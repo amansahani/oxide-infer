@@ -1,0 +1,15 @@
+[package]
+name = "oxide-infer-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+oxide-infer-core = { workspace = true }
+cuda-core = { workspace = true }
+cuda-bindings = { workspace = true }
+half = { workspace = true }
+bytemuck = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
