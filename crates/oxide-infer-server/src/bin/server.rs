@@ -183,18 +183,14 @@ async fn main() -> anyhow::Result<()> {
         let mut h_size: u32 = 2048;
 
         loop {
-            // 1. Admit incoming requests into any free slots
+            // 1. Check if any slots are active
             let any_active = slots.iter().any(|s| s.req.is_some());
-            for slot in slots.iter_mut() {
-                if slot.req.is_none() {
-                    let maybe_req = if any_active {
-                        req_rx.try_recv().ok()
-                    } else {
-                        // All slots idle, block until at least one request arrives
-                        req_rx.blocking_recv()
-                    };
 
-                    if let Some(req) = maybe_req {
+            // If completely idle, wait for the first incoming request
+            if !any_active {
+                match req_rx.blocking_recv() {
+                    Some(req) => {
+                        let slot = &mut slots[0];
                         let token_ids = tokenizer_clone.encode(&req.prompt).unwrap_or_else(|_| vec![124894, 2048]);
                         let prompt_len = token_ids.len();
                         let cur_token = *token_ids.last().unwrap();
@@ -206,7 +202,47 @@ async fn main() -> anyhow::Result<()> {
                         slot.gen_count = 0;
                         slot.max_gen = max_gen;
 
-                        // Prefill newly admitted request
+                        // Prefill
+                        for (pos_id, &tok) in token_ids.iter().enumerate() {
+                            let _ = slot.d_tok.copy_from_slice(&gpu_clone, &[tok]);
+                            let _ = embed_clone.lookup(&gpu_clone, &slot.d_tok, 1, &mut slot.d_hidden);
+                            for layer in layers.iter_mut() {
+                                let _ = layer.forward(
+                                    &gpu_clone,
+                                    &mut slot.d_hidden,
+                                    &mut slot.scratch_norm,
+                                    &mut slot.scratch_layer,
+                                    &mut slot.scratch_ffn,
+                                    &mut slot.q_out,
+                                    &mut slot.k_out,
+                                    &mut slot.v_out,
+                                    &mut slot.gate_out,
+                                    pos_id,
+                                );
+                            }
+                        }
+                        slot.req = Some(req);
+                    }
+                    None => break, // Channel closed, shutdown worker
+                }
+            }
+
+            // Drain any additional pending requests into remaining free slots without blocking
+            for slot in slots.iter_mut() {
+                if slot.req.is_none() {
+                    if let Ok(req) = req_rx.try_recv() {
+                        let token_ids = tokenizer_clone.encode(&req.prompt).unwrap_or_else(|_| vec![124894, 2048]);
+                        let prompt_len = token_ids.len();
+                        let cur_token = *token_ids.last().unwrap();
+                        let max_gen = req.max_tokens;
+
+                        slot.prompt_len = prompt_len;
+                        slot.cur_token = cur_token;
+                        slot.gen_tokens.clear();
+                        slot.gen_count = 0;
+                        slot.max_gen = max_gen;
+
+                        // Prefill
                         for (pos_id, &tok) in token_ids.iter().enumerate() {
                             let _ = slot.d_tok.copy_from_slice(&gpu_clone, &[tok]);
                             let _ = embed_clone.lookup(&gpu_clone, &slot.d_tok, 1, &mut slot.d_hidden);
