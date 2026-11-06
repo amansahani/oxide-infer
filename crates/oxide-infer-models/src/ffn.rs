@@ -17,7 +17,7 @@ pub struct FfnLayer {
     pub intermediate_size: usize,
     pub hidden_size: usize,
     rms_module: PtxModule,
-    gemv_module: PtxModule,
+    pub gemv_module: PtxModule,
     swiglu_module: PtxModule,
 }
 

@@ -1,3 +1,4 @@
+use oxide_infer_kernels::gemm::BATCHED_GEMV_FP16_PTX;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
@@ -179,30 +180,28 @@ async fn main() -> anyhow::Result<()> {
     // Dedicated asynchronous GPU continuous batching worker
     tokio::task::spawn_blocking(move || {
         let stream = gpu_clone.compute_stream();
+        let batched_ptx = PtxModule::load_from_ptx(&gpu_clone, BATCHED_GEMV_FP16_PTX).expect("Failed to load BATCHED_GEMV_FP16_PTX");
+        let batched_gemv_func = batched_ptx.get_function("batched_gemv_fp16_vec8").expect("batched_gemv_fp16_vec8 not found");
+        let mut d_batch_act = DeviceBuffer::<half::f16>::zeroed(&gpu_clone, 16 * 7680).expect("Failed to alloc d_batch_act");
+        let mut d_batch_ffn_out = DeviceBuffer::<half::f16>::zeroed(&gpu_clone, 16 * 2048).expect("Failed to alloc d_batch_ffn_out");
+
         let mut epsilon: f32 = 1e-5;
         let mut h_size: u32 = 2048;
 
         loop {
-            // 1. Check if any slots are active
-            let any_active = slots.iter().any(|s| s.req.is_some());
-
-            // If completely idle, wait for the first incoming request
-            if !any_active {
+            // 1. Drain pending requests into free slots
+            if !slots.iter().any(|s| s.req.is_some()) {
+                // If completely idle, wait for the first incoming request
                 match req_rx.blocking_recv() {
                     Some(req) => {
                         let slot = &mut slots[0];
                         let token_ids = tokenizer_clone.encode(&req.prompt).unwrap_or_else(|_| vec![124894, 2048]);
-                        let prompt_len = token_ids.len();
-                        let cur_token = *token_ids.last().unwrap();
-                        let max_gen = req.max_tokens;
-
-                        slot.prompt_len = prompt_len;
-                        slot.cur_token = cur_token;
+                        slot.prompt_len = token_ids.len();
+                        slot.cur_token = *token_ids.last().unwrap();
                         slot.gen_tokens.clear();
                         slot.gen_count = 0;
-                        slot.max_gen = max_gen;
+                        slot.max_gen = req.max_tokens;
 
-                        // Prefill
                         for (pos_id, &tok) in token_ids.iter().enumerate() {
                             let _ = slot.d_tok.copy_from_slice(&gpu_clone, &[tok]);
                             let _ = embed_clone.lookup(&gpu_clone, &slot.d_tok, 1, &mut slot.d_hidden);
@@ -227,22 +226,18 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            // Drain any additional pending requests into remaining free slots without blocking
-            for slot in slots.iter_mut() {
-                if slot.req.is_none() {
+            // Drain any additional pending requests into remaining free slots
+            for idx in 0..slots.len() {
+                if slots[idx].req.is_none() {
                     if let Ok(req) = req_rx.try_recv() {
                         let token_ids = tokenizer_clone.encode(&req.prompt).unwrap_or_else(|_| vec![124894, 2048]);
-                        let prompt_len = token_ids.len();
-                        let cur_token = *token_ids.last().unwrap();
-                        let max_gen = req.max_tokens;
-
-                        slot.prompt_len = prompt_len;
-                        slot.cur_token = cur_token;
+                        let slot = &mut slots[idx];
+                        slot.prompt_len = token_ids.len();
+                        slot.cur_token = *token_ids.last().unwrap();
                         slot.gen_tokens.clear();
                         slot.gen_count = 0;
-                        slot.max_gen = max_gen;
+                        slot.max_gen = req.max_tokens;
 
-                        // Prefill
                         for (pos_id, &tok) in token_ids.iter().enumerate() {
                             let _ = slot.d_tok.copy_from_slice(&gpu_clone, &[tok]);
                             let _ = embed_clone.lookup(&gpu_clone, &slot.d_tok, 1, &mut slot.d_hidden);
@@ -280,8 +275,8 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            // Execute 24 layers interleaved across active slots:
-            // Layer weights are kept hot in L2 cache across all concurrent requests!
+            // Layer-interleaved execution across all active slots:
+            // For each layer, evaluate all active slots back-to-back to keep weights in L2 cache
             for layer in layers.iter_mut() {
                 for slot in slots.iter_mut() {
                     if slot.req.is_some() {

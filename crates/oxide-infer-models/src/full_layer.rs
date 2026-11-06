@@ -741,13 +741,13 @@ enum LayerType {
 
 pub struct FullLfm3DecoderLayer {
     inner_layer: LayerType,
-    ffn: FfnLayer,
+    pub ffn: FfnLayer,
     operator_norm: DeviceBuffer<half::f16>,
     ffn_norm: DeviceBuffer<half::f16>,
     post_operator_norm: DeviceBuffer<half::f16>,
     post_ffn_norm: DeviceBuffer<half::f16>,
     norm_ptx: PtxModule,
-    add_ptx: PtxModule,
+    pub add_ptx: PtxModule,
     hidden_size: usize,
     rope: Option<RotaryEmbeddingTable>,
     gqa: Option<GqaAttentionEngine>,
@@ -979,4 +979,160 @@ impl FullLfm3DecoderLayer {
 
         Ok(())
     }
+
+    /// Part 1 of forward: Operator norm, inner layer (Conv or Attention), post-operator norm,
+    /// and fused residual add + ffn_norm.
+    /// After this, `scratch_norm` holds the input ready for the FFN block.
+    pub fn forward_pre_ffn(
+        &mut self,
+        gpu: &GpuContext,
+        hidden_states: &mut DeviceBuffer<half::f16>,
+        scratch_norm: &mut DeviceBuffer<half::f16>,
+        scratch_layer_out: &mut DeviceBuffer<half::f16>,
+        q_out: &mut DeviceBuffer<half::f16>,
+        k_out: &mut DeviceBuffer<half::f16>,
+        v_out: &mut DeviceBuffer<half::f16>,
+        gate_out: &mut DeviceBuffer<half::f16>,
+        pos_id: usize,
+    ) -> Result<()> {
+        let stream = gpu.compute_stream();
+        let rms_func = self.add_ptx.get_function("rms_norm_vec8_fp16")?;
+        let mut epsilon: f32 = 1e-5;
+        let mut h_size = self.hidden_size as u32;
+
+        // 1. operator_norm(hidden_states) -> scratch_norm
+        let mut d_normed = scratch_norm.inner_mut().cu_deviceptr();
+        let mut d_hidden = hidden_states.inner().cu_deviceptr();
+        let mut d_op_w = self.operator_norm.inner().cu_deviceptr();
+
+        let mut args_norm1: [*mut std::ffi::c_void; 5] = [
+            &mut d_normed as *mut _ as *mut std::ffi::c_void,
+            &mut d_hidden as *mut _ as *mut std::ffi::c_void,
+            &mut d_op_w as *mut _ as *mut std::ffi::c_void,
+            &mut epsilon as *mut _ as *mut std::ffi::c_void,
+            &mut h_size as *mut _ as *mut std::ffi::c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(&rms_func, (1, 1, 1), (256, 1, 1), 0, stream, &mut args_norm1)?;
+        }
+
+        // 2. Inner Layer forward -> scratch_layer_out
+        match &mut self.inner_layer {
+            LayerType::Conv(conv) => {
+                conv.forward(gpu, scratch_norm, scratch_layer_out)?;
+            }
+            LayerType::Attention(attn) => {
+                attn.forward_projections(gpu, scratch_norm, q_out, k_out, v_out, gate_out)?;
+
+                if let Some(rope) = &self.rope {
+                    rope.apply(gpu, q_out, pos_id, 16)?;
+                    rope.apply(gpu, k_out, pos_id, 4)?;
+                }
+
+                let kv_dim = 4 * 128; // 512 elements
+                if let (Some(kc), Some(vc)) = (&mut self.k_cache, &mut self.v_cache) {
+                    let offset = pos_id * kv_dim;
+                    let mut kc_ptr = kc.inner_mut().cu_deviceptr() + (offset * 2) as u64;
+                    let mut vc_ptr = vc.inner_mut().cu_deviceptr() + (offset * 2) as u64;
+                    let mut d_k = k_out.inner().cu_deviceptr();
+                    let mut d_v = v_out.inner().cu_deviceptr();
+                    let mut kv_dim_u32 = kv_dim as u32;
+
+                    let copy_func = self.add_ptx.get_function("copy_kv_slice_vec8_fp16")?;
+                    let mut args_k: [*mut std::ffi::c_void; 3] = [
+                        &mut kc_ptr as *mut _ as *mut std::ffi::c_void,
+                        &mut d_k as *mut _ as *mut std::ffi::c_void,
+                        &mut kv_dim_u32 as *mut _ as *mut std::ffi::c_void,
+                    ];
+                    let mut args_v: [*mut std::ffi::c_void; 3] = [
+                        &mut vc_ptr as *mut _ as *mut std::ffi::c_void,
+                        &mut d_v as *mut _ as *mut std::ffi::c_void,
+                        &mut kv_dim_u32 as *mut _ as *mut std::ffi::c_void,
+                    ];
+
+                    unsafe {
+                        launch_kernel_on_stream(&copy_func, (1, 1, 1), (64, 1, 1), 0, stream, &mut args_k)?;
+                        launch_kernel_on_stream(&copy_func, (1, 1, 1), (64, 1, 1), 0, stream, &mut args_v)?;
+                    }
+
+                    if let Some(gqa) = &self.gqa {
+                        gqa.compute_attention(
+                            gpu,
+                            &mut attn.context_buf,
+                            q_out,
+                            kc,
+                            vc,
+                            pos_id + 1,
+                            16,
+                            4,
+                            128,
+                        )?;
+                    }
+                }
+
+                attn.forward_gating_and_o_proj(gpu, gate_out, scratch_layer_out)?;
+            }
+        }
+
+        // 3. post_operator_norm on scratch_layer_out
+        let mut d_layer_out = scratch_layer_out.inner_mut().cu_deviceptr();
+        let mut d_post_op = self.post_operator_norm.inner().cu_deviceptr();
+        let mut args_post_op: [*mut std::ffi::c_void; 5] = [
+            &mut d_layer_out as *mut _ as *mut std::ffi::c_void,
+            &mut d_layer_out as *mut _ as *mut std::ffi::c_void,
+            &mut d_post_op as *mut _ as *mut std::ffi::c_void,
+            &mut epsilon as *mut _ as *mut std::ffi::c_void,
+            &mut h_size as *mut _ as *mut std::ffi::c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(&rms_func, (1, 1, 1), (256, 1, 1), 0, stream, &mut args_post_op)?;
+        }
+
+        // 4 & 5. Fused Residual 1 + ffn_norm:
+        // hidden_states += scratch_layer_out, and scratch_norm = rms_norm(hidden_states) * ffn_norm
+        let fused_res_norm_func = self.add_ptx.get_function("fused_residual_rms_norm_vec8_fp16")?;
+        let mut d_hidden_mut = hidden_states.inner_mut().cu_deviceptr();
+        let mut d_ffn_w = self.ffn_norm.inner().cu_deviceptr();
+        let mut args_fused_res1: [*mut std::ffi::c_void; 6] = [
+            &mut d_hidden_mut as *mut _ as *mut std::ffi::c_void,
+            &mut d_layer_out as *mut _ as *mut std::ffi::c_void,
+            &mut d_normed as *mut _ as *mut std::ffi::c_void,
+            &mut d_ffn_w as *mut _ as *mut std::ffi::c_void,
+            &mut epsilon as *mut _ as *mut std::ffi::c_void,
+            &mut h_size as *mut _ as *mut std::ffi::c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(&fused_res_norm_func, (1, 1, 1), (256, 1, 1), 0, stream, &mut args_fused_res1)?;
+        }
+        Ok(())
+    }
+
+    /// Part 2 of forward: Fused post-FFN norm + Residual 2
+    pub fn forward_post_ffn(
+        &mut self,
+        gpu: &GpuContext,
+        hidden_states: &mut DeviceBuffer<half::f16>,
+        scratch_ffn_out: &mut DeviceBuffer<half::f16>,
+    ) -> Result<()> {
+        let stream = gpu.compute_stream();
+        let fused_post_add_func = self.add_ptx.get_function("fused_post_norm_residual_add_vec8_fp16")?;
+        let mut d_hidden_mut = hidden_states.inner_mut().cu_deviceptr();
+        let mut d_ffn_out = scratch_ffn_out.inner_mut().cu_deviceptr();
+        let mut d_post_ffn = self.post_ffn_norm.inner().cu_deviceptr();
+        let mut epsilon: f32 = 1e-5;
+        let mut h_size = self.hidden_size as u32;
+
+        let mut args_fused_res2: [*mut std::ffi::c_void; 5] = [
+            &mut d_hidden_mut as *mut _ as *mut std::ffi::c_void,
+            &mut d_ffn_out as *mut _ as *mut std::ffi::c_void,
+            &mut d_post_ffn as *mut _ as *mut std::ffi::c_void,
+            &mut epsilon as *mut _ as *mut std::ffi::c_void,
+            &mut h_size as *mut _ as *mut std::ffi::c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(&fused_post_add_func, (1, 1, 1), (256, 1, 1), 0, stream, &mut args_fused_res2)?;
+        }
+        Ok(())
+    }
+
 }
