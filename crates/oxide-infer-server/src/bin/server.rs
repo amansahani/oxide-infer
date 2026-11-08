@@ -102,6 +102,8 @@ pub struct ChatChoice {
 pub struct ChatResponseMessage {
     pub role: String,
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2003,17 +2005,22 @@ async fn chat_completions(
                                     }
                                 }
                             }
-                            role_content.push_str("<|image|>");
+                            role_content.push_str("<|vision_start|><|image|><|vision_end|>");
                         }
                     }
                     full_prompt.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", msg.role, role_content));
                 }
             }
         }
-        full_prompt.push_str("<|im_start|>assistant\n<think>");
+        full_prompt.push_str("<|im_start|>assistant\n<think></think>");
         full_prompt
     } else if let Some(p) = payload.prompt {
-        p
+        // If raw prompt is not wrapped in ChatML, wrap it canonical style with direct answer output:
+        if !p.contains("<|im_start|>") {
+            format!("<|startoftext|><|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think></think>", p)
+        } else {
+            p
+        }
     } else {
         return (
             axum::http::StatusCode::BAD_REQUEST,
@@ -2041,7 +2048,17 @@ async fn chat_completions(
     }
 
     match rx.await {
-        Ok((text, prompt_tokens, comp_tokens)) => {
+        Ok((raw_text, prompt_tokens, comp_tokens)) => {
+            // Parse <think>...</think> if present
+            let (reasoning_content, content) = if let Some(end_think) = raw_text.find("</think>") {
+                let reasoning = raw_text[..end_think].trim().to_string();
+                let answer = raw_text[end_think + 8..].trim().to_string();
+                (Some(reasoning), answer)
+            } else {
+                // If model has not emitted </think> yet, return as content (or reasoning)
+                (None, raw_text)
+            };
+
             let resp = ChatCompletionResponse {
                 id: format!("chatcmpl-{}", uuid_simple()),
                 object: "chat.completion".to_string(),
@@ -2054,7 +2071,8 @@ async fn chat_completions(
                     index: 0,
                     message: ChatResponseMessage {
                         role: "assistant".to_string(),
-                        content: text,
+                        content,
+                        reasoning_content,
                     },
                     finish_reason: "stop".to_string(),
                 }],
