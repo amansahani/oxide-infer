@@ -12,6 +12,7 @@ Currently focused on serving **Liquid AI's `LFM3-VL-2B`** on NVIDIA Ampere GPUs 
 - **Continuous Unified Batching**: Fully dynamic request scheduling supporting up to 128 concurrent sequences in a single batched engine pass.
 - **Token-Batched Wave Prefill**: Prefills incoming multi-turn prompts as row batches (up to 128 tokens per wave) with persistent 6-tap conv carry state across chunk boundaries. Prefill latency dropped from ~880 ms to ~11–15 ms.
 - **Bitwise Shape-Invariant cuBLASLt GEMM**: Locked heuristics per `(m, k)` layer projection ensuring bitwise-identical outputs across all batch sizes ($B=1..128$) with FP32 accumulation.
+- **Pure-Rust Multimodal Vision Pipeline**: Native support for image comprehension (`LFM3-VL-2B`) via pure Rust image planar normalization, $(gh/m, gw/m, m, m)$ patch unfolding, and GPU MultiModalProjector with zero external Python or C++ dependencies.
 - **Direct Pointer-Table Addressing**: Avoids GPU tensor concatenation, reallocations, or memory copies in the hot decode loop by passing device pointer tables (`k_ptrs`, `v_ptrs`, `conv_ptrs`) directly into PTX kernels.
 
 ---

@@ -17,6 +17,7 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }
 crossbeam-channel = { workspace = true }
+image = { version = "0.25.10", features = ["jpeg", "png", "webp"] }
 
 [dev-dependencies]
 tempfile = "3"

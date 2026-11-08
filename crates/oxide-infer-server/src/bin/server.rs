@@ -47,9 +47,29 @@ extern "C" {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ContentPart {
+    #[serde(rename = "type")]
+    pub part_type: String,
+    pub text: Option<String>,
+    pub image_url: Option<ImageUrl>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImageUrl {
+    pub url: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    pub content: MessageContent,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1764,7 +1784,29 @@ async fn chat_completions(
     let prompt = if let Some(messages) = payload.messages {
         let mut full_prompt = String::from("<|startoftext|>");
         for msg in messages {
-            full_prompt.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", msg.role, msg.content));
+            match msg.content {
+                MessageContent::Text(text) => {
+                    full_prompt.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", msg.role, text));
+                }
+                MessageContent::Parts(parts) => {
+                    let mut role_content = String::new();
+                    for part in parts {
+                        if part.part_type == "text" {
+                            if let Some(t) = part.text {
+                                role_content.push_str(&t);
+                            }
+                        } else if part.part_type == "image_url" || part.part_type == "image" {
+                            // Canonical 64 image tokens wrapped in vision brackets
+                            role_content.push_str("<|vision_start|>");
+                            for _ in 0..64 {
+                                role_content.push_str("<|image|>");
+                            }
+                            role_content.push_str("<|vision_end|>");
+                        }
+                    }
+                    full_prompt.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", msg.role, role_content));
+                }
+            }
         }
         full_prompt.push_str("<|im_start|>assistant\n<think></think>");
         full_prompt

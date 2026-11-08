@@ -10,6 +10,7 @@ pub mod hybrid_layer;
 pub mod lm_head;
 pub mod engine;
 pub mod traits;
+pub mod vision_tower;
 
 pub use embedding::EmbeddingTable;
 pub use projector::MultiModalProjector;
@@ -24,3 +25,4 @@ pub use full_layer::LayerType;
 pub use lm_head::TiedLmHead;
 pub use engine::ModelEngine;
 pub use traits::ModelArchitecture;
+pub use vision_tower::VisionTower;
