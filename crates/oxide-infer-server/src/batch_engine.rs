@@ -227,6 +227,8 @@ impl BatchEngine {
     /// `tokens[i]` is embedded for sequence `i`; `pos_ids[i]` is used for RoPE
     /// and the KV cache write. When `sample` is true the final RMSNorm, LM head
     /// and argmax are executed and the next tokens are returned.
+    /// If `custom_embeddings` is provided, those embeddings are used directly
+    /// instead of looking up `tokens` in `embed_table`.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_step<C: BatchSequence>(
         &mut self,
@@ -240,6 +242,37 @@ impl BatchEngine {
         emb_norm: &DeviceBuffer<f16>,
         sample: bool,
         prefill: Option<&PrefillMeta>,
+    ) -> Result<Vec<u32>> {
+        self.forward_step_with_embeds(
+            gpu,
+            layers,
+            is_conv,
+            ctxs,
+            tokens,
+            pos_ids,
+            embed_table,
+            emb_norm,
+            sample,
+            prefill,
+            None,
+        )
+    }
+
+    /// Run one transformer step with optional custom input embeddings (e.g. multimodal vision tokens).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_step_with_embeds<C: BatchSequence>(
+        &mut self,
+        gpu: &GpuContext,
+        layers: &mut [FullLfm3DecoderLayer],
+        is_conv: &[bool],
+        ctxs: &[C],
+        tokens: &[u32],
+        pos_ids: &[u32],
+        embed_table: &DeviceBuffer<f16>,
+        emb_norm: &DeviceBuffer<f16>,
+        sample: bool,
+        prefill: Option<&PrefillMeta>,
+        custom_embeddings: Option<&DeviceBuffer<f16>>,
     ) -> Result<Vec<u32>> {
         let b = ctxs.len();
         if b == 0 || b > self.max_batch {
@@ -300,21 +333,32 @@ impl BatchEngine {
             self.scratch.pf_pos.copy_from_slice(gpu, &pos_pad_local)?;
         }
 
-        // 1. Batched embedding lookup.
-        let mut d_hidden = fptr(&self.scratch.hidden);
-        let mut d_tbl = embed_table.inner().cu_deviceptr();
-        let mut d_tok_in = self.scratch.tokens_in.inner().cu_deviceptr();
         let mut h_u32 = HIDDEN as u32;
         let mut b_arg = b_u32;
-        let mut args_embed: [*mut c_void; 5] = [
-            &mut d_hidden as *mut _ as *mut c_void,
-            &mut d_tbl as *mut _ as *mut c_void,
-            &mut d_tok_in as *mut _ as *mut c_void,
-            &mut h_u32 as *mut _ as *mut c_void,
-            &mut b_arg as *mut _ as *mut c_void,
-        ];
-        unsafe {
-            launch_kernel_on_stream(&self.embed, (b_u32, 1, 1), (256, 1, 1), 0, stream, &mut args_embed)?;
+
+        // 1. Batched embedding lookup or custom embedding copy.
+        if let Some(embeds) = custom_embeddings {
+            let dst = self.scratch.hidden.inner_mut().cu_deviceptr();
+            let src = embeds.inner().cu_deviceptr();
+            unsafe {
+                cuMemcpyDtoDAsync_v2(dst, src, b * HIDDEN * 2, stream.cu_stream() as *mut c_void);
+            }
+        } else {
+            let mut d_hidden = fptr(&self.scratch.hidden);
+            let mut d_tbl = embed_table.inner().cu_deviceptr();
+            let mut d_tok_in = self.scratch.tokens_in.inner().cu_deviceptr();
+            let mut h_arg = h_u32;
+            let mut b_tmp = b_arg;
+            let mut args_embed: [*mut c_void; 5] = [
+                &mut d_hidden as *mut _ as *mut c_void,
+                &mut d_tbl as *mut _ as *mut c_void,
+                &mut d_tok_in as *mut _ as *mut c_void,
+                &mut h_arg as *mut _ as *mut c_void,
+                &mut b_tmp as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                launch_kernel_on_stream(&self.embed, (b_u32, 1, 1), (256, 1, 1), 0, stream, &mut args_embed)?;
+            }
         }
 
         for (l_idx, layer) in layers.iter_mut().enumerate() {
