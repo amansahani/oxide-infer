@@ -360,7 +360,7 @@ pub const BATCHED_GQA_ATTENTION_PTX: &str = r#"
 
     mov.f32 %fscale, 0.0883883476;
 
-    .shared .f32 s_scores[4096];
+    .shared .f32 s_scores[8192];
     .shared .f32 s_warp_dot[8];
     .shared .f32 s_max;
     .shared .f32 s_denom;

@@ -694,9 +694,12 @@ FINISH:
                         let prompt_len = token_ids.len();
                         let cur_token = *token_ids.last().unwrap();
                         let max_gen = req.max_tokens;
+                        let target_seq_len = prompt_len + max_gen + 64; // dynamic capacity with safety margin
+                        let kv_elements = target_seq_len * 512; // 4 kv heads * 128 head_dim
+
                         if debug_top {
                             let ids: Vec<u32> = token_ids.iter().cloned().collect();
-                            eprintln!("[tok] n={} ids={:?}", prompt_len, ids);
+                            eprintln!("[tok] n={} ids={:?} (kv_capacity={})", prompt_len, ids, target_seq_len);
                         }
 
                         let mut k_caches = Vec::with_capacity(24);
@@ -708,9 +711,9 @@ FINISH:
                                 v_caches.push(None);
                                 conv_states.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, 2048 * 7).expect("alloc")));
                             } else {
-                                // 4096 tokens capacity (512 elements per token = 4 heads x 128 dim)
-                                k_caches.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, 4096 * 512).expect("alloc")));
-                                v_caches.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, 4096 * 512).expect("alloc")));
+                                // Dynamic tokens capacity per request
+                                k_caches.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, kv_elements).expect("alloc")));
+                                v_caches.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, kv_elements).expect("alloc")));
                                 conv_states.push(None);
                             }
                         }
@@ -824,9 +827,12 @@ FINISH:
                         let prompt_len = token_ids.len();
                         let cur_token = *token_ids.last().unwrap();
                         let max_gen = req.max_tokens;
+                        let target_seq_len = prompt_len + max_gen + 64; // dynamic capacity with safety margin
+                        let kv_elements = target_seq_len * 512; // 4 kv heads * 128 head_dim
+
                         if debug_top {
                             let ids: Vec<u32> = token_ids.iter().cloned().collect();
-                            eprintln!("[tok] n={} ids={:?}", prompt_len, ids);
+                            eprintln!("[tok] n={} ids={:?} (kv_capacity={})", prompt_len, ids, target_seq_len);
                         }
 
                         let mut k_caches = Vec::with_capacity(24);
@@ -838,9 +844,9 @@ FINISH:
                                 v_caches.push(None);
                                 conv_states.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, 2048 * 7).expect("alloc")));
                             } else {
-                                // 4096 tokens capacity (512 elements per token = 4 heads x 128 dim)
-                                k_caches.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, 4096 * 512).expect("alloc")));
-                                v_caches.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, 4096 * 512).expect("alloc")));
+                                // Dynamic tokens capacity per request
+                                k_caches.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, kv_elements).expect("alloc")));
+                                v_caches.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, kv_elements).expect("alloc")));
                                 conv_states.push(None);
                             }
                         }

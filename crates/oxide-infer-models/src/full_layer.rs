@@ -1176,11 +1176,11 @@ impl FullLfm3DecoderLayer {
             )?;
             let theta = if is_sliding { 10000.0 } else { 1000000.0 };
             let partial_factor = if is_sliding { 1.0 } else { 0.5 };
-            let rope_table = RotaryEmbeddingTable::new(gpu, 1024, 128, theta, partial_factor)?;
+            let rope_table = RotaryEmbeddingTable::new(gpu, 131072, 128, theta, partial_factor)?;
             let gqa_engine = GqaAttentionEngine::new(gpu)?;
-            // Cache for up to 1024 tokens: 4 kv heads * 128 head_dim = 512 elements per token
-            let kc = DeviceBuffer::<half::f16>::zeroed(gpu, 1024 * 512)?;
-            let vc = DeviceBuffer::<half::f16>::zeroed(gpu, 1024 * 512)?;
+            // Cache for up to 131072 tokens: 4 kv heads * 128 head_dim = 512 elements per token
+            let kc = DeviceBuffer::<half::f16>::zeroed(gpu, 4096 * 512)?;
+            let vc = DeviceBuffer::<half::f16>::zeroed(gpu, 4096 * 512)?;
             (LayerType::Attention(attn), Some(rope_table), Some(gqa_engine), Some(kc), Some(vc))
         } else {
             let conv = CausalConvLayer::load_from_safetensors(
