@@ -10,9 +10,9 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use oxide_infer_core::{GpuContext, SafeTensorsLoader, DeviceBuffer};
+use oxide_infer_core::{GpuContext, SafeTensorsLoader, DeviceBuffer, VisionPreprocessor};
 use oxide_infer_server::tokenizer::OxideTokenizer;
-use oxide_infer_models::{EmbeddingTable, FullLfm3DecoderLayer, TiedLmHead, LayerType, RESIDUAL_ADD_PTX};
+use oxide_infer_models::{EmbeddingTable, FullLfm3DecoderLayer, TiedLmHead, VisionTower, LayerType, RESIDUAL_ADD_PTX};
 use oxide_infer_server::batch_engine::{BatchEngine, BatchSequence, PrefillMeta};
 use oxide_infer_kernels::norm::RMS_NORM_FP16_PTX;
 use oxide_infer_kernels::PtxModule;
@@ -113,6 +113,7 @@ pub struct ChatUsage {
 
 struct ServingRequest {
     prompt: String,
+    image_bytes: Option<Vec<u8>>,
     max_tokens: usize,
     response_tx: oneshot::Sender<(String, usize, usize)>,
 }
@@ -160,6 +161,10 @@ async fn main() -> anyhow::Result<()> {
     let norm_ptx = Arc::new(PtxModule::load_from_ptx(&gpu, RMS_NORM_FP16_PTX)?);
     let rms_func = norm_ptx.get_function("rms_norm_fp16")?;
     let mut d_logits = DeviceBuffer::<f32>::zeroed(&gpu, 128000)?;
+
+    println!("      Loading VisionTower & MultiModal Projector...");
+    let vision_tower = VisionTower::load_from_safetensors(&gpu, &loader)?;
+    let preprocessor = VisionPreprocessor::default();
 
     let layer_types = [
         "conv", "conv", "full_attention", "conv", "sliding_attention", "conv", "full_attention", "conv",
@@ -235,6 +240,8 @@ async fn main() -> anyhow::Result<()> {
     let gpu_clone = gpu.clone();
     let embed_clone = embed_table.clone();
     let emb_norm_clone = embedding_norm.clone();
+    let mut vision_tower = vision_tower;
+    let preprocessor = preprocessor;
 
     // Dedicated asynchronous GPU continuous batching worker
     tokio::task::spawn_blocking(move || {
@@ -601,11 +608,89 @@ FINISH:
 
         loop {
             // 1. Drain incoming requests into newly admitted contexts
-            let mut new_contexts: Vec<(ActiveContext, Vec<u32>)> = Vec::new();
+            let mut new_contexts: Vec<(ActiveContext, Vec<u32>, Option<Vec<half::f16>>)> = Vec::new();
             if active_contexts.is_empty() {
                 match req_rx.blocking_recv() {
                     Some(req) => {
-                        let token_ids = tokenizer_clone.encode(&req.prompt).unwrap_or_else(|_| vec![124894, 2048]);
+                        let mut token_ids = tokenizer_clone.encode(&req.prompt).unwrap_or_else(|_| vec![124894, 2048]);
+                        
+                        // If request has image bytes, process through VisionPreprocessor + VisionTower
+                        let custom_embeds = if let Some(ref img_bytes) = req.image_bytes {
+                            match oxide_infer_core::image::load_from_memory(img_bytes) {
+                                Ok(dyn_img) => {
+                                    match preprocessor.process_image(&dyn_img) {
+                                        Ok(patchified) => {
+                                            match DeviceBuffer::from_slice(&gpu_clone, &patchified.patches) {
+                                                Ok(d_patches) => {
+                                                    let num_tokens = (patchified.grid_h * patchified.grid_w) / 4;
+                                                    let mut d_proj = DeviceBuffer::<half::f16>::zeroed(&gpu_clone, num_tokens * 2048)
+                                                        .expect("alloc vision proj");
+                                                    if let Err(e) = vision_tower.forward(&gpu_clone, &d_patches, &mut d_proj) {
+                                                        eprintln!("[vision] VisionTower error: {}", e);
+                                                        None
+                                                    } else {
+                                                        let _ = stream.synchronize();
+                                                        let vis_host = d_proj.inner().to_host_vec(stream).unwrap_or_default();
+                                                        let embed_table_host = embed_clone.table.inner().to_host_vec(stream).unwrap_or_default();
+                                                        
+                                                        // Expand <|image|> token placeholders if needed or replace canonical count
+                                                        let mut expanded_tokens = Vec::with_capacity(token_ids.len() + num_tokens);
+                                                        let mut seen_first_img = false;
+                                                        for &tok in &token_ids {
+                                                            if tok == 125030 {
+                                                                if !seen_first_img {
+                                                                    expanded_tokens.extend(vec![125030; num_tokens]);
+                                                                    seen_first_img = true;
+                                                                }
+                                                            } else {
+                                                                expanded_tokens.push(tok);
+                                                            }
+                                                        }
+                                                        if seen_first_img {
+                                                            token_ids = expanded_tokens;
+                                                        }
+
+                                                        let mut seq_embeds = Vec::with_capacity(token_ids.len() * 2048);
+                                                        let mut v_idx = 0usize;
+                                                        for &tok in &token_ids {
+                                                            if tok == 125030 && v_idx < num_tokens {
+                                                                let slice = &vis_host[v_idx * 2048..(v_idx + 1) * 2048];
+                                                                seq_embeds.extend_from_slice(slice);
+                                                                v_idx += 1;
+                                                            } else {
+                                                                let tidx = tok as usize;
+                                                                if (tidx + 1) * 2048 <= embed_table_host.len() {
+                                                                    let slice = &embed_table_host[tidx * 2048..(tidx + 1) * 2048];
+                                                                    seq_embeds.extend_from_slice(slice);
+                                                                } else {
+                                                                    seq_embeds.extend(vec![half::f16::ZERO; 2048]);
+                                                                }
+                                                            }
+                                                        }
+                                                        Some(seq_embeds)
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("[vision] patch alloc error: {}", e);
+                                                    None
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[vision] preprocessor error: {}", e);
+                                            None
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("[vision] image decode error: {}", e);
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+
                         let prompt_len = token_ids.len();
                         let cur_token = *token_ids.last().unwrap();
                         let max_gen = req.max_tokens;
@@ -649,7 +734,7 @@ FINISH:
                             layer_v_caches: v_caches,
                             layer_conv_states: conv_states,
                         };
-                        new_contexts.push((ctx, token_ids));
+                        new_contexts.push((ctx, token_ids, custom_embeds));
                     }
                     None => break,
                 }
@@ -658,26 +743,89 @@ FINISH:
             while active_contexts.len() + new_contexts.len() < MAX_BATCH_SIZE {
                 match req_rx.try_recv() {
                     Ok(req) => {
-                        let token_ids = tokenizer_clone.encode(&req.prompt).unwrap_or_else(|_| vec![124894, 2048]);
+                        let mut token_ids = tokenizer_clone.encode(&req.prompt).unwrap_or_else(|_| vec![124894, 2048]);
+                        
+                        let custom_embeds = if let Some(ref img_bytes) = req.image_bytes {
+                            match oxide_infer_core::image::load_from_memory(img_bytes) {
+                                Ok(dyn_img) => {
+                                    match preprocessor.process_image(&dyn_img) {
+                                        Ok(patchified) => {
+                                            match DeviceBuffer::from_slice(&gpu_clone, &patchified.patches) {
+                                                Ok(d_patches) => {
+                                                    let num_tokens = (patchified.grid_h * patchified.grid_w) / 4;
+                                                    let mut d_proj = DeviceBuffer::<half::f16>::zeroed(&gpu_clone, num_tokens * 2048)
+                                                        .expect("alloc vision proj");
+                                                    if let Err(e) = vision_tower.forward(&gpu_clone, &d_patches, &mut d_proj) {
+                                                        eprintln!("[vision] VisionTower error: {}", e);
+                                                        None
+                                                    } else {
+                                                        let _ = stream.synchronize();
+                                                        let vis_host = d_proj.inner().to_host_vec(stream).unwrap_or_default();
+                                                        let embed_table_host = embed_clone.table.inner().to_host_vec(stream).unwrap_or_default();
+                                                        
+                                                        let mut expanded_tokens = Vec::with_capacity(token_ids.len() + num_tokens);
+                                                        let mut seen_first_img = false;
+                                                        for &tok in &token_ids {
+                                                            if tok == 125030 {
+                                                                if !seen_first_img {
+                                                                    expanded_tokens.extend(vec![125030; num_tokens]);
+                                                                    seen_first_img = true;
+                                                                }
+                                                            } else {
+                                                                expanded_tokens.push(tok);
+                                                            }
+                                                        }
+                                                        if seen_first_img {
+                                                            token_ids = expanded_tokens;
+                                                        }
+
+                                                        let mut seq_embeds = Vec::with_capacity(token_ids.len() * 2048);
+                                                        let mut v_idx = 0usize;
+                                                        for &tok in &token_ids {
+                                                            if tok == 125030 && v_idx < num_tokens {
+                                                                let slice = &vis_host[v_idx * 2048..(v_idx + 1) * 2048];
+                                                                seq_embeds.extend_from_slice(slice);
+                                                                v_idx += 1;
+                                                            } else {
+                                                                let tidx = tok as usize;
+                                                                if (tidx + 1) * 2048 <= embed_table_host.len() {
+                                                                    let slice = &embed_table_host[tidx * 2048..(tidx + 1) * 2048];
+                                                                    seq_embeds.extend_from_slice(slice);
+                                                                } else {
+                                                                    seq_embeds.extend(vec![half::f16::ZERO; 2048]);
+                                                                }
+                                                            }
+                                                        }
+                                                        Some(seq_embeds)
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("[vision] patch alloc error: {}", e);
+                                                    None
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[vision] preprocessor error: {}", e);
+                                            None
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("[vision] image decode error: {}", e);
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+
                         let prompt_len = token_ids.len();
                         let cur_token = *token_ids.last().unwrap();
                         let max_gen = req.max_tokens;
                         if debug_top {
                             let ids: Vec<u32> = token_ids.iter().cloned().collect();
                             eprintln!("[tok] n={} ids={:?}", prompt_len, ids);
-                        }
-                        if debug_top {
-                            let head: Vec<u32> = token_ids.iter().take(14).cloned().collect();
-                            let tail: Vec<u32> = token_ids
-                                .iter()
-                                .rev()
-                                .take(12)
-                                .cloned()
-                                .collect::<Vec<u32>>()
-                                .into_iter()
-                                .rev()
-                                .collect();
-                            eprintln!("[tok] n={} head={:?} tail={:?}", prompt_len, head, tail);
                         }
 
                         let mut k_caches = Vec::with_capacity(24);
@@ -715,7 +863,7 @@ FINISH:
                             layer_v_caches: v_caches,
                             layer_conv_states: conv_states,
                         };
-                        new_contexts.push((ctx, token_ids));
+                        new_contexts.push((ctx, token_ids, custom_embeds));
                     }
                     Err(_) => break,
                 }
@@ -736,11 +884,11 @@ FINISH:
                     // once per token. Prompts longer than a wave are split
                     // into contiguous chunks; the request's persistent conv
                     // state carries the 6-token window across chunk bounds.
-                    new_contexts.sort_by_key(|(_, t)| t.len());
+                    new_contexts.sort_by_key(|(_, t, _)| t.len());
                     let mb = engine.max_batch();
                     // (request index, chunk start) in execution order.
                     let mut chunks: Vec<(usize, usize)> = Vec::new();
-                    for (ri, (_, t)) in new_contexts.iter().enumerate() {
+                    for (ri, (_, t, _)) in new_contexts.iter().enumerate() {
                         let mut start = 0usize;
                         while start < t.len() {
                             chunks.push((ri, start));
@@ -799,8 +947,39 @@ FINISH:
                         };
                         let ctx_refs: Vec<&ActiveContext> =
                             row_ctx.iter().map(|ri| &new_contexts[*ri].0).collect();
+                        let mut wave_has_custom_embeds = false;
+                        for (ri, _, _) in wave.iter() {
+                            if new_contexts[*ri].2.is_some() {
+                                wave_has_custom_embeds = true;
+                                break;
+                            }
+                        }
+
+                        let d_wave_embeds = if wave_has_custom_embeds {
+                            let embed_table_host = embed_clone.table.inner().to_host_vec(stream).unwrap_or_default();
+                            let mut wave_embed_vec = Vec::with_capacity(used * 2048);
+                            for (ri, start, len) in wave.iter() {
+                                if let Some(ref custom_vec) = new_contexts[*ri].2 {
+                                    let slice = &custom_vec[start * 2048..(start + len) * 2048];
+                                    wave_embed_vec.extend_from_slice(slice);
+                                } else {
+                                    for j in 0..*len {
+                                        let tok = new_contexts[*ri].1[start + j] as usize;
+                                        if (tok + 1) * 2048 <= embed_table_host.len() {
+                                            wave_embed_vec.extend_from_slice(&embed_table_host[tok * 2048..(tok + 1) * 2048]);
+                                        } else {
+                                            wave_embed_vec.extend(vec![half::f16::ZERO; 2048]);
+                                        }
+                                    }
+                                }
+                            }
+                            Some(DeviceBuffer::from_slice(&gpu_clone, &wave_embed_vec).expect("alloc wave embeds"))
+                        } else {
+                            None
+                        };
+
                         engine
-                            .forward_step(
+                            .forward_step_with_embeds(
                                 &gpu_clone,
                                 &mut layers,
                                 &is_conv,
@@ -811,6 +990,7 @@ FINISH:
                                 &emb_norm_clone,
                                 false,
                                 Some(&meta),
+                                d_wave_embeds.as_ref(),
                             )
                             .expect("batched prefill");
                         // Copy each chunk's last-row conv state back into the
@@ -855,7 +1035,7 @@ FINISH:
                             t0.elapsed().as_secs_f64() * 1000.0
                         );
                     }
-                    for (ctx, _) in new_contexts.drain(..) {
+                    for (ctx, _, _) in new_contexts.drain(..) {
                         active_contexts.push(ctx);
                     }
 
@@ -987,7 +1167,7 @@ FINISH:
                 let nb = new_contexts.len();
                 if nb == 1 || scalar_prefill {
                     // Scalar reference path: process each admitted request independently.
-                    for (ctx, token_ids) in new_contexts.iter_mut() {
+                    for (ctx, token_ids, _) in new_contexts.iter_mut() {
                         for (pos_id, &tok) in token_ids.iter().enumerate() {
                             let _ = ctx.d_tok.copy_from_slice(&gpu_clone, &[tok]);
                             let _ = embed_clone.lookup(&gpu_clone, &ctx.d_tok, 1, &mut ctx.d_hidden);
@@ -1048,10 +1228,10 @@ FINISH:
                     }
                 } else {
                     // Batched Prefill with Tensor Core HGEMM across all newly admitted requests
-                    let max_plen = new_contexts.iter().map(|(_, t)| t.len()).max().unwrap_or(0);
+                    let max_plen = new_contexts.iter().map(|(_, t, _)| t.len()).max().unwrap_or(0);
                     for pos_id in 0..max_plen {
                         // (a) Embedding lookup for active positions
-                        for (ctx, token_ids) in new_contexts.iter_mut() {
+                        for (ctx, token_ids, _) in new_contexts.iter_mut() {
                             if pos_id < token_ids.len() {
                                 let tok = token_ids[pos_id];
                                 let _ = ctx.d_tok.copy_from_slice(&gpu_clone, &[tok]);
@@ -1062,7 +1242,7 @@ FINISH:
                         // (b) Forward through 24 layers with batched FFN
                         for (l_idx, layer) in layers.iter_mut().enumerate() {
                             let mut active_prefill_indices: Vec<usize> = Vec::with_capacity(nb);
-                            for (i, (ctx, token_ids)) in new_contexts.iter_mut().enumerate() {
+                            for (i, (ctx, token_ids, _)) in new_contexts.iter_mut().enumerate() {
                                 if pos_id < token_ids.len() {
                                     active_prefill_indices.push(i);
                                     let _ = layer.forward_pre_ffn_with_cache(
@@ -1188,7 +1368,7 @@ FINISH:
                     }
                 }
 
-                for (ctx, _) in new_contexts {
+                for (ctx, _, _) in new_contexts {
                     active_contexts.push(ctx);
                 }
 
@@ -1781,6 +1961,8 @@ async fn chat_completions(
     State(state): State<ServerState>,
     Json(payload): Json<ChatCompletionRequest>,
 ) -> Response {
+    let mut extracted_image_bytes: Option<Vec<u8>> = None;
+
     let prompt = if let Some(messages) = payload.messages {
         let mut full_prompt = String::from("<|startoftext|>");
         for msg in messages {
@@ -1796,19 +1978,30 @@ async fn chat_completions(
                                 role_content.push_str(&t);
                             }
                         } else if part.part_type == "image_url" || part.part_type == "image" {
-                            // Canonical 64 image tokens wrapped in vision brackets
-                            role_content.push_str("<|vision_start|>");
-                            for _ in 0..64 {
-                                role_content.push_str("<|image|>");
+                            if let Some(ref img_obj) = part.image_url {
+                                let url = &img_obj.url;
+                                if let Some(comma_pos) = url.find(',') {
+                                    if url.starts_with("data:") {
+                                        let b64_str = &url[comma_pos + 1..];
+                                        use base64::Engine;
+                                        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64_str) {
+                                            extracted_image_bytes = Some(bytes);
+                                        }
+                                    }
+                                } else if std::path::Path::new(url).exists() {
+                                    if let Ok(bytes) = std::fs::read(url) {
+                                        extracted_image_bytes = Some(bytes);
+                                    }
+                                }
                             }
-                            role_content.push_str("<|vision_end|>");
+                            role_content.push_str("<|image|>");
                         }
                     }
                     full_prompt.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", msg.role, role_content));
                 }
             }
         }
-        full_prompt.push_str("<|im_start|>assistant\n<think></think>");
+        full_prompt.push_str("<|im_start|>assistant\n<think>");
         full_prompt
     } else if let Some(p) = payload.prompt {
         p
@@ -1825,6 +2018,7 @@ async fn chat_completions(
 
     let req = ServingRequest {
         prompt,
+        image_bytes: extracted_image_bytes,
         max_tokens,
         response_tx: tx,
     };
