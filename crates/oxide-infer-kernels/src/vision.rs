@@ -1464,3 +1464,5 @@ $L__BB0_13:
 }
 
 "#;
+
+pub const VISION_ATTN_PTX: &str = include_str!("vision_attn.ptx");

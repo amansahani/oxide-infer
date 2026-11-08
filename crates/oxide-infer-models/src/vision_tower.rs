@@ -15,7 +15,7 @@ use oxide_infer_core::{DeviceBuffer, GpuContext, SafeTensorsLoader};
 use oxide_infer_kernels::gemm::FUSED_GEMV_FP16_FP32ACCUM_PTX;
 use oxide_infer_kernels::norm::RMS_NORM_FP16_PTX;
 use oxide_infer_kernels::activations::SWIGLU_FP16_PTX;
-use oxide_infer_kernels::vision::{VISION_BIAS_ADD_PTX, VISION_GELU_PTX, VISION_LAYER_NORM_PTX, VISION_OPS_PTX, VISION_RMSNORM_PTX};
+use oxide_infer_kernels::vision::{VISION_ATTN_PTX, VISION_BIAS_ADD_PTX, VISION_GELU_PTX, VISION_LAYER_NORM_PTX, VISION_OPS_PTX, VISION_RMSNORM_PTX};
 use oxide_infer_kernels::PtxModule;
 use cuda_core::launch_kernel_on_stream;
 
@@ -69,6 +69,7 @@ pub struct VisionTower {
     ln_ptx: PtxModule,
     gelu_ptx: PtxModule,
     bias_ptx: PtxModule,
+    attn_ptx: PtxModule,
 
     // Reusable GPU scratch buffers
     scratch_h1: DeviceBuffer<f16>,
@@ -198,6 +199,7 @@ impl VisionTower {
         let ln_ptx = PtxModule::load_from_ptx(gpu, VISION_LAYER_NORM_PTX)?;
         let gelu_ptx = PtxModule::load_from_ptx(gpu, VISION_GELU_PTX)?;
         let bias_ptx = PtxModule::load_from_ptx(gpu, VISION_BIAS_ADD_PTX)?;
+        let attn_ptx = PtxModule::load_from_ptx(gpu, VISION_ATTN_PTX)?;
 
         let n = 256usize;
         let c = 1024usize;
@@ -241,6 +243,7 @@ impl VisionTower {
             ln_ptx,
             gelu_ptx,
             bias_ptx,
+            attn_ptx,
             scratch_h1,
             scratch_h2,
             scratch_norm,
@@ -327,6 +330,7 @@ impl VisionTower {
         let r2m_func = self.ops_ptx.get_function("vision_raster_to_merge_fp16")?;
         let mult_func = self.ops_ptx.get_function("vision_conv_gate_mult_fp16")?;
         let rope_func = self.ops_ptx.get_function("vision_axial_rope_fp16")?;
+        let attn_sdpa_func = self.attn_ptx.get_function("vision_gqa_sdpa_fp16")?;
         let swiglu_func = self.swiglu_ptx.get_function("fused_swiglu_fp16")?;
 
         for layer in &self.layers {
@@ -581,67 +585,32 @@ impl VisionTower {
                         launch_kernel_on_stream(&rope_func, ((total_q_elem + 255) / 256, 1, 1), (256, 1, 1), 0, stream, &mut args_rope)?;
                     }
 
-                    // Attention SDPA: Q [16, 256, 64] @ K [16, 64, 256] -> Softmax -> @ V [16, 256, 64]
-                    // Copy to host, execute high-precision vector forward, copy back
-                    let q_host = self.scratch_q.inner().to_host_vec(stream)?;
-                    let k_host = self.scratch_k.inner().to_host_vec(stream)?;
-                    let v_host = self.scratch_v.inner().to_host_vec(stream)?;
+                    // Attention SDPA: on-device native Ampere kernel (zero host copy, fused softmax + V-reduction)
+                    let mut d_attn_out = self.scratch_norm.inner().cu_deviceptr();
+                    let mut d_q_in = self.scratch_q.inner().cu_deviceptr();
+                    let mut d_k_in = self.scratch_k.inner().cu_deviceptr();
+                    let mut d_v_in = self.scratch_v.inner().cu_deviceptr();
+                    let mut num_p_i32 = num_patches as i32;
+                    let mut scale_f32 = 1.0f32 / (64.0f32).sqrt();
 
-                    let mut attn_host = vec![f16::ZERO; num_patches * c];
-                    let scale = 1.0f32 / (64.0f32).sqrt();
-
-                    for h in 0..16 {
-                        let kv_h = h / 2;
-                        let mut scores = vec![0.0f32; num_patches * num_patches];
-
-                        for qi in 0..num_patches {
-                            let q_base = (qi * 16 + h) * 64;
-                            for kj in 0..num_patches {
-                                let k_base = (kj * 8 + kv_h) * 64;
-                                let mut dot = 0.0f32;
-                                for d in 0..64 {
-                                    dot += q_host[q_base + d].to_f32() * k_host[k_base + d].to_f32();
-                                }
-                                scores[qi * num_patches + kj] = dot * scale;
-                            }
-                        }
-
-                        // Softmax row-wise
-                        for qi in 0..num_patches {
-                            let row_base = qi * num_patches;
-                            let mut max_s = f32::NEG_INFINITY;
-                            for kj in 0..num_patches {
-                                let s = scores[row_base + kj];
-                                if s > max_s { max_s = s; }
-                            }
-                            let mut sum_exp = 0.0f32;
-                            for kj in 0..num_patches {
-                                let exp_s = (scores[row_base + kj] - max_s).exp();
-                                scores[row_base + kj] = exp_s;
-                                sum_exp += exp_s;
-                            }
-                            let inv_sum = 1.0f32 / sum_exp;
-                            for kj in 0..num_patches {
-                                scores[row_base + kj] *= inv_sum;
-                            }
-                        }
-
-                        // Multiply by V
-                        for qi in 0..num_patches {
-                            let out_base = (qi * 16 + h) * 64;
-                            let score_base = qi * num_patches;
-                            for d in 0..64 {
-                                let mut acc = 0.0f32;
-                                for kj in 0..num_patches {
-                                    let v_base = (kj * 8 + kv_h) * 64;
-                                    acc += scores[score_base + kj] * v_host[v_base + d].to_f32();
-                                }
-                                attn_host[out_base + d] = f16::from_f32(acc);
-                            }
-                        }
+                    let mut args_sdpa: [*mut std::ffi::c_void; 6] = [
+                        &mut d_attn_out as *mut _ as *mut std::ffi::c_void,
+                        &mut d_q_in as *mut _ as *mut std::ffi::c_void,
+                        &mut d_k_in as *mut _ as *mut std::ffi::c_void,
+                        &mut d_v_in as *mut _ as *mut std::ffi::c_void,
+                        &mut num_p_i32 as *mut _ as *mut std::ffi::c_void,
+                        &mut scale_f32 as *mut _ as *mut std::ffi::c_void,
+                    ];
+                    unsafe {
+                        launch_kernel_on_stream(
+                            &attn_sdpa_func,
+                            (16, num_patches as u32, 1),
+                            (64, 1, 1),
+                            0,
+                            stream,
+                            &mut args_sdpa,
+                        )?;
                     }
-
-                    self.scratch_norm.copy_from_slice(gpu, &attn_host)?;
 
                     // out_proj GEMM: [256, 1024] x [1024, 1024] -> [256, 1024]
                     for i in 0..num_patches {
