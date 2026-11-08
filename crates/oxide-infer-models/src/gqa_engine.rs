@@ -20,7 +20,7 @@ const ATTN_SCORES_AND_V_ACCUM_PTX: &str = r#"
 ) {
     .reg .pred %p0, %p1;
     .reg .b32 %head_idx, %dim_idx, %t_idx, %slen, %nq, %nkv, %hd, %kv_head_idx, %hstride, %kv_idx_32, %tid_val;
-    .reg .b32 %s_offset, %s_addr;
+    .reg .b32 %s_offset, %s_addr, %lane_id_r, %warp_id_r, %wctr, %nw;
     .reg .b64 %ctx_ptr, %q_ptr, %k_ptr, %v_ptr, %offset, %q_offset;
     .reg .b16 %hq, %hk, %hv, %hctx;
     .reg .f32 %fq, %fk, %fv, %fdot, %fscore, %fmax, %fsum, %fweight, %fscale, %shfl_val, %faccum;
@@ -50,6 +50,7 @@ const ATTN_SCORES_AND_V_ACCUM_PTX: &str = r#"
     .shared .f32 s_scores[512];
     .shared .f32 s_max;
     .shared .f32 s_denom;
+    .shared .f32 s_warp_dot[8];
 
     mov.u32 %t_idx, 0;
 TOKEN_LOOP:
@@ -97,13 +98,43 @@ DOT_REDUCE:
     shfl.sync.down.b32 %shfl_val, %fdot, 1, 31, 0xffffffff;
     add.f32 %fdot, %fdot, %shfl_val;
 
+    // Cross-warp reduction: lane 0 of each warp publishes its partial, then
+    // thread 0 sums all warp partials.
+    mov.u32 %tid_val, %tid.x;
+    and.b32 %lane_id_r, %tid_val, 31;
+    shr.u32 %warp_id_r, %tid_val, 5;
+    setp.eq.u32 %p1, %lane_id_r, 0;
+    mov.u32 %s_addr, s_warp_dot;
+    shl.b32 %s_offset, %warp_id_r, 2;
+    add.u32 %s_addr, %s_addr, %s_offset;
+    @%p1 st.shared.f32 [%s_addr], %fdot;
+    bar.sync 0;
+
     mov.u32 %tid_val, %tid.x;
     setp.eq.u32 %p1, %tid_val, 0;
+    @!%p1 bra DOT_DONE;
+    mov.f32 %fdot, 0.0;
+    mov.u32 %nw, %ntid.x;
+    shr.u32 %nw, %nw, 5;
+    mov.u32 %wctr, 0;
+DOT_WARP_SUM:
+    setp.ge.u32 %p1, %wctr, %nw;
+    @%p1 bra DOT_HAVE;
+    mov.u32 %s_addr, s_warp_dot;
+    shl.b32 %s_offset, %wctr, 2;
+    add.u32 %s_addr, %s_addr, %s_offset;
+    ld.shared.f32 %shfl_val, [%s_addr];
+    add.f32 %fdot, %fdot, %shfl_val;
+    add.u32 %wctr, %wctr, 1;
+    bra DOT_WARP_SUM;
+DOT_HAVE:
     mul.f32 %fscore, %fdot, %fscale;
     shl.b32 %s_offset, %t_idx, 2;
     mov.u32 %s_addr, s_scores;
     add.u32 %s_addr, %s_addr, %s_offset;
-    @%p1 st.shared.f32 [%s_addr], %fscore;
+    st.shared.f32 [%s_addr], %fscore;
+DOT_DONE:
+    bar.sync 0;
 
     add.u32 %t_idx, %t_idx, 1;
     bra TOKEN_LOOP;

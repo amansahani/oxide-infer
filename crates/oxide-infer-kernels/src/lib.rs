@@ -4,6 +4,7 @@ pub mod norm;
 pub mod attention;
 pub mod activations;
 pub mod conv;
+pub mod batched_attn;
 
 pub use ptx::PtxModule;
 pub use attention::PagedAttentionExecutor;

@@ -5,10 +5,377 @@ use oxide_infer_kernels::norm::RMS_NORM_FP16_PTX;
 use oxide_infer_kernels::PtxModule;
 use cuda_core::launch_kernel_on_stream;
 
-const RESIDUAL_ADD_PTX: &str = r#"
+pub const RESIDUAL_ADD_PTX: &str = r#"
 .version 7.5
 .target sm_80
 .address_size 64
+
+.visible .entry batched_rms_norm_vec8_fp16(
+    .param .u64 out_ptr,
+    .param .u64 in_ptr,
+    .param .u64 weight_ptr,
+    .param .f32 epsilon,
+    .param .u32 hidden_size,
+    .param .u32 batch_size
+) {
+    .reg .pred %p0, %p1, %p_lane0;
+    .reg .b32 %lane_id, %warp_id, %num_warps, %tid_val, %ntid_val, %stride, %k_idx, %h_size, %b_idx, %b_size, %s_addr;
+    .reg .b64 %y_ptr, %x_ptr, %w_ptr, %offset, %b_offset;
+    .reg .b32 %v0, %v1, %v2, %v3, %wv0, %wv1, %wv2, %wv3;
+    .reg .b32 %out0, %out1, %out2, %out3;
+    .reg .b16 %h0, %h1, %hw0, %hw1, %hn0, %hn1;
+    .reg .f32 %f0, %f1, %fw0, %fw1;
+    .reg .f32 %f_norm0, %f_norm1, %f_norm2, %f_norm3, %f_norm4, %f_norm5, %f_norm6, %f_norm7;
+    .reg .f32 %sum_sq, %shfl_val, %inv_rms, %h_size_f32, %eps, %mean_sq;
+    .shared .f32 s_warp_sums[8];
+    .shared .f32 s_inv_rms;
+
+    ld.param.u32 %h_size, [hidden_size];
+    ld.param.u32 %b_size, [batch_size];
+    ld.param.f32 %eps, [epsilon];
+
+    mov.u32 %b_idx, %ctaid.y;
+    setp.ge.u32 %p0, %b_idx, %b_size;
+    @%p0 bra EXIT_BNORM;
+
+    ld.param.u64 %y_ptr, [out_ptr];
+    ld.param.u64 %x_ptr, [in_ptr];
+    ld.param.u64 %w_ptr, [weight_ptr];
+
+    mul.wide.u32 %b_offset, %b_idx, %h_size;
+    shl.b64 %b_offset, %b_offset, 1;
+    add.u64 %y_ptr, %y_ptr, %b_offset;
+    add.u64 %x_ptr, %x_ptr, %b_offset;
+
+    mov.u32 %tid_val, %tid.x;
+    and.b32 %lane_id, %tid_val, 31;
+    shr.u32 %warp_id, %tid_val, 5;
+    mov.u32 %ntid_val, %ntid.x;
+    shr.u32 %num_warps, %ntid_val, 5;
+
+    shl.b32 %k_idx, %tid_val, 3;
+    cvt.u64.u32 %offset, %k_idx;
+    shl.b64 %offset, %offset, 1;
+
+    mov.f32 %sum_sq, 0.0;
+
+    setp.ge.u32 %p0, %k_idx, %h_size;
+    @%p0 bra REDUCE_BNORM;
+
+    add.u64 %x_ptr, %x_ptr, %offset;
+    ld.global.v4.u32 {%v0, %v1, %v2, %v3}, [%x_ptr];
+
+    mov.b32 {%h0, %h1}, %v0;
+    cvt.f32.f16 %f0, %h0;
+    cvt.f32.f16 %f1, %h1;
+    fma.rn.f32 %sum_sq, %f0, %f0, %sum_sq;
+    fma.rn.f32 %sum_sq, %f1, %f1, %sum_sq;
+
+    mov.b32 {%h0, %h1}, %v1;
+    cvt.f32.f16 %f0, %h0;
+    cvt.f32.f16 %f1, %h1;
+    fma.rn.f32 %sum_sq, %f0, %f0, %sum_sq;
+    fma.rn.f32 %sum_sq, %f1, %f1, %sum_sq;
+
+    mov.b32 {%h0, %h1}, %v2;
+    cvt.f32.f16 %f0, %h0;
+    cvt.f32.f16 %f1, %h1;
+    fma.rn.f32 %sum_sq, %f0, %f0, %sum_sq;
+    fma.rn.f32 %sum_sq, %f1, %f1, %sum_sq;
+
+    mov.b32 {%h0, %h1}, %v3;
+    cvt.f32.f16 %f0, %h0;
+    cvt.f32.f16 %f1, %h1;
+    fma.rn.f32 %sum_sq, %f0, %f0, %sum_sq;
+    fma.rn.f32 %sum_sq, %f1, %f1, %sum_sq;
+
+REDUCE_BNORM:
+    shfl.sync.down.b32 %shfl_val, %sum_sq, 16, 31, 0xffffffff;
+    add.f32 %sum_sq, %sum_sq, %shfl_val;
+    shfl.sync.down.b32 %shfl_val, %sum_sq, 8, 31, 0xffffffff;
+    add.f32 %sum_sq, %sum_sq, %shfl_val;
+    shfl.sync.down.b32 %shfl_val, %sum_sq, 4, 31, 0xffffffff;
+    add.f32 %sum_sq, %sum_sq, %shfl_val;
+    shfl.sync.down.b32 %shfl_val, %sum_sq, 2, 31, 0xffffffff;
+    add.f32 %sum_sq, %sum_sq, %shfl_val;
+    shfl.sync.down.b32 %shfl_val, %sum_sq, 1, 31, 0xffffffff;
+    add.f32 %sum_sq, %sum_sq, %shfl_val;
+
+    setp.eq.u32 %p_lane0, %lane_id, 0;
+    mov.u32 %s_addr, s_warp_sums;
+    shl.b32 %stride, %warp_id, 2;
+    add.u32 %s_addr, %s_addr, %stride;
+    @%p_lane0 st.shared.f32 [%s_addr], %sum_sq;
+    bar.sync 0;
+
+    setp.eq.u32 %p0, %warp_id, 0;
+    @!%p0 bra NORM_WRITE_BNORM;
+
+    setp.lt.u32 %p1, %tid_val, %num_warps;
+    mov.u32 %s_addr, s_warp_sums;
+    shl.b32 %stride, %tid_val, 2;
+    add.u32 %s_addr, %s_addr, %stride;
+    @%p1 ld.shared.f32 %sum_sq, [%s_addr];
+    @!%p1 mov.f32 %sum_sq, 0.0;
+
+    shfl.sync.down.b32 %shfl_val, %sum_sq, 4, 31, 0xffffffff;
+    add.f32 %sum_sq, %sum_sq, %shfl_val;
+    shfl.sync.down.b32 %shfl_val, %sum_sq, 2, 31, 0xffffffff;
+    add.f32 %sum_sq, %sum_sq, %shfl_val;
+    shfl.sync.down.b32 %shfl_val, %sum_sq, 1, 31, 0xffffffff;
+    add.f32 %sum_sq, %sum_sq, %shfl_val;
+
+    setp.eq.u32 %p_lane0, %tid_val, 0;
+    @!%p_lane0 bra NORM_WRITE_BNORM;
+
+    cvt.rn.f32.u32 %h_size_f32, %h_size;
+    div.rn.f32 %mean_sq, %sum_sq, %h_size_f32;
+    add.f32 %mean_sq, %mean_sq, %eps;
+    rsqrt.approx.ftz.f32 %inv_rms, %mean_sq;
+    st.shared.f32 [s_inv_rms], %inv_rms;
+
+NORM_WRITE_BNORM:
+    bar.sync 0;
+    ld.shared.f32 %inv_rms, [s_inv_rms];
+
+    setp.ge.u32 %p0, %k_idx, %h_size;
+    @%p0 bra EXIT_BNORM;
+
+    add.u64 %w_ptr, %w_ptr, %offset;
+    ld.global.v4.u32 {%wv0, %wv1, %wv2, %wv3}, [%w_ptr];
+
+    mov.b32 {%hw0, %hw1}, %wv0;
+    cvt.f32.f16 %fw0, %hw0;
+    cvt.f32.f16 %fw1, %hw1;
+    mov.b32 {%h0, %h1}, %v0;
+    cvt.f32.f16 %f0, %h0;
+    cvt.f32.f16 %f1, %h1;
+    mul.f32 %f_norm0, %f0, %inv_rms;
+    mul.f32 %f_norm0, %f_norm0, %fw0;
+    mul.f32 %f_norm1, %f1, %inv_rms;
+    mul.f32 %f_norm1, %f_norm1, %fw1;
+    cvt.rn.f16.f32 %hn0, %f_norm0;
+    cvt.rn.f16.f32 %hn1, %f_norm1;
+    mov.b32 %out0, {%hn0, %hn1};
+
+    mov.b32 {%hw0, %hw1}, %wv1;
+    cvt.f32.f16 %fw0, %hw0;
+    cvt.f32.f16 %fw1, %hw1;
+    mov.b32 {%h0, %h1}, %v1;
+    cvt.f32.f16 %f0, %h0;
+    cvt.f32.f16 %f1, %h1;
+    mul.f32 %f_norm2, %f0, %inv_rms;
+    mul.f32 %f_norm2, %f_norm2, %fw0;
+    mul.f32 %f_norm3, %f1, %inv_rms;
+    mul.f32 %f_norm3, %f_norm3, %fw1;
+    cvt.rn.f16.f32 %hn0, %f_norm2;
+    cvt.rn.f16.f32 %hn1, %f_norm3;
+    mov.b32 %out1, {%hn0, %hn1};
+
+    mov.b32 {%hw0, %hw1}, %wv2;
+    cvt.f32.f16 %fw0, %hw0;
+    cvt.f32.f16 %fw1, %hw1;
+    mov.b32 {%h0, %h1}, %v2;
+    cvt.f32.f16 %f0, %h0;
+    cvt.f32.f16 %f1, %h1;
+    mul.f32 %f_norm4, %f0, %inv_rms;
+    mul.f32 %f_norm4, %f_norm4, %fw0;
+    mul.f32 %f_norm5, %f1, %inv_rms;
+    mul.f32 %f_norm5, %f_norm5, %fw1;
+    cvt.rn.f16.f32 %hn0, %f_norm4;
+    cvt.rn.f16.f32 %hn1, %f_norm5;
+    mov.b32 %out2, {%hn0, %hn1};
+
+    mov.b32 {%hw0, %hw1}, %wv3;
+    cvt.f32.f16 %fw0, %hw0;
+    cvt.f32.f16 %fw1, %hw1;
+    mov.b32 {%h0, %h1}, %v3;
+    cvt.f32.f16 %f0, %h0;
+    cvt.f32.f16 %f1, %h1;
+    mul.f32 %f_norm6, %f0, %inv_rms;
+    mul.f32 %f_norm6, %f_norm6, %fw0;
+    mul.f32 %f_norm7, %f1, %inv_rms;
+    mul.f32 %f_norm7, %f_norm7, %fw1;
+    cvt.rn.f16.f32 %hn0, %f_norm6;
+    cvt.rn.f16.f32 %hn1, %f_norm7;
+    mov.b32 %out3, {%hn0, %hn1};
+
+    add.u64 %y_ptr, %y_ptr, %offset;
+    st.global.v4.u32 [%y_ptr], {%out0, %out1, %out2, %out3};
+
+EXIT_BNORM:
+    ret;
+}
+
+.visible .entry batched_swiglu_separate_fp16(
+    .param .u64 act_out,
+    .param .u64 gate_in,
+    .param .u64 up_in,
+    .param .u32 intermediate_size,
+    .param .u32 batch_size
+) {
+    .reg .pred %p0;
+    .reg .b32 %idx, %b_idx, %b_size, %stride, %inter_size;
+    .reg .b64 %out_ptr, %gate_ptr, %up_ptr, %elem_offset, %b_offset;
+    .reg .b16 %h_gate, %h_up, %h_act;
+    .reg .f32 %f_gate, %f_up, %f_neg_gate, %f_exp, %f_sig, %f_act;
+
+    ld.param.u32 %inter_size, [intermediate_size];
+    ld.param.u32 %b_size, [batch_size];
+
+    mov.u32 %b_idx, %ctaid.y;
+    setp.ge.u32 %p0, %b_idx, %b_size;
+    @%p0 bra EXIT_SWIGLU_SEP;
+
+    mov.u32 %idx, %tid.x;
+    mov.u32 %stride, %ntid.x;
+    .reg .b32 %bx;
+    mov.u32 %bx, %ctaid.x;
+    mad.lo.u32 %idx, %bx, %stride, %idx;
+
+    setp.ge.u32 %p0, %idx, %inter_size;
+    @%p0 bra EXIT_SWIGLU_SEP;
+
+    ld.param.u64 %out_ptr, [act_out];
+    ld.param.u64 %gate_ptr, [gate_in];
+    ld.param.u64 %up_ptr, [up_in];
+
+    mul.wide.u32 %b_offset, %b_idx, %inter_size;
+    shl.b64 %b_offset, %b_offset, 1;
+    add.u64 %out_ptr, %out_ptr, %b_offset;
+    add.u64 %gate_ptr, %gate_ptr, %b_offset;
+    add.u64 %up_ptr, %up_ptr, %b_offset;
+
+    cvt.u64.u32 %elem_offset, %idx;
+    shl.b64 %elem_offset, %elem_offset, 1;
+
+    add.u64 %gate_ptr, %gate_ptr, %elem_offset;
+    add.u64 %up_ptr, %up_ptr, %elem_offset;
+    add.u64 %out_ptr, %out_ptr, %elem_offset;
+
+    ld.global.u16 %h_gate, [%gate_ptr];
+    ld.global.u16 %h_up, [%up_ptr];
+
+    cvt.f32.f16 %f_gate, %h_gate;
+    cvt.f32.f16 %f_up, %h_up;
+
+    neg.f32 %f_neg_gate, %f_gate;
+    mul.f32 %f_neg_gate, %f_neg_gate, 1.44269504;
+    ex2.approx.ftz.f32 %f_exp, %f_neg_gate;
+    add.f32 %f_exp, %f_exp, 1.0;
+    rcp.approx.ftz.f32 %f_sig, %f_exp;
+
+    mul.f32 %f_act, %f_gate, %f_sig;
+    mul.f32 %f_act, %f_act, %f_up;
+
+    cvt.rn.f16.f32 %h_act, %f_act;
+
+    st.global.u16 [%out_ptr], %h_act;
+
+EXIT_SWIGLU_SEP:
+    ret;
+}
+
+.visible .entry batched_residual_add_fp16(
+    .param .u64 residual_inout,
+    .param .u64 update_in,
+    .param .u32 hidden_size,
+    .param .u32 batch_size
+) {
+    .reg .pred %p0;
+    .reg .b32 %idx, %h_size, %b_idx, %b_size, %stride;
+    .reg .b64 %res_ptr, %upd_ptr, %offset, %b_offset;
+    .reg .b32 %rv0, %rv1, %rv2, %rv3, %uv0, %uv1, %uv2, %uv3, %out0, %out1, %out2, %out3;
+    .reg .b16 %hr0, %hr1, %hu0, %hu1, %ho0, %ho1;
+    .reg .f32 %fr0, %fr1, %fu0, %fu1, %fo0, %fo1;
+
+    ld.param.u32 %h_size, [hidden_size];
+    ld.param.u32 %b_size, [batch_size];
+
+    mov.u32 %b_idx, %ctaid.y;
+    setp.ge.u32 %p0, %b_idx, %b_size;
+    @%p0 bra EXIT_RES;
+
+    mov.u32 %idx, %tid.x;
+    mov.u32 %stride, %ntid.x;
+    .reg .b32 %bx;
+    mov.u32 %bx, %ctaid.x;
+    mad.lo.u32 %idx, %bx, %stride, %idx;
+    shl.b32 %idx, %idx, 3;
+
+    setp.ge.u32 %p0, %idx, %h_size;
+    @%p0 bra EXIT_RES;
+
+    ld.param.u64 %res_ptr, [residual_inout];
+    ld.param.u64 %upd_ptr, [update_in];
+
+    mul.wide.u32 %b_offset, %b_idx, %h_size;
+    shl.b64 %b_offset, %b_offset, 1;
+    add.u64 %res_ptr, %res_ptr, %b_offset;
+    add.u64 %upd_ptr, %upd_ptr, %b_offset;
+
+    cvt.u64.u32 %offset, %idx;
+    shl.b64 %offset, %offset, 1;
+    add.u64 %res_ptr, %res_ptr, %offset;
+    add.u64 %upd_ptr, %upd_ptr, %offset;
+
+    ld.global.v4.u32 {%rv0, %rv1, %rv2, %rv3}, [%res_ptr];
+    ld.global.v4.u32 {%uv0, %uv1, %uv2, %uv3}, [%upd_ptr];
+
+    mov.b32 {%hr0, %hr1}, %rv0;
+    mov.b32 {%hu0, %hu1}, %uv0;
+    cvt.f32.f16 %fr0, %hr0;
+    cvt.f32.f16 %fr1, %hr1;
+    cvt.f32.f16 %fu0, %hu0;
+    cvt.f32.f16 %fu1, %hu1;
+    add.f32 %fo0, %fr0, %fu0;
+    add.f32 %fo1, %fr1, %fu1;
+    cvt.rn.f16.f32 %ho0, %fo0;
+    cvt.rn.f16.f32 %ho1, %fo1;
+    mov.b32 %out0, {%ho0, %ho1};
+
+    mov.b32 {%hr0, %hr1}, %rv1;
+    mov.b32 {%hu0, %hu1}, %uv1;
+    cvt.f32.f16 %fr0, %hr0;
+    cvt.f32.f16 %fr1, %hr1;
+    cvt.f32.f16 %fu0, %hu0;
+    cvt.f32.f16 %fu1, %hu1;
+    add.f32 %fo0, %fr0, %fu0;
+    add.f32 %fo1, %fr1, %fu1;
+    cvt.rn.f16.f32 %ho0, %fo0;
+    cvt.rn.f16.f32 %ho1, %fo1;
+    mov.b32 %out1, {%ho0, %ho1};
+
+    mov.b32 {%hr0, %hr1}, %rv2;
+    mov.b32 {%hu0, %hu1}, %uv2;
+    cvt.f32.f16 %fr0, %hr0;
+    cvt.f32.f16 %fr1, %hr1;
+    cvt.f32.f16 %fu0, %hu0;
+    cvt.f32.f16 %fu1, %hu1;
+    add.f32 %fo0, %fr0, %fu0;
+    add.f32 %fo1, %fr1, %fu1;
+    cvt.rn.f16.f32 %ho0, %fo0;
+    cvt.rn.f16.f32 %ho1, %fo1;
+    mov.b32 %out2, {%ho0, %ho1};
+
+    mov.b32 {%hr0, %hr1}, %rv3;
+    mov.b32 {%hu0, %hu1}, %uv3;
+    cvt.f32.f16 %fr0, %hr0;
+    cvt.f32.f16 %fr1, %hr1;
+    cvt.f32.f16 %fu0, %hu0;
+    cvt.f32.f16 %fu1, %hu1;
+    add.f32 %fo0, %fr0, %fu0;
+    add.f32 %fo1, %fr1, %fu1;
+    cvt.rn.f16.f32 %ho0, %fo0;
+    cvt.rn.f16.f32 %ho1, %fo1;
+    mov.b32 %out3, {%ho0, %ho1};
+
+    st.global.v4.u32 [%res_ptr], {%out0, %out1, %out2, %out3};
+
+EXIT_RES:
+    ret;
+}
+
 
 .visible .entry copy_kv_slice_vec8_fp16(
     .param .u64 dst_cache,
@@ -734,28 +1101,59 @@ EXIT:
 }
 "#;
 
-enum LayerType {
+pub enum LayerType {
     Conv(CausalConvLayer),
     Attention(Lfm3AttentionLayer),
 }
 
 pub struct FullLfm3DecoderLayer {
-    inner_layer: LayerType,
+    pub inner_layer: LayerType,
     pub ffn: FfnLayer,
-    operator_norm: DeviceBuffer<half::f16>,
-    ffn_norm: DeviceBuffer<half::f16>,
-    post_operator_norm: DeviceBuffer<half::f16>,
-    post_ffn_norm: DeviceBuffer<half::f16>,
-    norm_ptx: PtxModule,
+    pub operator_norm: DeviceBuffer<half::f16>,
+    pub ffn_norm: DeviceBuffer<half::f16>,
+    pub post_operator_norm: DeviceBuffer<half::f16>,
+    pub post_ffn_norm: DeviceBuffer<half::f16>,
+    pub norm_ptx: PtxModule,
     pub add_ptx: PtxModule,
-    hidden_size: usize,
-    rope: Option<RotaryEmbeddingTable>,
-    gqa: Option<GqaAttentionEngine>,
-    k_cache: Option<DeviceBuffer<half::f16>>,
-    v_cache: Option<DeviceBuffer<half::f16>>,
+    pub hidden_size: usize,
+    pub rope: Option<RotaryEmbeddingTable>,
+    pub gqa: Option<GqaAttentionEngine>,
+    pub k_cache: Option<DeviceBuffer<half::f16>>,
+    pub v_cache: Option<DeviceBuffer<half::f16>>,
 }
 
 impl FullLfm3DecoderLayer {
+    fn maybe_dump_qkv(
+        gpu: &GpuContext,
+        layer_idx: usize,
+        pos_id: usize,
+        q_out: &DeviceBuffer<half::f16>,
+        k_out: &DeviceBuffer<half::f16>,
+        v_out: &DeviceBuffer<half::f16>,
+    ) {
+        let dir = match std::env::var("OXIDE_DUMP_QKV_DIR") {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let l_ok = std::env::var("OXIDE_DUMP_LAYER").ok().and_then(|s| s.parse::<usize>().ok()).map(|v| v == layer_idx).unwrap_or(true);
+        let p_ok = std::env::var("OXIDE_DUMP_POS").ok().and_then(|s| s.parse::<usize>().ok()).map(|v| v == pos_id).unwrap_or(true);
+        if !l_ok || !p_ok {
+            return;
+        }
+        let stream = gpu.compute_stream();
+        let _ = stream.synchronize();
+        let write = |name: &str, buf: &DeviceBuffer<half::f16>| {
+            if let Ok(host) = buf.inner().to_host_vec(stream) {
+                let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 2) };
+                let _ = std::fs::write(format!("{}/l{}_p{}_{}.bin", dir, layer_idx, pos_id, name), bytes);
+            }
+        };
+        write("q", q_out);
+        write("k", k_out);
+        write("v", v_out);
+        eprintln!("[qkv] dumped layer {} pos {}", layer_idx, pos_id);
+    }
+
     pub fn load_from_safetensors(
         gpu: &GpuContext,
         loader: &SafeTensorsLoader,
@@ -876,6 +1274,8 @@ impl FullLfm3DecoderLayer {
                     rope.apply(gpu, k_out, pos_id, 4)?;
                 }
 
+                Self::maybe_dump_qkv(gpu, attn.layer_idx, pos_id, q_out, k_out, v_out);
+
                 // Copy current k_out and v_out into k_cache and v_cache at pos_id directly on device (D2D)!
                 let kv_dim = 4 * 128; // 512 elements
                 if let (Some(kc), Some(vc)) = (&mut self.k_cache, &mut self.v_cache) {
@@ -917,6 +1317,19 @@ impl FullLfm3DecoderLayer {
                             4,
                             128,
                         )?;
+                        if std::env::var("OXIDE_DUMP_QKV_DIR").is_ok() {
+                            let _ = stream.synchronize();
+                            if let Ok(host) = attn.context_buf.inner().to_host_vec(stream) {
+                                let bytes = unsafe {
+                                    std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 2)
+                                };
+                                let dir = std::env::var("OXIDE_DUMP_QKV_DIR").unwrap_or_default();
+                                let _ = std::fs::write(
+                                    format!("{}/l{}_p{}_ctx.bin", dir, attn.layer_idx, pos_id),
+                                    bytes,
+                                );
+                            }
+                        }
                     }
                 }
 
@@ -982,8 +1395,8 @@ impl FullLfm3DecoderLayer {
 
     /// Part 1 of forward: Operator norm, inner layer (Conv or Attention), post-operator norm,
     /// and fused residual add + ffn_norm.
-    /// After this, `scratch_norm` holds the input ready for the FFN block.
-    pub fn forward_pre_ffn(
+    /// Supports per-request state (k_cache, v_cache, conv_state) for multi-sequence concurrency.
+    pub fn forward_pre_ffn_with_cache(
         &mut self,
         gpu: &GpuContext,
         hidden_states: &mut DeviceBuffer<half::f16>,
@@ -994,6 +1407,9 @@ impl FullLfm3DecoderLayer {
         v_out: &mut DeviceBuffer<half::f16>,
         gate_out: &mut DeviceBuffer<half::f16>,
         pos_id: usize,
+        req_k_cache: Option<&mut DeviceBuffer<half::f16>>,
+        req_v_cache: Option<&mut DeviceBuffer<half::f16>>,
+        req_conv_state: Option<&mut DeviceBuffer<half::f16>>,
     ) -> Result<()> {
         let stream = gpu.compute_stream();
         let rms_func = self.add_ptx.get_function("rms_norm_vec8_fp16")?;
@@ -1019,7 +1435,11 @@ impl FullLfm3DecoderLayer {
         // 2. Inner Layer forward -> scratch_layer_out
         match &mut self.inner_layer {
             LayerType::Conv(conv) => {
-                conv.forward(gpu, scratch_norm, scratch_layer_out)?;
+                if let Some(cs) = req_conv_state {
+                    conv.forward_with_cache(gpu, scratch_norm, scratch_layer_out, cs)?;
+                } else {
+                    conv.forward(gpu, scratch_norm, scratch_layer_out)?;
+                }
             }
             LayerType::Attention(attn) => {
                 attn.forward_projections(gpu, scratch_norm, q_out, k_out, v_out, gate_out)?;
@@ -1029,11 +1449,18 @@ impl FullLfm3DecoderLayer {
                     rope.apply(gpu, k_out, pos_id, 4)?;
                 }
 
+                Self::maybe_dump_qkv(gpu, attn.layer_idx, pos_id, q_out, k_out, v_out);
+
                 let kv_dim = 4 * 128; // 512 elements
-                if let (Some(kc), Some(vc)) = (&mut self.k_cache, &mut self.v_cache) {
+                let (kc, vc) = match (req_k_cache, req_v_cache) {
+                    (Some(kc), Some(vc)) => (Some(kc), Some(vc)),
+                    _ => (self.k_cache.as_mut(), self.v_cache.as_mut()),
+                };
+
+                if let (Some(kc_buf), Some(vc_buf)) = (kc, vc) {
                     let offset = pos_id * kv_dim;
-                    let mut kc_ptr = kc.inner_mut().cu_deviceptr() + (offset * 2) as u64;
-                    let mut vc_ptr = vc.inner_mut().cu_deviceptr() + (offset * 2) as u64;
+                    let mut kc_ptr = kc_buf.inner_mut().cu_deviceptr() + (offset * 2) as u64;
+                    let mut vc_ptr = vc_buf.inner_mut().cu_deviceptr() + (offset * 2) as u64;
                     let mut d_k = k_out.inner().cu_deviceptr();
                     let mut d_v = v_out.inner().cu_deviceptr();
                     let mut kv_dim_u32 = kv_dim as u32;
@@ -1060,13 +1487,41 @@ impl FullLfm3DecoderLayer {
                             gpu,
                             &mut attn.context_buf,
                             q_out,
-                            kc,
-                            vc,
+                            kc_buf,
+                            vc_buf,
                             pos_id + 1,
                             16,
                             4,
                             128,
                         )?;
+                        if std::env::var("OXIDE_DUMP_QKV_DIR").is_ok() {
+                            let _ = stream.synchronize();
+                            for (name, buf) in [("kcache", kc_buf), ("vcache", vc_buf)] {
+                                if let Ok(host) = buf.inner().to_host_vec(stream) {
+                                    let bytes = unsafe {
+                                        std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 2)
+                                    };
+                                    let dir = std::env::var("OXIDE_DUMP_QKV_DIR").unwrap_or_default();
+                                    let _ = std::fs::write(
+                                        format!("{}/l{}_p{}_{}.bin", dir, attn.layer_idx, pos_id, name),
+                                        bytes,
+                                    );
+                                }
+                            }
+                        }
+                        if std::env::var("OXIDE_DUMP_QKV_DIR").is_ok() {
+                            let _ = stream.synchronize();
+                            if let Ok(host) = attn.context_buf.inner().to_host_vec(stream) {
+                                let bytes = unsafe {
+                                    std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 2)
+                                };
+                                let dir = std::env::var("OXIDE_DUMP_QKV_DIR").unwrap_or_default();
+                                let _ = std::fs::write(
+                                    format!("{}/l{}_p{}_ctx.bin", dir, attn.layer_idx, pos_id),
+                                    bytes,
+                                );
+                            }
+                        }
                     }
                 }
 
@@ -1105,6 +1560,34 @@ impl FullLfm3DecoderLayer {
             launch_kernel_on_stream(&fused_res_norm_func, (1, 1, 1), (256, 1, 1), 0, stream, &mut args_fused_res1)?;
         }
         Ok(())
+    }
+
+    pub fn forward_pre_ffn(
+        &mut self,
+        gpu: &GpuContext,
+        hidden_states: &mut DeviceBuffer<half::f16>,
+        scratch_norm: &mut DeviceBuffer<half::f16>,
+        scratch_layer_out: &mut DeviceBuffer<half::f16>,
+        q_out: &mut DeviceBuffer<half::f16>,
+        k_out: &mut DeviceBuffer<half::f16>,
+        v_out: &mut DeviceBuffer<half::f16>,
+        gate_out: &mut DeviceBuffer<half::f16>,
+        pos_id: usize,
+    ) -> Result<()> {
+        self.forward_pre_ffn_with_cache(
+            gpu,
+            hidden_states,
+            scratch_norm,
+            scratch_layer_out,
+            q_out,
+            k_out,
+            v_out,
+            gate_out,
+            pos_id,
+            None,
+            None,
+            None,
+        )
     }
 
     /// Part 2 of forward: Fused post-FFN norm + Residual 2

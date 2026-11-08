@@ -8,7 +8,7 @@ use cuda_core::launch_kernel_on_stream;
 // Fused Causal Conv1D + B*x gating + C*conv_out gating
 // Computes B[i]*x[i], evaluates 1D convolution with state_cache, shifts state, and multiplies by C[i]
 // completely in registers without intermediate DRAM buffers (bx_buffer / conv_out_buffer).
-const FUSED_CONV_GATING_PTX: &str = r#"
+pub const FUSED_CONV_GATING_PTX: &str = r#"
 .version 7.5
 .target sm_80
 .address_size 64
@@ -246,6 +246,71 @@ impl CausalConvLayer {
         let mut h_dim = self.hidden_size as u32;
         let mut in_proj_rows = (3 * self.hidden_size) as u32;
 
+        let mut d_bcx = self.bcx_buffer.inner_mut().cu_deviceptr();
+        let mut d_x = x.inner().cu_deviceptr();
+        let mut d_in_w = self.in_proj.inner().cu_deviceptr();
+
+        let mut args_in: [*mut std::ffi::c_void; 5] = [
+            &mut d_bcx as *mut _ as *mut std::ffi::c_void,
+            &mut d_x as *mut _ as *mut std::ffi::c_void,
+            &mut d_in_w as *mut _ as *mut std::ffi::c_void,
+            &mut h_dim as *mut _ as *mut std::ffi::c_void,
+            &mut in_proj_rows as *mut _ as *mut std::ffi::c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(&gemv_func, (in_proj_rows, 1, 1), (64, 1, 1), 0, stream, &mut args_in)?;
+        }
+
+        let block_dim: u32 = 128;
+        let grid_dim: u32 = (h_dim + block_dim - 1) / block_dim;
+        let mut d_y = self.y_buffer.inner_mut().cu_deviceptr();
+        let mut d_cache = self.state_cache.inner_mut().cu_deviceptr();
+        let mut d_cw = self.conv_weight.inner().cu_deviceptr();
+        let mut k_len_u32 = self.k_len as u32;
+
+        let mut args_fused: [*mut std::ffi::c_void; 6] = [
+            &mut d_y as *mut _ as *mut std::ffi::c_void,
+            &mut d_cache as *mut _ as *mut std::ffi::c_void,
+            &mut d_bcx as *mut _ as *mut std::ffi::c_void,
+            &mut d_cw as *mut _ as *mut std::ffi::c_void,
+            &mut h_dim as *mut _ as *mut std::ffi::c_void,
+            &mut k_len_u32 as *mut _ as *mut std::ffi::c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(&fused_conv_func, (grid_dim, 1, 1), (block_dim, 1, 1), 0, stream, &mut args_fused)?;
+        }
+
+        let mut d_out = out.inner_mut().cu_deviceptr();
+        let mut d_ow = self.out_proj.inner().cu_deviceptr();
+
+        let mut args_out_proj: [*mut std::ffi::c_void; 5] = [
+            &mut d_out as *mut _ as *mut std::ffi::c_void,
+            &mut d_y as *mut _ as *mut std::ffi::c_void,
+            &mut d_ow as *mut _ as *mut std::ffi::c_void,
+            &mut h_dim as *mut _ as *mut std::ffi::c_void,
+            &mut h_dim as *mut _ as *mut std::ffi::c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(&gemv_func, (h_dim, 1, 1), (64, 1, 1), 0, stream, &mut args_out_proj)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn forward_with_cache(
+        &mut self,
+        gpu: &GpuContext,
+        x: &DeviceBuffer<half::f16>,
+        out: &mut DeviceBuffer<half::f16>,
+        state_cache: &mut DeviceBuffer<half::f16>,
+    ) -> Result<()> {
+        let stream = gpu.compute_stream();
+        let gemv_func = self.gemv_module.get_function("fused_gemv_fp16_vec8")?;
+        let fused_conv_func = self.fused_conv_module.get_function("fused_causal_conv1d_gating_fp16")?;
+
+        let mut h_dim = self.hidden_size as u32;
+        let mut in_proj_rows = (3 * self.hidden_size) as u32;
+
         // 1. in_proj GEMV: [6144, 2048] x [2048] -> [6144] (BCx) with 128-bit vectorization
         let mut d_bcx = self.bcx_buffer.inner_mut().cu_deviceptr();
         let mut d_x = x.inner().cu_deviceptr();
@@ -266,7 +331,7 @@ impl CausalConvLayer {
         let block_dim: u32 = 128;
         let grid_dim: u32 = (h_dim + block_dim - 1) / block_dim;
         let mut d_y = self.y_buffer.inner_mut().cu_deviceptr();
-        let mut d_cache = self.state_cache.inner_mut().cu_deviceptr();
+        let mut d_cache = state_cache.inner_mut().cu_deviceptr();
         let mut d_cw = self.conv_weight.inner().cu_deviceptr();
         let mut k_len_u32 = self.k_len as u32;
 

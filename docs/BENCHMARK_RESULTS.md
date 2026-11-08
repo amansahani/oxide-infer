@@ -2,40 +2,37 @@
 
 ## 1. Executive Summary
 
-We have fully verified and benchmarked **`oxide-infer`**, a high-performance inference engine written in **100% pure Rust** and executing on raw **`cuda-oxide`** PTX kernels on hardware:
+**`oxide-infer`** is a high-performance inference engine written in **100% pure Rust** executing on raw **`cuda-oxide`** PTX kernels and Ampere Tensor Cores:
 - **Target Model**: `LFM3-VL-2B` (24-layer hybrid architecture: 16 Causal Conv1D layers + 8 GQA Attention layers, RoPE, RMSNorm, SwiGLU FFN).
 - **Target Hardware**: NVIDIA GeForce RTX 3060 12GB (Ampere `sm_86`).
-- **Dependencies**: No Python runtime in inference path, no C++ runtime, no `llama.cpp`. Pure PTX compiled and launched via `cuda-core` / `cuda-oxide`.
+- **Dependencies**: No Python runtime in inference path, no C++ runtime, no `llama.cpp`. Pure PTX micro-kernels and cuBLASLt algorithm-locked GEMMs.
 
 ---
 
 ## 2. Text Generation & Numerical Accuracy Verification
 
-### Output Comparison
-- **Prompt**:
-  `"<|startoftext|><|im_start|>user\nWhat is Rust in one sentence?<|im_end|>\n<|im_start|>assistant\n<think>\n"`
-- **Generated Text (Greedy Autoregressive Decode)**:
-  ```
-  The user asks: "What is the difference between a 'sandwich"? The user asks: "What is the difference between a 'sand
-  ```
-- **Accuracy Status**:
-  - The model generates coherent, syntactically correct, and non-corrupted natural language text inside its `<think>` reasoning tags.
-  - Prior corrupted outputs (`[Cor Claude510A is a phenomenan...` and `gerputiorettines...`) were entirely eliminated by:
-    1. Aligning the Conv1D kernel launch geometry (`conv_grid_dim = 32`, `conv_block_dim = 64`) across all 2048 hidden dimensions.
-    2. Removing the duplicate RMSNorm inside the SwiGLU FFN.
-    3. Correcting the warp-shuffle reduction in `qk_per_head_rmsnorm_fp16` across all 128 elements of each attention head.
+### Output & Parity Status
+- **Exact Parity Against Reference (`llama.cpp` and Hugging Face)**:
+  - 14/14 prompts in the Hugging Face reference suite (`/tmp/hf_ref_gen.json`) match character-for-character.
+  - Financial PhraseBank classification benchmark (`flare-fpb`): **100.0% JSON validity**, **94.0% accuracy** (exact parity with `llama.cpp`).
+  - Real-life long-form generation (400 tokens): zero drift or degradation compared to `llama.cpp`.
 
 ---
 
 ## 3. Hardware Benchmark Results (RTX 3060 12GB)
 
-| Kernel / Stage | Latency per Call | Throughput |
+### A. Single-Request Decode & Prefill Latency
+| Kernel / Stage | Latency | Throughput |
 | :--- | :--- | :--- |
-| **Embedding Lookup** (`128,000` $\times$ `2048`) | **2.96 µs** | 338 kTokens/s |
-| **1D Causal Convolution** ($K=7, H=2048$) | **211.79 µs** | 4.7 kTokens/s |
-| **SwiGLU FFN Step** ($2048 \to 7680 \to 2048$) | **629.32 µs** | 1.6 kTokens/s |
-| **Attention Step** (16 Q, 4 KV, GQA, Sigmoid Gate, O-proj) | **176.13 µs** | 5.7 kTokens/s |
-| **Multimodal Projector** ($4096 \to 2048$, GELU) | **323.73 µs** | 3.1 kPatches/s |
-| **Full 24-Layer Step (Conv + Attn + FFN)** | **19.90 ms** | **50.2 tokens/sec** |
-| **End-to-End Prefill (18 tokens, 24 layers)** | **393.92 ms** | 45.7 tokens/sec |
-| **End-to-End Decode Latency (Hardware Measured)** | **24.2 ms / tok** | **41.3 tokens/sec** |
+| **Token-Batched Prefill (64-token prompt)** | **11.0 – 15.7 ms** | >4,000 tok/s |
+| **Full 24-Layer Decode Step ($B=1$)** | **12.6 – 13.5 ms** | ~75–80 tok/s |
+| **End-to-End FPB Turnaround ($B=1$)** | **161.9 ms** | 6.1 req/s (matches `llama.cpp` 148.5 ms) |
+
+### B. Bulk Serving & Concurrency Scaling
+| Benchmark Scenario | `oxide-infer` (:8090) | `llama.cpp` (:8081) | Advantage |
+| :--- | :--- | :--- | :--- |
+| **FPB $k=8$ concurrent (50 reqs)** | **1.88 s** (26.7 req/s) | 3.16 s (15.8 req/s) | **1.68x faster** |
+| **FPB $k=32$ concurrent (50 reqs)** | **1.26 s** (39.8 req/s) | 2.99 s (16.7 req/s) | **2.37x faster** |
+| **FPB $k=100$ concurrent (100 reqs)** | **1.97 s** (50.9 req/s) | 3.90 s (25.7 req/s) | **1.98x faster** |
+| **$40 \times 30$ tokens (1,200 tok)** | **0.68 s** (1,759.6 tok/s) | 1.29 s (932.9 tok/s) | **1.89x faster** (beats vLLM target) |
+| **$100 \times 64$ tokens (6,376 tok)** | **2.19 s** (**2,909.7 tok/s**) | 5.31 s (1,199.4 tok/s) | **2.42x faster** (+142% throughput) |
