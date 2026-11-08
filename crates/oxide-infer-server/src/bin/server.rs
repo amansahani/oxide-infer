@@ -708,8 +708,9 @@ FINISH:
                                 v_caches.push(None);
                                 conv_states.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, 2048 * 7).expect("alloc")));
                             } else {
-                                k_caches.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, 1024 * 512).expect("alloc")));
-                                v_caches.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, 1024 * 512).expect("alloc")));
+                                // 4096 tokens capacity (512 elements per token = 4 heads x 128 dim)
+                                k_caches.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, 4096 * 512).expect("alloc")));
+                                v_caches.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, 4096 * 512).expect("alloc")));
                                 conv_states.push(None);
                             }
                         }
@@ -837,8 +838,9 @@ FINISH:
                                 v_caches.push(None);
                                 conv_states.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, 2048 * 7).expect("alloc")));
                             } else {
-                                k_caches.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, 1024 * 512).expect("alloc")));
-                                v_caches.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, 1024 * 512).expect("alloc")));
+                                // 4096 tokens capacity (512 elements per token = 4 heads x 128 dim)
+                                k_caches.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, 4096 * 512).expect("alloc")));
+                                v_caches.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, 4096 * 512).expect("alloc")));
                                 conv_states.push(None);
                             }
                         }
