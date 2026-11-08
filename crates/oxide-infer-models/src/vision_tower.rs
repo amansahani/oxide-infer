@@ -45,6 +45,7 @@ pub struct VisionLayerWeights {
 }
 
 pub struct VisionTower {
+    pub cublas_handle: crate::cublas::CublasHandle,
     pub patchifier_w: DeviceBuffer<f16>,
     pub embedding_norm_w: DeviceBuffer<f16>,
     pub layers: Vec<VisionLayerWeights>,
@@ -112,6 +113,11 @@ impl VisionTower {
         let patchifier_w = convert_bf16_to_f16("model.vision_tower.patchifier.weight")?;
         let embedding_norm_w = convert_bf16_to_f16("model.vision_tower.embedding_norm.weight")?;
 
+        let mut cublas_handle: crate::cublas::CublasHandle = std::ptr::null_mut();
+        unsafe {
+            assert_eq!(crate::cublas::cublasCreate_v2(&mut cublas_handle), 0);
+            assert_eq!(crate::cublas::cublasSetStream_v2(cublas_handle, stream.cu_stream() as *mut _), 0);
+        }
         let mut layers = Vec::with_capacity(14);
         for l_idx in 0..14 {
             let prefix = format!("model.vision_tower.layers.{}", l_idx);
@@ -225,6 +231,7 @@ impl VisionTower {
         let scratch_proj_gelu = DeviceBuffer::<f16>::zeroed(gpu, (n / 4) * 4096)?;
 
         Ok(Self {
+            cublas_handle,
             patchifier_w,
             embedding_norm_w,
             layers,
@@ -278,27 +285,18 @@ impl VisionTower {
         let num_patches = 256usize;
         let c = 1024usize;
 
-        // 1. Patchifier: [256, 1536] x [1536, 1024] -> [256, 1024]
+        // 1. Patchifier: [256, 1536] x [1536, 1024] -> [256, 1024] (cuBLAS HGEMM)
         let gemv_func = self.gemv_ptx.get_function("fused_gemv_fp16_fp32accum")?;
-        for i in 0..num_patches {
-            let in_off = i * 1536;
-            let out_off = i * c;
-            let mut d_out = self.scratch_h1.inner().cu_deviceptr() + (out_off * 2) as u64;
-            let mut d_in = pixel_patches.inner().cu_deviceptr() + (in_off * 2) as u64;
-            let mut d_w = self.patchifier_w.inner().cu_deviceptr();
-            let mut k_arg = 1536u32;
-            let mut m_arg = c as u32;
-
-            let mut args: [*mut std::ffi::c_void; 5] = [
-                &mut d_out as *mut _ as *mut std::ffi::c_void,
-                &mut d_in as *mut _ as *mut std::ffi::c_void,
-                &mut d_w as *mut _ as *mut std::ffi::c_void,
-                &mut k_arg as *mut _ as *mut std::ffi::c_void,
-                &mut m_arg as *mut _ as *mut std::ffi::c_void,
-            ];
-            unsafe {
-                launch_kernel_on_stream(&gemv_func, (c as u32, 1, 1), (64, 1, 1), 4, stream, &mut args)?;
-            }
+        unsafe {
+            crate::cublas::cublas_matmul_rowmajor(
+                self.cublas_handle,
+                num_patches as i32,
+                c as i32,
+                1536,
+                pixel_patches.inner().cu_deviceptr() as *const _,
+                self.patchifier_w.inner().cu_deviceptr() as *const _,
+                self.scratch_h1.inner_mut().cu_deviceptr() as *mut _,
+            )?;
         }
 
         // 2. Embedding RMSNorm
@@ -358,25 +356,17 @@ impl VisionTower {
 
             match &layer.kind {
                 VisionLayerKind::Conv { in_proj_w, spatial_conv_w, out_proj_w } => {
-                    // in_proj GEMM: [256, 1024] x [1024, 3072] -> [256, 3072]
-                    for i in 0..num_patches {
-                        let in_off = i * c;
-                        let out_off = i * 3 * c;
-                        let mut d_out = self.scratch_proj_3c.inner().cu_deviceptr() + (out_off * 2) as u64;
-                        let mut d_in = self.scratch_norm.inner().cu_deviceptr() + (in_off * 2) as u64;
-                        let mut d_w = in_proj_w.inner().cu_deviceptr();
-                        let mut k_arg = c as u32;
-                        let mut m_arg = (3 * c) as u32;
-                        let mut args: [*mut std::ffi::c_void; 5] = [
-                            &mut d_out as *mut _ as *mut std::ffi::c_void,
-                            &mut d_in as *mut _ as *mut std::ffi::c_void,
-                            &mut d_w as *mut _ as *mut std::ffi::c_void,
-                            &mut k_arg as *mut _ as *mut std::ffi::c_void,
-                            &mut m_arg as *mut _ as *mut std::ffi::c_void,
-                        ];
-                        unsafe {
-                            launch_kernel_on_stream(&gemv_func, (m_arg, 1, 1), (64, 1, 1), 4, stream, &mut args)?;
-                        }
+                    // in_proj GEMM: [256, 1024] x [1024, 3072] -> [256, 3072] (cuBLAS HGEMM)
+                    unsafe {
+                        crate::cublas::cublas_matmul_rowmajor(
+                            self.cublas_handle,
+                            num_patches as i32,
+                            (3 * c) as i32,
+                            c as i32,
+                            self.scratch_norm.inner().cu_deviceptr() as *const _,
+                            in_proj_w.inner().cu_deviceptr() as *const _,
+                            self.scratch_proj_3c.inner_mut().cu_deviceptr() as *mut _,
+                        )?;
                     }
 
                     // Unpack B*x and C
@@ -457,110 +447,75 @@ impl VisionTower {
                         launch_kernel_on_stream(&mult_func, ((total_nc + 255) / 256, 1, 1), (256, 1, 1), 0, stream, &mut args_mult)?;
                     }
 
-                    // out_proj GEMM: [256, 1024] x [1024, 1024] -> [256, 1024]
-                    for i in 0..num_patches {
-                        let in_off = i * c;
-                        let out_off = i * c;
-                        let mut d_out = self.scratch_attn_out.inner().cu_deviceptr() + (out_off * 2) as u64;
-                        let mut d_in = self.scratch_norm.inner().cu_deviceptr() + (in_off * 2) as u64;
-                        let mut d_w = out_proj_w.inner().cu_deviceptr();
-                        let mut k_arg = c as u32;
-                        let mut m_arg = c as u32;
-                        let mut args: [*mut std::ffi::c_void; 5] = [
-                            &mut d_out as *mut _ as *mut std::ffi::c_void,
-                            &mut d_in as *mut _ as *mut std::ffi::c_void,
-                            &mut d_w as *mut _ as *mut std::ffi::c_void,
-                            &mut k_arg as *mut _ as *mut std::ffi::c_void,
-                            &mut m_arg as *mut _ as *mut std::ffi::c_void,
-                        ];
-                        unsafe {
-                            launch_kernel_on_stream(&gemv_func, (m_arg, 1, 1), (64, 1, 1), 4, stream, &mut args)?;
-                        }
+                    // out_proj GEMM: [256, 1024] x [1024, 1024] -> [256, 1024] (cuBLAS HGEMM)
+                    unsafe {
+                        crate::cublas::cublas_matmul_rowmajor(
+                            self.cublas_handle,
+                            num_patches as i32,
+                            c as i32,
+                            c as i32,
+                            self.scratch_norm.inner().cu_deviceptr() as *const _,
+                            out_proj_w.inner().cu_deviceptr() as *const _,
+                            self.scratch_attn_out.inner_mut().cu_deviceptr() as *mut _,
+                        )?;
                     }
                 }
                 VisionLayerKind::Attention { q_proj_w, k_proj_w, v_proj_w, out_proj_w, q_layernorm_w, k_layernorm_w } => {
-                    // Q, K, V GEMMs
-                    for i in 0..num_patches {
-                        let in_off = i * c;
-                        let out_off_q = i * c;
-                        let out_off_kv = i * (c / 2);
-
-                        // Q: 1024 -> 1024
-                        let mut d_q = self.scratch_q.inner().cu_deviceptr() + (out_off_q * 2) as u64;
-                        let mut d_in = self.scratch_norm.inner().cu_deviceptr() + (in_off * 2) as u64;
-                        let mut d_qw = q_proj_w.inner().cu_deviceptr();
-                        let mut k_arg = c as u32;
-                        let mut m_arg = c as u32;
-                        let mut args_q: [*mut std::ffi::c_void; 5] = [
-                            &mut d_q as *mut _ as *mut std::ffi::c_void,
-                            &mut d_in as *mut _ as *mut std::ffi::c_void,
-                            &mut d_qw as *mut _ as *mut std::ffi::c_void,
-                            &mut k_arg as *mut _ as *mut std::ffi::c_void,
-                            &mut m_arg as *mut _ as *mut std::ffi::c_void,
-                        ];
-                        unsafe { launch_kernel_on_stream(&gemv_func, (m_arg, 1, 1), (64, 1, 1), 4, stream, &mut args_q)?; }
-
-                        // K: 1024 -> 512
-                        let mut d_k = self.scratch_k.inner().cu_deviceptr() + (out_off_kv * 2) as u64;
-                        let mut d_kw = k_proj_w.inner().cu_deviceptr();
-                        let mut m_kv = (c / 2) as u32;
-                        let mut args_k: [*mut std::ffi::c_void; 5] = [
-                            &mut d_k as *mut _ as *mut std::ffi::c_void,
-                            &mut d_in as *mut _ as *mut std::ffi::c_void,
-                            &mut d_kw as *mut _ as *mut std::ffi::c_void,
-                            &mut k_arg as *mut _ as *mut std::ffi::c_void,
-                            &mut m_kv as *mut _ as *mut std::ffi::c_void,
-                        ];
-                        unsafe { launch_kernel_on_stream(&gemv_func, (m_kv, 1, 1), (64, 1, 1), 4, stream, &mut args_k)?; }
-
-                        // V: 1024 -> 512
-                        let mut d_v = self.scratch_v.inner().cu_deviceptr() + (out_off_kv * 2) as u64;
-                        let mut d_vw = v_proj_w.inner().cu_deviceptr();
-                        let mut args_v: [*mut std::ffi::c_void; 5] = [
-                            &mut d_v as *mut _ as *mut std::ffi::c_void,
-                            &mut d_in as *mut _ as *mut std::ffi::c_void,
-                            &mut d_vw as *mut _ as *mut std::ffi::c_void,
-                            &mut k_arg as *mut _ as *mut std::ffi::c_void,
-                            &mut m_kv as *mut _ as *mut std::ffi::c_void,
-                        ];
-                        unsafe { launch_kernel_on_stream(&gemv_func, (m_kv, 1, 1), (64, 1, 1), 4, stream, &mut args_v)?; }
+                    // Q, K, V GEMMs (cuBLAS HGEMM)
+                    unsafe {
+                        crate::cublas::cublas_matmul_rowmajor(
+                            self.cublas_handle,
+                            num_patches as i32,
+                            c as i32,
+                            c as i32,
+                            self.scratch_norm.inner().cu_deviceptr() as *const _,
+                            q_proj_w.inner().cu_deviceptr() as *const _,
+                            self.scratch_q.inner_mut().cu_deviceptr() as *mut _,
+                        )?;
+                        crate::cublas::cublas_matmul_rowmajor(
+                            self.cublas_handle,
+                            num_patches as i32,
+                            (c / 2) as i32,
+                            c as i32,
+                            self.scratch_norm.inner().cu_deviceptr() as *const _,
+                            k_proj_w.inner().cu_deviceptr() as *const _,
+                            self.scratch_k.inner_mut().cu_deviceptr() as *mut _,
+                        )?;
+                        crate::cublas::cublas_matmul_rowmajor(
+                            self.cublas_handle,
+                            num_patches as i32,
+                            (c / 2) as i32,
+                            c as i32,
+                            self.scratch_norm.inner().cu_deviceptr() as *const _,
+                            v_proj_w.inner().cu_deviceptr() as *const _,
+                            self.scratch_v.inner_mut().cu_deviceptr() as *mut _,
+                        )?;
                     }
 
-                    // RMSNorm on Q (16 heads x 64) and K (8 heads x 64)
-                    for i in 0..num_patches {
-                        for h in 0..16 {
-                            let off = (i * 16 + h) * 64;
-                            let mut d_out = self.scratch_q.inner().cu_deviceptr() + (off * 2) as u64;
-                            let mut d_in = d_out;
-                            let mut d_w = q_layernorm_w.inner().cu_deviceptr();
-                            let mut head_dim = 64u32;
-                            let mut eps = 1e-5f32;
-                            let mut args: [*mut std::ffi::c_void; 5] = [
-                                &mut d_out as *mut _ as *mut std::ffi::c_void,
-                                &mut d_in as *mut _ as *mut std::ffi::c_void,
-                                &mut d_w as *mut _ as *mut std::ffi::c_void,
-                                &mut head_dim as *mut _ as *mut std::ffi::c_void,
-                                &mut eps as *mut _ as *mut std::ffi::c_void,
-                            ];
-                            unsafe { launch_kernel_on_stream(&rms_func, (1, 1, 1), (64, 1, 1), 0, stream, &mut args)?; }
-                        }
-                        for h in 0..8 {
-                            let off = (i * 8 + h) * 64;
-                            let mut d_out = self.scratch_k.inner().cu_deviceptr() + (off * 2) as u64;
-                            let mut d_in = d_out;
-                            let mut d_w = k_layernorm_w.inner().cu_deviceptr();
-                            let mut head_dim = 64u32;
-                            let mut eps = 1e-5f32;
-                            let mut args: [*mut std::ffi::c_void; 5] = [
-                                &mut d_out as *mut _ as *mut std::ffi::c_void,
-                                &mut d_in as *mut _ as *mut std::ffi::c_void,
-                                &mut d_w as *mut _ as *mut std::ffi::c_void,
-                                &mut head_dim as *mut _ as *mut std::ffi::c_void,
-                                &mut eps as *mut _ as *mut std::ffi::c_void,
-                            ];
-                            unsafe { launch_kernel_on_stream(&rms_func, (1, 1, 1), (64, 1, 1), 0, stream, &mut args)?; }
-                        }
-                    }
+                    // Vectorized RMSNorm on Q (16 heads x 64) and K (8 heads x 64)
+                    let qk_norm_func = self.rms_ptx.get_function("vision_qk_head_rmsnorm_fp16")?;
+                    let mut d_q = self.scratch_q.inner_mut().cu_deviceptr();
+                    let mut d_qw = q_layernorm_w.inner().cu_deviceptr();
+                    let mut total_q_heads = (num_patches * 16) as i32;
+                    let mut eps_q = 1e-5f32;
+                    let mut args_qn: [*mut std::ffi::c_void; 4] = [
+                        &mut d_q as *mut _ as *mut std::ffi::c_void,
+                        &mut d_qw as *mut _ as *mut std::ffi::c_void,
+                        &mut total_q_heads as *mut _ as *mut std::ffi::c_void,
+                        &mut eps_q as *mut _ as *mut std::ffi::c_void,
+                    ];
+                    unsafe { launch_kernel_on_stream(&qk_norm_func, (total_q_heads as u32, 1, 1), (64, 1, 1), 0, stream, &mut args_qn)?; }
+
+                    let mut d_k = self.scratch_k.inner_mut().cu_deviceptr();
+                    let mut d_kw = k_layernorm_w.inner().cu_deviceptr();
+                    let mut total_k_heads = (num_patches * 8) as i32;
+                    let mut args_kn: [*mut std::ffi::c_void; 4] = [
+                        &mut d_k as *mut _ as *mut std::ffi::c_void,
+                        &mut d_kw as *mut _ as *mut std::ffi::c_void,
+                        &mut total_k_heads as *mut _ as *mut std::ffi::c_void,
+                        &mut eps_q as *mut _ as *mut std::ffi::c_void,
+                    ];
+                    unsafe { launch_kernel_on_stream(&qk_norm_func, (total_k_heads as u32, 1, 1), (64, 1, 1), 0, stream, &mut args_kn)?; }
 
                     // Axial 2D RoPE
                     let mut d_q = self.scratch_q.inner().cu_deviceptr();
@@ -614,27 +569,18 @@ impl VisionTower {
                         )?;
                     }
 
-                    // out_proj GEMM: [256, 1024] x [1024, 1024] -> [256, 1024]
-                    for i in 0..num_patches {
-                        let in_off = i * c;
-                        let out_off = i * c;
-                        let mut d_out = self.scratch_attn_out.inner().cu_deviceptr() + (out_off * 2) as u64;
-                        let mut d_in = self.scratch_norm.inner().cu_deviceptr() + (in_off * 2) as u64;
-                        let mut d_w = out_proj_w.inner().cu_deviceptr();
-                        let mut k_arg = c as u32;
-                        let mut m_arg = c as u32;
-                        let mut args: [*mut std::ffi::c_void; 5] = [
-                            &mut d_out as *mut _ as *mut std::ffi::c_void,
-                            &mut d_in as *mut _ as *mut std::ffi::c_void,
-                            &mut d_w as *mut _ as *mut std::ffi::c_void,
-                            &mut k_arg as *mut _ as *mut std::ffi::c_void,
-                            &mut m_arg as *mut _ as *mut std::ffi::c_void,
-                        ];
-                        unsafe {
-                            launch_kernel_on_stream(&gemv_func, (m_arg, 1, 1), (64, 1, 1), 4, stream, &mut args)?;
-                        }
-                    }
-                }
+                    // out_proj GEMM: [256, 1024] x [1024, 1024] -> [256, 1024] (cuBLAS HGEMM)
+                    unsafe {
+                        crate::cublas::cublas_matmul_rowmajor(
+                            self.cublas_handle,
+                            num_patches as i32,
+                            c as i32,
+                            c as i32,
+                            self.scratch_norm.inner().cu_deviceptr() as *const _,
+                            out_proj_w.inner().cu_deviceptr() as *const _,
+                            self.scratch_attn_out.inner_mut().cu_deviceptr() as *mut _,
+                        )?;
+                    }                }
             }
 
             // Residual Add 1: on-device scratch_h1 = scratch_h1 + scratch_attn_out
@@ -670,38 +616,27 @@ impl VisionTower {
                 }
             }
 
-            // MLP: w1, w3, swiglu, w2
+            // MLP: w1, w3, swiglu, w2 (cuBLAS HGEMMs)
             let inter_dim = 2560usize;
-            for i in 0..num_patches {
-                let in_off = i * c;
-                let out_off = i * inter_dim;
-
-                // w1 GEMM
-                let mut d_w1_out = self.scratch_mlp_w1.inner().cu_deviceptr() + (out_off * 2) as u64;
-                let mut d_in = self.scratch_norm.inner().cu_deviceptr() + (in_off * 2) as u64;
-                let mut d_w1 = layer.mlp_w1.inner().cu_deviceptr();
-                let mut k_arg = c as u32;
-                let mut m_arg = inter_dim as u32;
-                let mut args_w1: [*mut std::ffi::c_void; 5] = [
-                    &mut d_w1_out as *mut _ as *mut std::ffi::c_void,
-                    &mut d_in as *mut _ as *mut std::ffi::c_void,
-                    &mut d_w1 as *mut _ as *mut std::ffi::c_void,
-                    &mut k_arg as *mut _ as *mut std::ffi::c_void,
-                    &mut m_arg as *mut _ as *mut std::ffi::c_void,
-                ];
-                unsafe { launch_kernel_on_stream(&gemv_func, (m_arg, 1, 1), (64, 1, 1), 4, stream, &mut args_w1)?; }
-
-                // w3 GEMM
-                let mut d_w3_out = self.scratch_mlp_w3.inner().cu_deviceptr() + (out_off * 2) as u64;
-                let mut d_w3 = layer.mlp_w3.inner().cu_deviceptr();
-                let mut args_w3: [*mut std::ffi::c_void; 5] = [
-                    &mut d_w3_out as *mut _ as *mut std::ffi::c_void,
-                    &mut d_in as *mut _ as *mut std::ffi::c_void,
-                    &mut d_w3 as *mut _ as *mut std::ffi::c_void,
-                    &mut k_arg as *mut _ as *mut std::ffi::c_void,
-                    &mut m_arg as *mut _ as *mut std::ffi::c_void,
-                ];
-                unsafe { launch_kernel_on_stream(&gemv_func, (m_arg, 1, 1), (64, 1, 1), 4, stream, &mut args_w3)?; }
+            unsafe {
+                crate::cublas::cublas_matmul_rowmajor(
+                    self.cublas_handle,
+                    num_patches as i32,
+                    inter_dim as i32,
+                    c as i32,
+                    self.scratch_norm.inner().cu_deviceptr() as *const _,
+                    layer.mlp_w1.inner().cu_deviceptr() as *const _,
+                    self.scratch_mlp_w1.inner_mut().cu_deviceptr() as *mut _,
+                )?;
+                crate::cublas::cublas_matmul_rowmajor(
+                    self.cublas_handle,
+                    num_patches as i32,
+                    inter_dim as i32,
+                    c as i32,
+                    self.scratch_norm.inner().cu_deviceptr() as *const _,
+                    layer.mlp_w3.inner().cu_deviceptr() as *const _,
+                    self.scratch_mlp_w3.inner_mut().cu_deviceptr() as *mut _,
+                )?;
             }
 
             // SwiGLU: out = silu(w1) * w3
@@ -719,23 +654,17 @@ impl VisionTower {
                 launch_kernel_on_stream(&swiglu_func, ((total_mlp + 255) / 256, 1, 1), (256, 1, 1), 0, stream, &mut args_swiglu)?;
             }
 
-            // w2 GEMM: [256, 2560] x [2560, 1024] -> [256, 1024]
-            for i in 0..num_patches {
-                let in_off = i * inter_dim;
-                let out_off = i * c;
-                let mut d_out = self.scratch_h2.inner().cu_deviceptr() + (out_off * 2) as u64;
-                let mut d_in = self.scratch_mlp_swiglu.inner().cu_deviceptr() + (in_off * 2) as u64;
-                let mut d_w2 = layer.mlp_w2.inner().cu_deviceptr();
-                let mut k_arg = inter_dim as u32;
-                let mut m_arg = c as u32;
-                let mut args_w2: [*mut std::ffi::c_void; 5] = [
-                    &mut d_out as *mut _ as *mut std::ffi::c_void,
-                    &mut d_in as *mut _ as *mut std::ffi::c_void,
-                    &mut d_w2 as *mut _ as *mut std::ffi::c_void,
-                    &mut k_arg as *mut _ as *mut std::ffi::c_void,
-                    &mut m_arg as *mut _ as *mut std::ffi::c_void,
-                ];
-                unsafe { launch_kernel_on_stream(&gemv_func, (m_arg, 1, 1), (64, 1, 1), 4, stream, &mut args_w2)?; }
+            // w2 GEMM: [256, 2560] x [2560, 1024] -> [256, 1024] (cuBLAS HGEMM)
+            unsafe {
+                crate::cublas::cublas_matmul_rowmajor(
+                    self.cublas_handle,
+                    num_patches as i32,
+                    c as i32,
+                    inter_dim as i32,
+                    self.scratch_mlp_swiglu.inner().cu_deviceptr() as *const _,
+                    layer.mlp_w2.inner().cu_deviceptr() as *const _,
+                    self.scratch_h2.inner_mut().cu_deviceptr() as *mut _,
+                )?;
             }
 
             // Residual Add 2: on-device scratch_h1 = scratch_h1 + scratch_h2
@@ -775,28 +704,20 @@ impl VisionTower {
             launch_kernel_on_stream(&ln_func, (rows as u32, 1, 1), (256, 1, 1), 0, stream, &mut args_ln)?;
         }
 
-        // Linear 1 GEMM: [64, 4096] x [4096, 4096] -> [64, 4096]
+        // Linear 1 GEMM: [64, 4096] x [4096, 4096] -> [64, 4096] (cuBLAS HGEMM)
         let num_merged = 64usize;
         let m1 = 4096u32;
         let k1 = 4096u32;
-        for tok in 0..num_merged {
-            let in_off = tok * 4096;
-            let out_off = tok * 4096;
-            let mut d_out = self.scratch_proj_l1.inner().cu_deviceptr() + (out_off * 2) as u64;
-            let mut d_in = self.scratch_proj_norm.inner().cu_deviceptr() + (in_off * 2) as u64;
-            let mut d_w = self.proj_l1_w.inner().cu_deviceptr();
-            let mut k_arg = k1;
-            let mut m_arg = m1;
-            let mut args: [*mut std::ffi::c_void; 5] = [
-                &mut d_out as *mut _ as *mut std::ffi::c_void,
-                &mut d_in as *mut _ as *mut std::ffi::c_void,
-                &mut d_w as *mut _ as *mut std::ffi::c_void,
-                &mut k_arg as *mut _ as *mut std::ffi::c_void,
-                &mut m_arg as *mut _ as *mut std::ffi::c_void,
-            ];
-            unsafe {
-                launch_kernel_on_stream(&gemv_func, (m1, 1, 1), (64, 1, 1), 4, stream, &mut args)?;
-            }
+        unsafe {
+            crate::cublas::cublas_matmul_rowmajor(
+                self.cublas_handle,
+                num_merged as i32,
+                m1 as i32,
+                k1 as i32,
+                self.scratch_proj_norm.inner().cu_deviceptr() as *const _,
+                self.proj_l1_w.inner().cu_deviceptr() as *const _,
+                self.scratch_proj_l1.inner_mut().cu_deviceptr() as *mut _,
+            )?;
         }
 
         // Bias 1 add
@@ -829,27 +750,19 @@ impl VisionTower {
             launch_kernel_on_stream(&gelu_func, ((total_elems1 + 255) / 256, 1, 1), (256, 1, 1), 0, stream, &mut args_gelu)?;
         }
 
-        // Linear 2 GEMM: [64, 4096] x [4096, 2048] -> [64, 2048]
+        // Linear 2 GEMM: [64, 4096] x [4096, 2048] -> [64, 2048] (cuBLAS HGEMM)
         let m2 = 2048u32;
         let k2 = 4096u32;
-        for tok in 0..num_merged {
-            let in_off = tok * 4096;
-            let out_off = tok * 2048;
-            let mut d_out = out_projected_tokens.inner().cu_deviceptr() + (out_off * 2) as u64;
-            let mut d_in = self.scratch_proj_gelu.inner().cu_deviceptr() + (in_off * 2) as u64;
-            let mut d_w = self.proj_l2_w.inner().cu_deviceptr();
-            let mut k_arg = k2;
-            let mut m_arg = m2;
-            let mut args: [*mut std::ffi::c_void; 5] = [
-                &mut d_out as *mut _ as *mut std::ffi::c_void,
-                &mut d_in as *mut _ as *mut std::ffi::c_void,
-                &mut d_w as *mut _ as *mut std::ffi::c_void,
-                &mut k_arg as *mut _ as *mut std::ffi::c_void,
-                &mut m_arg as *mut _ as *mut std::ffi::c_void,
-            ];
-            unsafe {
-                launch_kernel_on_stream(&gemv_func, (m2, 1, 1), (64, 1, 1), 4, stream, &mut args)?;
-            }
+        unsafe {
+            crate::cublas::cublas_matmul_rowmajor(
+                self.cublas_handle,
+                num_merged as i32,
+                m2 as i32,
+                k2 as i32,
+                self.scratch_proj_gelu.inner().cu_deviceptr() as *const _,
+                self.proj_l2_w.inner().cu_deviceptr() as *const _,
+                out_projected_tokens.inner_mut().cu_deviceptr() as *mut _,
+            )?;
         }
 
         // Bias 2 add
@@ -871,3 +784,15 @@ impl VisionTower {
         Ok(())
     }
 }
+
+impl Drop for VisionTower {
+    fn drop(&mut self) {
+        if !self.cublas_handle.is_null() {
+            unsafe {
+                let _ = crate::cublas::cublasDestroy_v2(self.cublas_handle);
+            }
+        }
+    }
+}
+
+unsafe impl Send for VisionTower {}

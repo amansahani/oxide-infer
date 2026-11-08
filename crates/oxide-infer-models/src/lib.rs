@@ -11,6 +11,7 @@ pub mod lm_head;
 pub mod engine;
 pub mod traits;
 pub mod vision_tower;
+pub mod cublas;
 
 pub use embedding::EmbeddingTable;
 pub use projector::MultiModalProjector;

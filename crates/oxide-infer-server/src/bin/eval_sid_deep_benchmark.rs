@@ -120,11 +120,16 @@ fn main() -> Result<()> {
     let mut batch_engine = BatchEngine::new(&gpu, 128)?;
 
     let pages = [
-        (1, "/tmp/sid_bench-01.png", "Transcribe the prominent title and header text visible on this page.", 64),
-        (2, "/tmp/sid_bench-02.png", "Transcribe the table of contents and section headings on this page.", 64),
-        (3, "/tmp/sid_bench-03.png", "Extract the highlights, summary, and fund details from this page.", 64),
-        (4, "/tmp/sid_bench-04.png", "Perform OCR transcription of key risk factors and clauses on this page.", 64),
-        (5, "/tmp/sid_bench-05.png", "Transcribe fee structure, expense ratios, and asset allocation data.", 64),
+        (1, "/tmp/sid_all_pages/page-01.png", "Transcribe the prominent title and header text visible on this page.", 64),
+        (2, "/tmp/sid_all_pages/page-02.png", "Transcribe the table of contents and section headings on this page.", 64),
+        (3, "/tmp/sid_all_pages/page-03.png", "Extract the highlights, summary, and fund details from this page.", 64),
+        (4, "/tmp/sid_all_pages/page-04.png", "Perform OCR transcription of key risk factors and clauses on this page.", 64),
+        (5, "/tmp/sid_all_pages/page-05.png", "Transcribe fee structure, expense ratios, and asset allocation data.", 64),
+        (6, "/tmp/sid_all_pages/page-06.png", "Transcribe investment objectives and benchmark details from this page.", 64),
+        (7, "/tmp/sid_all_pages/page-07.png", "Transcribe standard risk factors and statutory disclosures from this page.", 64),
+        (8, "/tmp/sid_all_pages/page-08.png", "Transcribe definitions and abbreviations listed on this page.", 64),
+        (9, "/tmp/sid_all_pages/page-09.png", "Transcribe information regarding the trustee company and sponsor.", 64),
+        (10, "/tmp/sid_all_pages/page-10.png", "Transcribe key terms of the scheme and liquidity provisions.", 64),
     ];
 
     println!("\n================================================================================");

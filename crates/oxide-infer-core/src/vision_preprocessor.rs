@@ -43,10 +43,9 @@ impl VisionPreprocessor {
             return Err(anyhow!("Invalid image dimensions: {}x{}", raw_w, raw_h));
         }
 
-        // Align dimensions to multiples of (patch_size * merge_size = 32)
-        let block_unit = (self.patch_size * self.merge_size) as u32;
-        let target_w = ((raw_w + block_unit - 1) / block_unit) * block_unit;
-        let target_h = ((raw_h + block_unit - 1) / block_unit) * block_unit;
+        // Canonical 256-patch resolution for ViT (256x256 -> 16x16 patches = 256 patches -> 64 tokens)
+        let target_w = 256u32;
+        let target_h = 256u32;
 
         let resized = if target_w != raw_w || target_h != raw_h {
             img.resize_exact(target_w, target_h, FilterType::CatmullRom)

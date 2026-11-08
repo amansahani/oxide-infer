@@ -930,7 +930,8 @@ FINISH:
                         }
                         // Per-layer carry pointers: each row uses its
                         // request's persistent conv state for that layer.
-                        let mut carry_host = vec![0u64; 24 * mb];
+                        // Stride in batch_engine is `l * b`, which is `l * used`.
+                        let mut carry_host = vec![0u64; 24 * used];
                         for l in 0..layers.len() {
                             if is_conv[l] {
                                 for (r, ri) in row_ctx.iter().enumerate() {
