@@ -331,6 +331,8 @@ impl VisionTower {
         let mult_func = self.ops_ptx.get_function("vision_conv_gate_mult_fp16")?;
         let rope_func = self.ops_ptx.get_function("vision_axial_rope_fp16")?;
         let attn_sdpa_func = self.attn_ptx.get_function("vision_gqa_sdpa_fp16")?;
+        let add_ptx = PtxModule::load_from_ptx(gpu, crate::RESIDUAL_ADD_PTX)?;
+        let add_func = add_ptx.get_function("residual_add_fp16")?;
         let swiglu_func = self.swiglu_ptx.get_function("fused_swiglu_fp16")?;
 
         for layer in &self.layers {
@@ -635,14 +637,18 @@ impl VisionTower {
                 }
             }
 
-            // Residual Add 1: scratch_h1 = scratch_h1 + scratch_attn_out
-            let h1_host = self.scratch_h1.inner().to_host_vec(stream)?;
-            let op_host = self.scratch_attn_out.inner().to_host_vec(stream)?;
-            let mut sum1 = Vec::with_capacity(num_patches * c);
-            for i in 0..num_patches * c {
-                sum1.push(f16::from_f32(h1_host[i].to_f32() + op_host[i].to_f32()));
+            // Residual Add 1: on-device scratch_h1 = scratch_h1 + scratch_attn_out
+            let mut d_h1 = self.scratch_h1.inner_mut().cu_deviceptr();
+            let mut d_op = self.scratch_attn_out.inner().cu_deviceptr();
+            let mut n_res = (num_patches * c) as u32;
+            let mut args_add1: [*mut std::ffi::c_void; 3] = [
+                &mut d_h1 as *mut _ as *mut std::ffi::c_void,
+                &mut d_op as *mut _ as *mut std::ffi::c_void,
+                &mut n_res as *mut _ as *mut std::ffi::c_void,
+            ];
+            unsafe {
+                launch_kernel_on_stream(&add_func, ((n_res + 255) / 256, 1, 1), (256, 1, 1), 0, stream, &mut args_add1)?;
             }
-            self.scratch_h1.copy_from_slice(gpu, &sum1)?;
 
             // FFN Norm on scratch_h1 -> scratch_norm
             for i in 0..num_patches {
@@ -732,14 +738,17 @@ impl VisionTower {
                 unsafe { launch_kernel_on_stream(&gemv_func, (m_arg, 1, 1), (64, 1, 1), 4, stream, &mut args_w2)?; }
             }
 
-            // Residual Add 2: scratch_h1 = scratch_h1 + scratch_h2
-            let h1_host2 = self.scratch_h1.inner().to_host_vec(stream)?;
-            let h2_host = self.scratch_h2.inner().to_host_vec(stream)?;
-            let mut sum2 = Vec::with_capacity(num_patches * c);
-            for i in 0..num_patches * c {
-                sum2.push(f16::from_f32(h1_host2[i].to_f32() + h2_host[i].to_f32()));
+            // Residual Add 2: on-device scratch_h1 = scratch_h1 + scratch_h2
+            let mut d_h1_2 = self.scratch_h1.inner_mut().cu_deviceptr();
+            let mut d_h2 = self.scratch_h2.inner().cu_deviceptr();
+            let mut args_add2: [*mut std::ffi::c_void; 3] = [
+                &mut d_h1_2 as *mut _ as *mut std::ffi::c_void,
+                &mut d_h2 as *mut _ as *mut std::ffi::c_void,
+                &mut n_res as *mut _ as *mut std::ffi::c_void,
+            ];
+            unsafe {
+                launch_kernel_on_stream(&add_func, ((n_res + 255) / 256, 1, 1), (256, 1, 1), 0, stream, &mut args_add2)?;
             }
-            self.scratch_h1.copy_from_slice(gpu, &sum2)?;
         }
 
         // 4. Multi-Modal Projector

@@ -52,7 +52,7 @@ fn main() -> Result<()> {
     }
     println!("Projector output count: {} floats", proj_host.len());
     println!("Max difference vs PyTorch official reference: {:.6}", max_diff);
-    assert!(max_diff < 0.05, "Diff exceeds tolerance!");
+    assert!(max_diff < 0.02, "Diff exceeds tolerance!");
     println!("✅ FULL VISION TOWER + PROJECTOR PARITY CONFIRMED!");
 
     Ok(())
