@@ -16,7 +16,7 @@ use oxide_infer_kernels::batched_attn::{
 };
 use oxide_infer_kernels::PtxModule;
 use oxide_infer_models::{FullLfm3DecoderLayer, LayerType};
-use cuda_core::{launch_kernel_on_stream, Function, Stream as CuStream};
+use cuda_core::{launch_kernel_on_stream, CudaEvent, Function, Stream as CuStream};
 use std::ffi::c_void;
 
 use crate::lt_gemm::LtGemm;
@@ -166,6 +166,39 @@ where
         )
     };
     debug_assert_eq!(rc, 0, "cuMemcpyHtoDAsync failed with {rc}");
+}
+
+/// Print the phase totals accumulated by `OXIDE_PROFILE_PHASES`.
+///
+/// `ev[0]` is recorded before the embedding lookup and `ev[1 + 7i + k]` are
+/// the seven per-layer boundaries, so the segments are: operator norm,
+/// qkv/in-proj gemm, attention setup (or conv state prep), attention (or conv)
+/// kernel, out-proj gemm, ffn gemms + swiglu, post-ffn norm + residual.
+fn report_phases(ev: &[CudaEvent], n_layers: usize, rows: usize) {
+    // `elapsed_time` rejects an unfinished end event, and the prefill path
+    // returns without a synchronize, so wait once here (profiling only).
+    if let Some(last) = ev.last() {
+        let _ = last.synchronize();
+    }
+    let mut cats = [0f64; 7];
+    for i in 0..n_layers {
+        let base = 1 + i * 7;
+        let mut prev = if i == 0 { 0 } else { base - 1 };
+        for (k, c) in cats.iter_mut().enumerate() {
+            let dt = match ev[prev].elapsed_time(&ev[base + k]) {
+                Ok(ms) => ms as f64,
+                Err(_) => 0.0,
+            };
+            *c += dt;
+            prev = base + k;
+        }
+    }
+    let total = ev[0].elapsed_time(&ev[ev.len() - 1]).unwrap_or(0.0) as f64;
+    let sum: f64 = cats.iter().sum();
+    eprintln!(
+        "[phases] rows={rows:4} op_norm={:6.1} qkv={:6.1} setup={:6.1} attn={:6.1} oproj={:6.1} ffn={:6.1} post={:5.1} other={:5.1} total={:7.1} ms",
+        cats[0], cats[1], cats[2], cats[3], cats[4], cats[5], cats[6], total - sum, total
+    );
 }
 
 fn fptr(buf: &DeviceBuffer<f16>) -> u64 {
@@ -347,6 +380,29 @@ impl BatchEngine {
         let b_u32 = b as u32;
         let stream = gpu.compute_stream();
 
+        // Optional per-phase device timing. Seven event pairs per layer:
+        // operator norm, qkv/in_proj gemm, attention setup / conv prep,
+        // attention / conv kernel, out-proj gemm, ffn gemms, post-ffn norm.
+        // Opt-in so the serving path pays nothing (an event record is ~1 us,
+        // but 170 of them per wave would still distort a 0.1 ms step).
+        let prof = std::env::var("OXIDE_PROFILE_PHASES").is_ok();
+        let mut prof_ev: Vec<CudaEvent> = if prof {
+            (0..1 + layers.len() * 7)
+                .map(|_| gpu.context().new_event().expect("prof event"))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut mark = 0usize;
+        macro_rules! phase {
+            () => {{
+                if prof {
+                    prof_ev[mark].record(stream).expect("prof event record");
+                    mark += 1;
+                }
+            }};
+        }
+
         // Prefill waves address up to `rows` rows, so their metadata must be
         // padded to the device buffer length (and `copy_from_slice`
         // synchronizes, which is noise inside a multi-wave prefill). Decode
@@ -426,6 +482,7 @@ impl BatchEngine {
 
         let mut h_u32 = HIDDEN as u32;
         let mut b_arg = b_u32;
+        phase!();
 
         // 1. Batched embedding lookup or custom embedding copy.
         if let Some(embeds) = custom_embeddings {
@@ -462,6 +519,7 @@ impl BatchEngine {
                 b_u32,
                 stream,
             )?;
+            phase!();
 
             if is_conv[l_idx] {
                 let LayerType::Conv(conv) = &layer.inner_layer else {
@@ -472,6 +530,7 @@ impl BatchEngine {
                 let d_x = self.scratch.norm.inner().cu_deviceptr();
                 let d_y = self.scratch.bcx.inner_mut().cu_deviceptr();
                 self.lt.gemm(stream, 3 * HIDDEN, HIDDEN, b, d_w, d_x, d_y)?;
+                phase!();
 
                 let mut d_y = fptr_mut(&mut self.scratch.conv_y);
                 let mut d_ptrs = self.scratch.conv_ptrs.inner_mut().cu_deviceptr()
@@ -520,6 +579,7 @@ impl BatchEngine {
                         )?;
                     }
                 }
+                phase!();
                 let mut args_conv: [*mut c_void; 7] = [
                     &mut d_y as *mut _ as *mut c_void,
                     &mut d_ptrs as *mut _ as *mut c_void,
@@ -532,12 +592,14 @@ impl BatchEngine {
                 unsafe {
                     launch_kernel_on_stream(&self.conv, (16, b_u32, 1), (128, 1, 1), 0, stream, &mut args_conv)?;
                 }
+                phase!();
 
                 // out_proj: [2048, 2048] x [2048, B]
                 let d_w = conv.out_proj.inner().cu_deviceptr();
                 let d_x = self.scratch.conv_y.inner().cu_deviceptr();
                 let d_y = self.scratch.layer.inner_mut().cu_deviceptr();
                 self.lt.gemm(stream, HIDDEN, HIDDEN, b, d_w, d_x, d_y)?;
+                phase!();
             } else {
                 let LayerType::Attention(attn) = &layer.inner_layer else {
                     return Err(anyhow!("layer {l_idx} expected attention"));
@@ -557,6 +619,7 @@ impl BatchEngine {
                 let d_gw = attn.gate_proj.inner().cu_deviceptr();
                 let d_g = self.scratch.gate.inner_mut().cu_deviceptr();
                 self.lt.gemm(stream, NUM_Q_HEADS, HIDDEN, b, d_gw, d_x, d_g)?;
+                phase!();
 
                 let mut eps = 1e-5f32;
                 let mut nq = NUM_Q_HEADS as u32;
@@ -644,6 +707,7 @@ impl BatchEngine {
                     launch_kernel_on_stream(&self.kv_copy, (b_u32, 1, 1), (64, 1, 1), 0, stream, &mut args_kc)?;
                     launch_kernel_on_stream(&self.kv_copy, (b_u32, 1, 1), (64, 1, 1), 0, stream, &mut args_vc)?;
                 }
+                phase!();
 
                 // GQA attention. Sliding layers carry their 256-token window
                 // in the rope table; full layers pass 0 (unmasked).
@@ -728,6 +792,7 @@ impl BatchEngine {
                         launch_kernel_on_stream(&self.gqa, (nkv, b_u32, 1), (hd, 1, 1), 0, stream, &mut args_gqa)?;
                     }
                 }
+                phase!();
 
                 // Sigmoid gating.
                 let mut args_gate: [*mut c_void; 5] = [
@@ -746,6 +811,7 @@ impl BatchEngine {
                 let d_x = self.scratch.ctx.inner().cu_deviceptr();
                 let d_y = self.scratch.layer.inner_mut().cu_deviceptr();
                 self.lt.gemm(stream, HIDDEN, HIDDEN, b, d_w, d_x, d_y)?;
+                phase!();
             }
 
             // Post-operator norm (in place), then residual add.
@@ -796,6 +862,7 @@ impl BatchEngine {
             let d_act = self.scratch.ffn_act.inner().cu_deviceptr();
             let d_out = self.scratch.ffn_out.inner_mut().cu_deviceptr();
             self.lt.gemm(stream, HIDDEN, INTER, b, d_w2, d_act, d_out)?;
+            phase!();
 
             // Post-FFN norm (in place) + residual add.
             launch_rms(
@@ -807,7 +874,9 @@ impl BatchEngine {
                 stream,
             )?;
             self.residual_add(&self.scratch.hidden, &self.scratch.ffn_out, b_u32, stream)?;
+            phase!();
         }
+        debug_assert!(!prof || mark == 1 + layers.len() * 7);
 
         if !sample {
             // Persist this position's hidden state into each sequence's
@@ -822,12 +891,18 @@ impl BatchEngine {
                     cuMemcpyDtoDAsync_v2(dst, src, HIDDEN * 2, stream.cu_stream() as *mut c_void);
                 }
             }
+            if prof {
+                report_phases(&prof_ev[..mark], layers.len(), b);
+            }
             return Ok(Vec::new());
         }
 
         // Final RMSNorm + LM head + batched argmax.
         let mut out = self.sample_tail(gpu, b_u32, embed_table, emb_norm, stream)?;
 
+        if prof {
+            report_phases(&prof_ev[..mark], layers.len(), b);
+        }
         out.truncate(b);
         Ok(out)
     }
