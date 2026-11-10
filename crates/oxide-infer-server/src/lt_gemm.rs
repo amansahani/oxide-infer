@@ -26,6 +26,7 @@ const CUBLAS_COMPUTE_16F: i32 = 64;
 const CUBLAS_COMPUTE_32F: i32 = 68;
 const CUBLAS_COMPUTE_32F_FAST_16F: i32 = 74;
 const CUBLAS_OP_T: i32 = 1;
+const CUBLAS_OP_N: i32 = 0;
 
 const CUBLASLT_MATMUL_DESC_TRANSA: i32 = 3;
 const CUBLASLT_MATRIX_LAYOUT_COLS: i32 = 3;
@@ -133,6 +134,9 @@ struct LtConfig {
     algo: LtAlgo,
     /// Column count the B/C descriptors are currently configured for.
     cols: u64,
+    /// Own operation descriptor when a config needs a different transpose
+    /// combination than the shared one (the PV attention GEMM transposes B).
+    own_op: Option<Desc>,
 }
 
 /// One cuBLASLt handle with a per-shape cache of deterministic algorithms.
@@ -141,9 +145,15 @@ pub struct LtGemm {
     op_desc: Desc,
     /// Scale type of alpha/beta: `CUDA_R_32F` for FP32 compute.
     scale_type: i32,
+    /// cuBLASLt compute mode, needed to clone the op descriptor for configs
+    /// that use a different transpose combination.
+    compute: i32,
     workspace: DeviceBuffer<u8>,
     workspace_size: usize,
     configs: HashMap<(usize, usize), LtConfig>,
+    /// Configs for `gemm_strided`, keyed by the full logical shape. `n` is
+    /// absent because the column count is patched per call.
+    strided: HashMap<(usize, usize, i64, i64, i64, bool, bool, u64), LtConfig>,
     max_batch: usize,
 }
 
@@ -188,9 +198,11 @@ impl LtGemm {
             handle,
             op_desc,
             scale_type,
+            compute,
             workspace,
             workspace_size: WORKSPACE_BYTES,
             configs: HashMap::new(),
+            strided: HashMap::new(),
             max_batch,
         })
     }
@@ -309,7 +321,249 @@ impl LtGemm {
             c_desc,
             algo: result.algo,
             cols: algo_n,
+            own_op: None,
         })
+    }
+
+    /// Create a deterministic config for a layout with explicit leading
+    /// dimensions.
+    ///
+    /// Same contract as `create_config`, but A/B/C may be strided views (the
+    /// attention path reads a K/V head out of an interleaved 4-head cache) and
+    /// C may be f32 so score matrices keep full precision.
+    #[allow(clippy::too_many_arguments)]
+    fn create_config_strided(
+        &self,
+        m: usize,
+        k: usize,
+        lda: i64,
+        ldb: i64,
+        ldc: i64,
+        c_f32: bool,
+        trans_a: bool,
+        algo_n: u64,
+    ) -> Result<LtConfig> {
+        if c_f32 && self.scale_type != CUDA_R_32F {
+            return Err(anyhow!(
+                "f32 GEMM output needs FP32 compute; OXIDE_LT_COMPUTE selects an f16 scale"
+            ));
+        }
+        let mut a_desc = ptr::null_mut();
+        let mut b_desc = ptr::null_mut();
+        let mut c_desc = ptr::null_mut();
+        // `trans_a` selects how A is stored. Both layouts occur in attention:
+        // K is read as `[k=128][m=keys]` (TRANSA), because the KV slab is
+        // `[token][4 kv][128]`; V is read as `[m=128][k=keys]` (no transpose),
+        // and then the C transpose `[128][n]` is exactly the output layout.
+        let (a_rows, a_cols) = if trans_a {
+            (k as u64, m as u64)
+        } else {
+            (m as u64, k as u64)
+        };
+        status(
+            unsafe { cublasLtMatrixLayoutCreate(&mut a_desc, CUDA_R_16F, a_rows, a_cols, lda) },
+            "cublasLtMatrixLayoutCreate(A strided)",
+        )?;
+        status(
+            unsafe { cublasLtMatrixLayoutCreate(&mut b_desc, CUDA_R_16F, k as u64, algo_n, ldb) },
+            "cublasLtMatrixLayoutCreate(B strided)",
+        )?;
+        let c_type = if c_f32 { CUDA_R_32F } else { CUDA_R_16F };
+        status(
+            unsafe { cublasLtMatrixLayoutCreate(&mut c_desc, c_type, m as u64, algo_n, ldc) },
+            "cublasLtMatrixLayoutCreate(C strided)",
+        )?;
+
+        // The transpose changes the reduction geometry, so a PV-style config
+        // needs its own operation descriptor.
+        let mut own_op: Option<Desc> = None;
+        let op = if trans_a {
+            self.op_desc
+        } else {
+            let mut op_desc = ptr::null_mut();
+            status(
+                unsafe { cublasLtMatmulDescCreate(&mut op_desc, self.compute, self.scale_type) },
+                "cublasLtMatmulDescCreate(strided)",
+            )?;
+            status(
+                unsafe {
+                    cublasLtMatmulDescSetAttribute(
+                        op_desc,
+                        CUBLASLT_MATMUL_DESC_TRANSA,
+                        &CUBLAS_OP_N as *const i32 as *const c_void,
+                        std::mem::size_of::<i32>(),
+                    )
+                },
+                "cublasLtMatmulDescSetAttribute(strided A)",
+            )?;
+            own_op = Some(op_desc);
+            op_desc
+        };
+
+        let mut pref = ptr::null_mut();
+        status(
+            unsafe { cublasLtMatmulPreferenceCreate(&mut pref) },
+            "cublasLtMatmulPreferenceCreate",
+        )?;
+        let ws = self.workspace_size;
+        status(
+            unsafe {
+                cublasLtMatmulPreferenceSetAttribute(
+                    pref,
+                    CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                    &ws as *const usize as *const c_void,
+                    std::mem::size_of::<usize>(),
+                )
+            },
+            "cublasLtMatmulPreferenceSetAttribute(MAX_WORKSPACE)",
+        )?;
+
+        let mut result = LtHeuristic {
+            algo: LtAlgo { data: [0; 8] },
+            workspace_size: 0,
+            state: -1,
+            waves_count: 0.0,
+            reserved: [0; 4],
+        };
+        let mut count = 0i32;
+        let code = unsafe {
+            cublasLtMatmulAlgoGetHeuristic(
+                self.handle,
+                op,
+                a_desc,
+                b_desc,
+                c_desc,
+                c_desc,
+                pref,
+                1,
+                &mut result,
+                &mut count,
+            )
+        };
+        unsafe {
+            cublasLtMatmulPreferenceDestroy(pref);
+        }
+        status(code, "cublasLtMatmulAlgoGetHeuristic(strided)")?;
+        if count < 1 || result.state != 0 {
+            unsafe {
+                cublasLtMatrixLayoutDestroy(a_desc);
+                cublasLtMatrixLayoutDestroy(b_desc);
+                cublasLtMatrixLayoutDestroy(c_desc);
+                if let Some(op_desc) = own_op {
+                    cublasLtMatmulDescDestroy(op_desc);
+                }
+            }
+            return Err(anyhow!(
+                "no usable strided cuBLASLt algorithm for m={m} k={k} (state {})",
+                result.state
+            ));
+        }
+        if result.workspace_size > self.workspace_size {
+            return Err(anyhow!(
+                "strided cuBLASLt algorithm for m={m} k={k} needs {} workspace bytes, have {}",
+                result.workspace_size,
+                self.workspace_size
+            ));
+        }
+        Ok(LtConfig {
+            a_desc,
+            b_desc,
+            c_desc,
+            algo: result.algo,
+            cols: algo_n,
+            own_op,
+        })
+    }
+
+    /// Compute `C[m, n] = op(A) * B` with explicit leading dimensions.
+    ///
+    /// A is a `[k, m]` column-major view when `trans_a` is set (the op
+    /// descriptor transposes it), or an `[m, k]` column-major view otherwise.
+    /// B is `[k, n]` column-major, C is `[m, n]` column-major. `lda`/`ldb`/`ldc`
+    /// are in elements. `c_f32` selects an f32 C (used for attention scores).
+    ///
+    /// `algo_n` is the column count used to pick the algorithm. It must be a
+    /// constant for a given shape so the reduction order never depends on the
+    /// live batch size, which is what keeps results batch-shape invariant.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_strided(
+        &mut self,
+        stream: &Stream,
+        m: usize,
+        k: usize,
+        n: usize,
+        lda: i64,
+        ldb: i64,
+        ldc: i64,
+        c_f32: bool,
+        trans_a: bool,
+        algo_n: u64,
+        a: u64,
+        b: u64,
+        c: u64,
+    ) -> Result<()> {
+        let key = (m, k, lda, ldb, ldc, c_f32, trans_a, algo_n);
+        if !self.strided.contains_key(&key) {
+            let cfg = self.create_config_strided(m, k, lda, ldb, ldc, c_f32, trans_a, algo_n)?;
+            self.strided.insert(key, cfg);
+        }
+        let config = self.strided.get_mut(&key).expect("config just inserted");
+
+        if config.cols != n as u64 {
+            let cols = n as u64;
+            for desc in [config.b_desc, config.c_desc] {
+                status(
+                    unsafe {
+                        cublasLtMatrixLayoutSetAttribute(
+                            desc,
+                            CUBLASLT_MATRIX_LAYOUT_COLS,
+                            &cols as *const u64 as *const c_void,
+                            std::mem::size_of::<u64>(),
+                        )
+                    },
+                    "cublasLtMatrixLayoutSetAttribute(strided cols)",
+                )?;
+            }
+            config.cols = cols;
+        }
+
+        let (alpha_f32, beta_f32) = (1.0f32, 0.0f32);
+        let (alpha_f16, beta_f16) = (f16::from_f32(1.0), f16::from_f32(0.0));
+        let (alpha_ptr, beta_ptr) = if self.scale_type == CUDA_R_32F {
+            (
+                &alpha_f32 as *const f32 as *const c_void,
+                &beta_f32 as *const f32 as *const c_void,
+            )
+        } else {
+            (
+                &alpha_f16 as *const f16 as *const c_void,
+                &beta_f16 as *const f16 as *const c_void,
+            )
+        };
+        let op = config.own_op.unwrap_or(self.op_desc);
+        status(
+            unsafe {
+                cublasLtMatmul(
+                    self.handle,
+                    op,
+                    alpha_ptr,
+                    a as *const c_void,
+                    config.a_desc,
+                    b as *const c_void,
+                    config.b_desc,
+                    beta_ptr,
+                    c as *const c_void,
+                    config.c_desc,
+                    c as *mut c_void,
+                    config.c_desc,
+                    &config.algo,
+                    self.workspace.inner().cu_deviceptr() as *mut c_void,
+                    self.workspace_size,
+                    stream.cu_stream() as *mut c_void,
+                )
+            },
+            "cublasLtMatmul(strided)",
+        )
     }
 
     /// Compute `C[m, n] = A[m, k] * B[k, n]` for column-major operands.
@@ -402,6 +656,14 @@ impl Drop for LtGemm {
                 cublasLtMatrixLayoutDestroy(config.a_desc);
                 cublasLtMatrixLayoutDestroy(config.b_desc);
                 cublasLtMatrixLayoutDestroy(config.c_desc);
+            }
+            for (_, config) in self.strided.drain() {
+                cublasLtMatrixLayoutDestroy(config.a_desc);
+                cublasLtMatrixLayoutDestroy(config.b_desc);
+                cublasLtMatrixLayoutDestroy(config.c_desc);
+                if let Some(op_desc) = config.own_op {
+                    cublasLtMatmulDescDestroy(op_desc);
+                }
             }
             cublasLtMatmulDescDestroy(self.op_desc);
             cublasLtDestroy(self.handle);

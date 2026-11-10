@@ -90,5 +90,30 @@ fn main() -> Result<()> {
             );
         }
     }
+
+    // Attention-shape GEMMs used by the prefill flash path: Q x K^T and P x V.
+    // Both are tall-skinny (K = 128 or N = 128), which is the regime where
+    // tensor-core efficiency is least certain.
+    let attn_shapes = [
+        Shape { name: "QK  keys x 128 ", m: 2000, k: 128, reps: 50 },
+        Shape { name: "PV  128 x keys ", m: 128, k: 2000, reps: 50 },
+    ];
+    for n in [512usize, 2048] {
+        let mut total = 0.0f64;
+        let mut flops = 0.0f64;
+        let mut detail = String::new();
+        for s in &attn_shapes {
+            let weight = DeviceBuffer::<f16>::from_slice(&gpu, &vec![f16::from_f32(0.01); s.m * s.k])?;
+            let mut out = DeviceBuffer::<f16>::zeroed(&gpu, s.m * n)?;
+            let t = bench(&mut lt, &stream, &weight, &act, &mut out, s, n)?;
+            total += t;
+            flops += 2.0 * s.m as f64 * s.k as f64 * n as f64;
+            detail.push_str(&format!("  {} {:.3}ms", s.name, t * 1e3));
+        }
+        println!(
+            "attn gemm        n={:4}  total {:7.3} ms  {:6.2} TFLOP/s{}",
+            n, total * 1e3, flops / total / 1e12, detail
+        );
+    }
     Ok(())
 }
