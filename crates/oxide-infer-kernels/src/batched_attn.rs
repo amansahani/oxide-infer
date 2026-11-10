@@ -1716,3 +1716,555 @@ EXIT:
     ret;
 }
 "#;
+
+/// Multi-row prefill GQA kernel.
+///
+/// Same maths and register layout as `batched_gqa_attention_online_fp16`, but a
+/// block is 16 warps covering **four query rows** x four query heads instead
+/// of four heads of one row. The four rows of a block are consecutive tokens
+/// of one request, so the four heads of a row and the four rows themselves
+/// scan identical K/V addresses; the lines are shared in L1 and per-key DRAM
+/// traffic drops by the row count. Prefill waves pack each request's tokens
+/// contiguously, so nearly every block gets four rows of the same sequence.
+///
+/// Correctness does not depend on that packing: every warp uses its own row's
+/// K/V table, sequence length and window, so heterogeneous blocks are exact,
+/// only less efficient.
+pub const BATCHED_GQA_ATTENTION_MR_PTX: &str = r#"
+.version 7.5
+.target sm_80
+.address_size 64
+
+.visible .entry batched_gqa_attention_mr_fp16(
+    .param .u64 context_out,
+    .param .u64 q_in,
+    .param .u64 k_ptrs,
+    .param .u64 v_ptrs,
+    .param .u64 seq_lens,
+    .param .u32 num_q_heads,
+    .param .u32 num_kv_heads,
+    .param .u32 head_dim,
+    .param .u32 batch_size,
+    .param .u32 window
+) {
+    .reg .pred %p0, %p1, %p2;
+    .reg .b32 %tidv, %lane, %warp, %head, %kvh, %b_idx, %slen, %nq, %nkv, %hd, %t, %t_start, %window, %kvbase, %tmp;
+    .reg .b64 %q_ptr, %ctx_ptr, %k_ptr, %v_ptr, %k_tbl, %v_tbl, %sl_tbl, %off, %addr, %laneoff;
+    .reg .f32 %q0, %q1, %q2, %q3, %a0, %a1, %a2, %a3, %m, %s, %dot, %sc, %w, %corr, %tmpf, %sh;
+    .reg .f32 %k0, %k1, %k2, %k3, %v0, %v1, %v2, %v3;
+    .reg .b16 %h0, %h1, %h2, %h3, %g0, %g1, %g2, %g3;
+
+    ld.param.u32 %nq, [num_q_heads];
+    ld.param.u32 %nkv, [num_kv_heads];
+    ld.param.u32 %hd, [head_dim];
+
+    mov.u32 %kvh, %ctaid.x;
+    setp.ge.u32 %p0, %kvh, %nkv;
+    @%p0 bra EXIT;
+
+    mov.u32 %tidv, %tid.x;
+    shr.u32 %warp, %tidv, 5;
+    and.b32 %lane, %tidv, 31;
+    // Sixteen warps cover four query rows x four heads. Row-major so the four
+    // heads of one row scan the same keys in lockstep: their K/V lines are
+    // shared in L1, which cuts the K/V DRAM traffic by the row count.
+    shr.u32 %tmp, %warp, 2;
+    mov.u32 %b_idx, %ctaid.y;
+    shl.b32 %b_idx, %b_idx, 2;
+    add.u32 %b_idx, %b_idx, %tmp;
+    ld.param.u32 %tmp, [batch_size];
+    setp.ge.u32 %p0, %b_idx, %tmp;
+    @%p0 bra EXIT;
+
+    and.b32 %tmp, %warp, 3;
+    shl.b32 %head, %kvh, 2;
+    add.u32 %head, %head, %tmp;
+
+    cvt.u64.u32 %laneoff, %lane;
+    shl.b64 %laneoff, %laneoff, 3;      // 4 halves per lane
+
+    ld.param.u64 %q_ptr, [q_in];
+    ld.param.u64 %ctx_ptr, [context_out];
+
+    mul.lo.u32 %tmp, %b_idx, %nq;
+    add.u32 %tmp, %tmp, %head;
+    mul.lo.u32 %tmp, %tmp, %hd;
+    cvt.u64.u32 %off, %tmp;
+    shl.b64 %off, %off, 1;
+    add.u64 %q_ptr, %q_ptr, %off;
+    add.u64 %ctx_ptr, %ctx_ptr, %off;
+    add.u64 %addr, %q_ptr, %laneoff;
+    ld.global.v4.u16 {%h0, %h1, %h2, %h3}, [%addr];
+    cvt.f32.f16 %q0, %h0;
+    cvt.f32.f16 %q1, %h1;
+    cvt.f32.f16 %q2, %h2;
+    cvt.f32.f16 %q3, %h3;
+
+    ld.param.u64 %k_tbl, [k_ptrs];
+    ld.param.u64 %v_tbl, [v_ptrs];
+    mul.wide.u32 %off, %b_idx, 8;
+    add.u64 %off, %k_tbl, %off;
+    ld.global.u64 %k_ptr, [%off];
+    mul.wide.u32 %off, %b_idx, 8;
+    add.u64 %off, %v_tbl, %off;
+    ld.global.u64 %v_ptr, [%off];
+
+    ld.param.u64 %sl_tbl, [seq_lens];
+    mul.wide.u32 %off, %b_idx, 4;
+    add.u64 %off, %sl_tbl, %off;
+    ld.global.u32 %slen, [%off];
+
+    ld.param.u32 %window, [window];
+    mov.u32 %t_start, 0;
+    setp.eq.u32 %p1, %window, 0;
+    @%p1 bra W_DONE;
+    setp.le.u32 %p1, %slen, %window;
+    @%p1 bra W_DONE;
+    sub.u32 %t_start, %slen, %window;
+W_DONE:
+
+    mov.f32 %m, -1.0e30;
+    mov.f32 %s, 0.0;
+    mov.f32 %a0, 0.0;
+    mov.f32 %a1, 0.0;
+    mov.f32 %a2, 0.0;
+    mov.f32 %a3, 0.0;
+    mov.u32 %t, %t_start;
+
+KEY_LOOP:
+    setp.ge.u32 %p0, %t, %slen;
+    @%p0 bra FINISH;
+
+    mul.lo.u32 %kvbase, %t, %nkv;
+    add.u32 %kvbase, %kvbase, %kvh;
+    mul.lo.u32 %kvbase, %kvbase, %hd;
+    cvt.u64.u32 %off, %kvbase;
+    shl.b64 %off, %off, 1;
+    add.u64 %off, %off, %laneoff;
+
+    // K and V loads are independent, so both are in flight together.
+    add.u64 %addr, %k_ptr, %off;
+    ld.global.v4.u16 {%h0, %h1, %h2, %h3}, [%addr];
+    add.u64 %addr, %v_ptr, %off;
+    ld.global.v4.u16 {%g0, %g1, %g2, %g3}, [%addr];
+
+    cvt.f32.f16 %k0, %h0;
+    cvt.f32.f16 %k1, %h1;
+    cvt.f32.f16 %k2, %h2;
+    cvt.f32.f16 %k3, %h3;
+
+    mul.f32 %dot, %q0, %k0;
+    fma.rn.f32 %dot, %q1, %k1, %dot;
+    fma.rn.f32 %dot, %q2, %k2, %dot;
+    fma.rn.f32 %dot, %q3, %k3, %dot;
+    shfl.sync.down.b32 %sh, %dot, 16, 31, 0xffffffff;
+    add.f32 %dot, %dot, %sh;
+    shfl.sync.down.b32 %sh, %dot, 8, 31, 0xffffffff;
+    add.f32 %dot, %dot, %sh;
+    shfl.sync.down.b32 %sh, %dot, 4, 31, 0xffffffff;
+    add.f32 %dot, %dot, %sh;
+    shfl.sync.down.b32 %sh, %dot, 2, 31, 0xffffffff;
+    add.f32 %dot, %dot, %sh;
+    shfl.sync.down.b32 %sh, %dot, 1, 31, 0xffffffff;
+    add.f32 %dot, %dot, %sh;
+    shfl.sync.idx.b32 %dot, %dot, 0, 31, 0xffffffff;
+    mul.f32 %sc, %dot, 0.0883883476;
+
+    // Online softmax. The rescale branch is warp-uniform because %sc is
+    // broadcast, and it is taken only when the running max grows.
+    setp.gt.f32 %p2, %sc, %m;
+    @!%p2 bra NO_RESCALE;
+    sub.f32 %tmpf, %m, %sc;
+    mul.f32 %tmpf, %tmpf, 1.44269504;
+    ex2.approx.ftz.f32 %corr, %tmpf;
+    mul.f32 %a0, %a0, %corr;
+    mul.f32 %a1, %a1, %corr;
+    mul.f32 %a2, %a2, %corr;
+    mul.f32 %a3, %a3, %corr;
+    mul.f32 %s, %s, %corr;
+    mov.f32 %m, %sc;
+NO_RESCALE:
+    sub.f32 %tmpf, %sc, %m;
+    mul.f32 %tmpf, %tmpf, 1.44269504;
+    ex2.approx.ftz.f32 %w, %tmpf;
+    add.f32 %s, %s, %w;
+
+    cvt.f32.f16 %v0, %g0;
+    cvt.f32.f16 %v1, %g1;
+    cvt.f32.f16 %v2, %g2;
+    cvt.f32.f16 %v3, %g3;
+    fma.rn.f32 %a0, %w, %v0, %a0;
+    fma.rn.f32 %a1, %w, %v1, %a1;
+    fma.rn.f32 %a2, %w, %v2, %a2;
+    fma.rn.f32 %a3, %w, %v3, %a3;
+
+    add.u32 %t, %t, 1;
+    bra KEY_LOOP;
+
+FINISH:
+    rcp.approx.ftz.f32 %tmpf, %s;
+    mul.f32 %a0, %a0, %tmpf;
+    mul.f32 %a1, %a1, %tmpf;
+    mul.f32 %a2, %a2, %tmpf;
+    mul.f32 %a3, %a3, %tmpf;
+
+    add.u64 %addr, %ctx_ptr, %laneoff;
+    cvt.rn.f16.f32 %h0, %a0;
+    cvt.rn.f16.f32 %h1, %a1;
+    cvt.rn.f16.f32 %h2, %a2;
+    cvt.rn.f16.f32 %h3, %a3;
+    st.global.v4.u16 [%addr], {%h0, %h1, %h2, %h3};
+
+EXIT:
+    ret;
+}
+"#;
+
+/// Online-softmax GQA kernel with two independent key streams per warp.
+///
+/// Each `shfl.sync` in the score reduction has ~25 cycles of latency and the
+/// six-step reduction chain is fully dependent, which caps the single-stream
+/// kernel at ~2.4 Gkeys/s (measured). Even and odd keys are therefore fed to
+/// two independent (max, normaliser, accumulator) states that interleave, so
+/// the two reduction chains hide each other's latency. The states cover
+/// disjoint key sets, so merging them at the end with the usual online
+/// rescaling is exact. Layout and masking are identical to
+/// `batched_gqa_attention_online_fp16`.
+pub const BATCHED_GQA_ATTENTION_ONLINE2_PTX: &str = r#"
+.version 7.5
+.target sm_80
+.address_size 64
+
+.visible .entry batched_gqa_attention_online2_fp16(
+    .param .u64 context_out,
+    .param .u64 q_in,
+    .param .u64 k_ptrs,
+    .param .u64 v_ptrs,
+    .param .u64 seq_lens,
+    .param .u32 num_q_heads,
+    .param .u32 num_kv_heads,
+    .param .u32 head_dim,
+    .param .u32 batch_size,
+    .param .u32 window
+) {
+    .reg .pred %p0, %p1, %p2, %p3;
+    .reg .b32 %tidv, %lane, %warp, %head, %kvh, %b_idx, %slen, %nq, %nkv, %hd, %t, %t_start, %window, %kvbase, %tmp;
+    .reg .b64 %q_ptr, %ctx_ptr, %k_ptr, %v_ptr, %k_tbl, %v_tbl, %sl_tbl, %off, %addr, %addr2, %laneoff;
+    .reg .b64 %off2;
+    .reg .f32 %q0, %q1, %q2, %q3, %m, %s, %dot, %sc, %corr, %tmpf, %sh, %denom;
+    .reg .f32 %ma, %sa, %mb, %sb, %dotb, %scb, %corrb, %shb, %wb;
+    .reg .f32 %ka0, %ka1, %ka2, %ka3, %kb0, %kb1, %kb2, %kb3;
+    .reg .f32 %aa0, %aa1, %aa2, %aa3, %ab0, %ab1, %ab2, %ab3;
+    .reg .f32 %va0, %va1, %va2, %va3, %vb0, %vb1, %vb2, %vb3;
+    .reg .b16 %h0, %h1, %h2, %h3, %g0, %g1, %g2, %g3;
+
+    ld.param.u32 %nq, [num_q_heads];
+    ld.param.u32 %nkv, [num_kv_heads];
+    ld.param.u32 %hd, [head_dim];
+
+    mov.u32 %b_idx, %ctaid.y;
+    ld.param.u32 %tmp, [batch_size];
+    setp.ge.u32 %p0, %b_idx, %tmp;
+    @%p0 bra EXIT;
+
+    mov.u32 %kvh, %ctaid.x;
+    setp.ge.u32 %p0, %kvh, %nkv;
+    @%p0 bra EXIT;
+
+    mov.u32 %tidv, %tid.x;
+    shr.u32 %warp, %tidv, 5;
+    and.b32 %lane, %tidv, 31;
+    shl.b32 %head, %kvh, 2;
+    add.u32 %head, %head, %warp;
+
+    cvt.u64.u32 %laneoff, %lane;
+    shl.b64 %laneoff, %laneoff, 3;
+
+    ld.param.u64 %q_ptr, [q_in];
+    ld.param.u64 %ctx_ptr, [context_out];
+
+    mul.lo.u32 %tmp, %b_idx, %nq;
+    add.u32 %tmp, %tmp, %head;
+    mul.lo.u32 %tmp, %tmp, %hd;
+    cvt.u64.u32 %off, %tmp;
+    shl.b64 %off, %off, 1;
+    add.u64 %q_ptr, %q_ptr, %off;
+    add.u64 %ctx_ptr, %ctx_ptr, %off;
+    add.u64 %addr, %q_ptr, %laneoff;
+    ld.global.v4.u16 {%h0, %h1, %h2, %h3}, [%addr];
+    cvt.f32.f16 %q0, %h0;
+    cvt.f32.f16 %q1, %h1;
+    cvt.f32.f16 %q2, %h2;
+    cvt.f32.f16 %q3, %h3;
+
+    ld.param.u64 %k_tbl, [k_ptrs];
+    ld.param.u64 %v_tbl, [v_ptrs];
+    mul.wide.u32 %off, %b_idx, 8;
+    add.u64 %off, %k_tbl, %off;
+    ld.global.u64 %k_ptr, [%off];
+    mul.wide.u32 %off, %b_idx, 8;
+    add.u64 %off, %v_tbl, %off;
+    ld.global.u64 %v_ptr, [%off];
+
+    ld.param.u64 %sl_tbl, [seq_lens];
+    mul.wide.u32 %off, %b_idx, 4;
+    add.u64 %off, %sl_tbl, %off;
+    ld.global.u32 %slen, [%off];
+
+    ld.param.u32 %window, [window];
+    mov.u32 %t_start, 0;
+    setp.eq.u32 %p1, %window, 0;
+    @%p1 bra W_DONE;
+    setp.le.u32 %p1, %slen, %window;
+    @%p1 bra W_DONE;
+    sub.u32 %t_start, %slen, %window;
+W_DONE:
+
+    mov.f32 %ma, -1.0e30;
+    mov.f32 %sa, 0.0;
+    mov.f32 %aa0, 0.0;
+    mov.f32 %aa1, 0.0;
+    mov.f32 %aa2, 0.0;
+    mov.f32 %aa3, 0.0;
+    mov.f32 %mb, -1.0e30;
+    mov.f32 %sb, 0.0;
+    mov.f32 %ab0, 0.0;
+    mov.f32 %ab1, 0.0;
+    mov.f32 %ab2, 0.0;
+    mov.f32 %ab3, 0.0;
+    mov.u32 %t, %t_start;
+
+PAIR_LOOP:
+    // Need at least two keys to run a pair; the tail is handled below.
+    add.u32 %tmp, %t, 1;
+    setp.ge.u32 %p0, %tmp, %slen;
+    @%p0 bra TAIL;
+
+    mul.lo.u32 %kvbase, %t, %nkv;
+    add.u32 %kvbase, %kvbase, %kvh;
+    mul.lo.u32 %kvbase, %kvbase, %hd;
+    cvt.u64.u32 %off, %kvbase;
+    shl.b64 %off, %off, 1;
+    add.u64 %off, %off, %laneoff;
+    add.u64 %off2, %off, 0;
+    // Second key is one KV row further: nkv * hd halves.
+    mul.lo.u32 %tmp, %nkv, %hd;
+    cvt.u64.u32 %addr2, %tmp;
+    shl.b64 %addr2, %addr2, 1;
+    add.u64 %off2, %off2, %addr2;
+
+    add.u64 %addr, %k_ptr, %off;
+    ld.global.v4.u16 {%h0, %h1, %h2, %h3}, [%addr];
+    add.u64 %addr, %k_ptr, %off2;
+    ld.global.v4.u16 {%g0, %g1, %g2, %g3}, [%addr];
+    cvt.f32.f16 %ka0, %h0;
+    cvt.f32.f16 %ka1, %h1;
+    cvt.f32.f16 %ka2, %h2;
+    cvt.f32.f16 %ka3, %h3;
+    cvt.f32.f16 %kb0, %g0;
+    cvt.f32.f16 %kb1, %g1;
+    cvt.f32.f16 %kb2, %g2;
+    cvt.f32.f16 %kb3, %g3;
+
+    mul.f32 %dot, %q0, %ka0;
+    fma.rn.f32 %dot, %q1, %ka1, %dot;
+    fma.rn.f32 %dot, %q2, %ka2, %dot;
+    fma.rn.f32 %dot, %q3, %ka3, %dot;
+    mul.f32 %dotb, %q0, %kb0;
+    fma.rn.f32 %dotb, %q1, %kb1, %dotb;
+    fma.rn.f32 %dotb, %q2, %kb2, %dotb;
+    fma.rn.f32 %dotb, %q3, %kb3, %dotb;
+
+    // Interleaved reductions: independent chains, so their latencies overlap.
+    shfl.sync.down.b32 %sh, %dot, 16, 31, 0xffffffff;
+    shfl.sync.down.b32 %shb, %dotb, 16, 31, 0xffffffff;
+    add.f32 %dot, %dot, %sh;
+    add.f32 %dotb, %dotb, %shb;
+    shfl.sync.down.b32 %sh, %dot, 8, 31, 0xffffffff;
+    shfl.sync.down.b32 %shb, %dotb, 8, 31, 0xffffffff;
+    add.f32 %dot, %dot, %sh;
+    add.f32 %dotb, %dotb, %shb;
+    shfl.sync.down.b32 %sh, %dot, 4, 31, 0xffffffff;
+    shfl.sync.down.b32 %shb, %dotb, 4, 31, 0xffffffff;
+    add.f32 %dot, %dot, %sh;
+    add.f32 %dotb, %dotb, %shb;
+    shfl.sync.down.b32 %sh, %dot, 2, 31, 0xffffffff;
+    shfl.sync.down.b32 %shb, %dotb, 2, 31, 0xffffffff;
+    add.f32 %dot, %dot, %sh;
+    add.f32 %dotb, %dotb, %shb;
+    shfl.sync.down.b32 %sh, %dot, 1, 31, 0xffffffff;
+    shfl.sync.down.b32 %shb, %dotb, 1, 31, 0xffffffff;
+    add.f32 %dot, %dot, %sh;
+    add.f32 %dotb, %dotb, %shb;
+    shfl.sync.idx.b32 %dot, %dot, 0, 31, 0xffffffff;
+    shfl.sync.idx.b32 %dotb, %dotb, 0, 31, 0xffffffff;
+    mul.f32 %sc, %dot, 0.0883883476;
+    mul.f32 %scb, %dotb, 0.0883883476;
+
+    setp.gt.f32 %p2, %sc, %ma;
+    @!%p2 bra NO_RESCALE_A;
+    sub.f32 %tmpf, %ma, %sc;
+    mul.f32 %tmpf, %tmpf, 1.44269504;
+    ex2.approx.ftz.f32 %corr, %tmpf;
+    mul.f32 %aa0, %aa0, %corr;
+    mul.f32 %aa1, %aa1, %corr;
+    mul.f32 %aa2, %aa2, %corr;
+    mul.f32 %aa3, %aa3, %corr;
+    mul.f32 %sa, %sa, %corr;
+    mov.f32 %ma, %sc;
+NO_RESCALE_A:
+    sub.f32 %tmpf, %sc, %ma;
+    mul.f32 %tmpf, %tmpf, 1.44269504;
+    ex2.approx.ftz.f32 %corr, %tmpf;
+    add.f32 %sa, %sa, %corr;
+
+    setp.gt.f32 %p3, %scb, %mb;
+    @!%p3 bra NO_RESCALE_B;
+    sub.f32 %tmpf, %mb, %scb;
+    mul.f32 %tmpf, %tmpf, 1.44269504;
+    ex2.approx.ftz.f32 %corrb, %tmpf;
+    mul.f32 %ab0, %ab0, %corrb;
+    mul.f32 %ab1, %ab1, %corrb;
+    mul.f32 %ab2, %ab2, %corrb;
+    mul.f32 %ab3, %ab3, %corrb;
+    mul.f32 %sb, %sb, %corrb;
+    mov.f32 %mb, %scb;
+NO_RESCALE_B:
+    sub.f32 %tmpf, %scb, %mb;
+    mul.f32 %tmpf, %tmpf, 1.44269504;
+    ex2.approx.ftz.f32 %wb, %tmpf;
+    add.f32 %sb, %sb, %wb;
+
+    add.u64 %addr, %v_ptr, %off;
+    ld.global.v4.u16 {%h0, %h1, %h2, %h3}, [%addr];
+    add.u64 %addr, %v_ptr, %off2;
+    ld.global.v4.u16 {%g0, %g1, %g2, %g3}, [%addr];
+    cvt.f32.f16 %va0, %h0;
+    cvt.f32.f16 %va1, %h1;
+    cvt.f32.f16 %va2, %h2;
+    cvt.f32.f16 %va3, %h3;
+    cvt.f32.f16 %vb0, %g0;
+    cvt.f32.f16 %vb1, %g1;
+    cvt.f32.f16 %vb2, %g2;
+    cvt.f32.f16 %vb3, %g3;
+    fma.rn.f32 %aa0, %corr, %va0, %aa0;
+    fma.rn.f32 %aa1, %corr, %va1, %aa1;
+    fma.rn.f32 %aa2, %corr, %va2, %aa2;
+    fma.rn.f32 %aa3, %corr, %va3, %aa3;
+    fma.rn.f32 %ab0, %wb, %vb0, %ab0;
+    fma.rn.f32 %ab1, %wb, %vb1, %ab1;
+    fma.rn.f32 %ab2, %wb, %vb2, %ab2;
+    fma.rn.f32 %ab3, %wb, %vb3, %ab3;
+
+    add.u32 %t, %t, 2;
+    bra PAIR_LOOP;
+
+TAIL:
+    // At most one key left; accumulate it into stream A.
+    setp.ge.u32 %p0, %t, %slen;
+    @%p0 bra MERGE;
+
+    mul.lo.u32 %kvbase, %t, %nkv;
+    add.u32 %kvbase, %kvbase, %kvh;
+    mul.lo.u32 %kvbase, %kvbase, %hd;
+    cvt.u64.u32 %off, %kvbase;
+    shl.b64 %off, %off, 1;
+    add.u64 %off, %off, %laneoff;
+
+    add.u64 %addr, %k_ptr, %off;
+    ld.global.v4.u16 {%h0, %h1, %h2, %h3}, [%addr];
+    cvt.f32.f16 %ka0, %h0;
+    cvt.f32.f16 %ka1, %h1;
+    cvt.f32.f16 %ka2, %h2;
+    cvt.f32.f16 %ka3, %h3;
+    mul.f32 %dot, %q0, %ka0;
+    fma.rn.f32 %dot, %q1, %ka1, %dot;
+    fma.rn.f32 %dot, %q2, %ka2, %dot;
+    fma.rn.f32 %dot, %q3, %ka3, %dot;
+    shfl.sync.down.b32 %sh, %dot, 16, 31, 0xffffffff;
+    add.f32 %dot, %dot, %sh;
+    shfl.sync.down.b32 %sh, %dot, 8, 31, 0xffffffff;
+    add.f32 %dot, %dot, %sh;
+    shfl.sync.down.b32 %sh, %dot, 4, 31, 0xffffffff;
+    add.f32 %dot, %dot, %sh;
+    shfl.sync.down.b32 %sh, %dot, 2, 31, 0xffffffff;
+    add.f32 %dot, %dot, %sh;
+    shfl.sync.down.b32 %sh, %dot, 1, 31, 0xffffffff;
+    add.f32 %dot, %dot, %sh;
+    shfl.sync.idx.b32 %dot, %dot, 0, 31, 0xffffffff;
+    mul.f32 %sc, %dot, 0.0883883476;
+
+    setp.gt.f32 %p2, %sc, %ma;
+    @!%p2 bra NO_RESCALE_T;
+    sub.f32 %tmpf, %ma, %sc;
+    mul.f32 %tmpf, %tmpf, 1.44269504;
+    ex2.approx.ftz.f32 %corr, %tmpf;
+    mul.f32 %aa0, %aa0, %corr;
+    mul.f32 %aa1, %aa1, %corr;
+    mul.f32 %aa2, %aa2, %corr;
+    mul.f32 %aa3, %aa3, %corr;
+    mul.f32 %sa, %sa, %corr;
+    mov.f32 %ma, %sc;
+NO_RESCALE_T:
+    sub.f32 %tmpf, %sc, %ma;
+    mul.f32 %tmpf, %tmpf, 1.44269504;
+    ex2.approx.ftz.f32 %corr, %tmpf;
+    add.f32 %sa, %sa, %corr;
+
+    add.u64 %addr, %v_ptr, %off;
+    ld.global.v4.u16 {%h0, %h1, %h2, %h3}, [%addr];
+    cvt.f32.f16 %va0, %h0;
+    cvt.f32.f16 %va1, %h1;
+    cvt.f32.f16 %va2, %h2;
+    cvt.f32.f16 %va3, %h3;
+    fma.rn.f32 %aa0, %corr, %va0, %aa0;
+    fma.rn.f32 %aa1, %corr, %va1, %aa1;
+    fma.rn.f32 %aa2, %corr, %va2, %aa2;
+    fma.rn.f32 %aa3, %corr, %va3, %aa3;
+
+MERGE:
+    // Combine the two disjoint key streams.
+    setp.gt.f32 %p2, %mb, %ma;
+    @!%p2 bra MERGE_A_FIRST;
+    sub.f32 %tmpf, %ma, %mb;
+    mul.f32 %tmpf, %tmpf, 1.44269504;
+    ex2.approx.ftz.f32 %corr, %tmpf;
+    mul.f32 %aa0, %aa0, %corr;
+    mul.f32 %aa1, %aa1, %corr;
+    mul.f32 %aa2, %aa2, %corr;
+    mul.f32 %aa3, %aa3, %corr;
+    mul.f32 %sa, %sa, %corr;
+    mov.f32 %ma, %mb;
+MERGE_A_FIRST:
+    sub.f32 %tmpf, %mb, %ma;
+    mul.f32 %tmpf, %tmpf, 1.44269504;
+    ex2.approx.ftz.f32 %corrb, %tmpf;
+    mul.f32 %ab0, %ab0, %corrb;
+    mul.f32 %ab1, %ab1, %corrb;
+    mul.f32 %ab2, %ab2, %corrb;
+    mul.f32 %ab3, %ab3, %corrb;
+    mul.f32 %sb, %sb, %corrb;
+
+    add.f32 %s, %sa, %sb;
+    add.f32 %aa0, %aa0, %ab0;
+    add.f32 %aa1, %aa1, %ab1;
+    add.f32 %aa2, %aa2, %ab2;
+    add.f32 %aa3, %aa3, %ab3;
+
+    rcp.approx.ftz.f32 %denom, %s;
+    mul.f32 %aa0, %aa0, %denom;
+    mul.f32 %aa1, %aa1, %denom;
+    mul.f32 %aa2, %aa2, %denom;
+    mul.f32 %aa3, %aa3, %denom;
+
+    add.u64 %addr, %ctx_ptr, %laneoff;
+    cvt.rn.f16.f32 %h0, %aa0;
+    cvt.rn.f16.f32 %h1, %aa1;
+    cvt.rn.f16.f32 %h2, %aa2;
+    cvt.rn.f16.f32 %h3, %aa3;
+    st.global.v4.u16 [%addr], {%h0, %h1, %h2, %h3};
+
+EXIT:
+    ret;
+}
+"#;

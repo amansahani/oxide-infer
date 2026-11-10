@@ -7,7 +7,10 @@ use anyhow::{anyhow, Result};
 use cuda_core::launch_kernel_on_stream;
 use half::f16;
 use oxide_infer_core::{DeviceBuffer, GpuContext};
-use oxide_infer_kernels::batched_attn::{BATCHED_GQA_ATTENTION_ONLINE_PTX, BATCHED_GQA_ATTENTION_PTX};
+use oxide_infer_kernels::batched_attn::{
+    BATCHED_GQA_ATTENTION_MR_PTX, BATCHED_GQA_ATTENTION_ONLINE2_PTX, BATCHED_GQA_ATTENTION_ONLINE_PTX,
+    BATCHED_GQA_ATTENTION_PTX,
+};
 use oxide_infer_kernels::PtxModule;
 use std::ffi::c_void;
 use std::time::Instant;
@@ -22,6 +25,10 @@ fn main() -> Result<()> {
     let which = std::env::var("BENCH_KERNEL").unwrap_or_else(|_| "online".into());
     let (ptx, entry) = if which == "scan" {
         (BATCHED_GQA_ATTENTION_PTX, "batched_gqa_attention_fp16")
+    } else if which == "mr" {
+        (BATCHED_GQA_ATTENTION_MR_PTX, "batched_gqa_attention_mr_fp16")
+    } else if which == "online2" {
+        (BATCHED_GQA_ATTENTION_ONLINE2_PTX, "batched_gqa_attention_online2_fp16")
     } else {
         (BATCHED_GQA_ATTENTION_ONLINE_PTX, "batched_gqa_attention_online_fp16")
     };
@@ -60,8 +67,17 @@ fn main() -> Result<()> {
                 &mut w as *mut _ as *mut c_void,
             ];
             unsafe {
-                let grid = if which == "scan" { (NQ as u32, bb, 1) } else { (NKV as u32, bb, 1) };
-                launch_kernel_on_stream(&gqa, grid, (HD as u32, 1, 1), 0, stream, &mut args)?;
+                let (grid, block) = if which == "scan" {
+                    ((NQ as u32, bb, 1), (HD as u32, 1, 1))
+                } else if which == "mr" {
+                    (
+                        (NKV as u32, (bb + 3) / 4, 1),
+                        (HD as u32, 4, 1),
+                    )
+                } else {
+                    ((NKV as u32, bb, 1), (HD as u32, 1, 1))
+                };
+                launch_kernel_on_stream(&gqa, grid, block, 0, stream, &mut args)?;
             }
             Ok(())
         };
