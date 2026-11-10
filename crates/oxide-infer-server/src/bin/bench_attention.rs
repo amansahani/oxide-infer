@@ -29,7 +29,7 @@ fn main() -> Result<()> {
         .map_err(|e| anyhow!("gqa PTX: {e}"))?;
     let gqa = module.get_function(entry)?;
 
-    for (b, slen) in [(1usize, 4000usize), (8, 2000), (64, 2000), (512, 512), (512, 2000)] {
+    for (b, slen) in [(1usize, 512usize), (1, 1000), (1, 2000), (1, 4000), (4, 2000), (8, 2000), (64, 2000), (512, 512), (512, 2000)] {
         let q = DeviceBuffer::<f16>::from_slice(&gpu, &vec![f16::from_f32(0.1); b * NQ * HD])?;
         let k = DeviceBuffer::<f16>::from_slice(&gpu, &vec![f16::from_f32(0.05); slen * NKV * HD])?;
         let v = DeviceBuffer::<f16>::from_slice(&gpu, &vec![f16::from_f32(0.05); slen * NKV * HD])?;
@@ -69,7 +69,7 @@ fn main() -> Result<()> {
         for w in [0u32, 256] {
             launch(w)?;
             stream.synchronize()?;
-            let reps = if b * slen > 2_000_000 { 3 } else { 10 };
+            let reps = if b * slen > 2_000_000 { 5 } else { 50 };
             let t0 = Instant::now();
             for _ in 0..reps {
                 launch(w)?;

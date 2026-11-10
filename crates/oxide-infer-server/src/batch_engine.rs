@@ -10,7 +10,8 @@ use half::f16;
 use oxide_infer_core::{DeviceBuffer, GpuContext};
 use oxide_infer_kernels::batched_attn::{
     BATCHED_ARGMAX_DIRECT_PTX, BATCHED_CONV_PTR_PTX, BATCHED_EMBED_LOOKUP_PTX,
-    BATCHED_GQA_ATTENTION_ONLINE_PTX, BATCHED_KV_COPY_PTX, BATCHED_QK_RMSNORM_PTX, BATCHED_ROPE_PTX,
+    BATCHED_GQA_ATTENTION_ONLINE_PTX, BATCHED_GQA_ATTENTION_SPLIT_PTX, BATCHED_KV_COPY_PTX,
+    BATCHED_QK_RMSNORM_PTX, BATCHED_ROPE_PTX,
     BATCHED_SIGMOID_GATE_PTX, CONV_STATE_PREFILL_PTX,
 };
 use oxide_infer_kernels::PtxModule;
@@ -36,6 +37,12 @@ pub const KV_DIM: usize = 512;
 pub const NUM_Q_HEADS: usize = 16;
 pub const NUM_KV_HEADS: usize = 4;
 pub const HEAD_DIM: usize = 128;
+/// Keys per block in split-K decode attention. Fixed so chunk boundaries (and
+/// therefore the summation order) never depend on the batch composition: a
+/// row sees identical arithmetic whether it runs alone or next to 127 others.
+const ATTN_CHUNK_KEYS: usize = 256;
+/// Hard cap on attention chunks; with 256-key chunks this covers 8192 tokens.
+const MAX_ATTN_CHUNKS: usize = 32;
 pub const VOCAB: usize = 128_000;
 
 /// Per-sequence GPU state needed by the batched engine.
@@ -85,6 +92,10 @@ struct BatchScratch {
     tokens_out: DeviceBuffer<u32>,
     pos_ids: DeviceBuffer<u32>,
     seq_lens: DeviceBuffer<u32>,
+    /// Split-K attention partials: `[row][chunk][q_head][head_dim]` (f32) and
+    /// `[row][chunk][q_head][max, normaliser]` (f32).
+    attn_part_acc: DeviceBuffer<f32>,
+    attn_part_stats: DeviceBuffer<f32>,
     k_ptrs: DeviceBuffer<u64>,
     v_ptrs: DeviceBuffer<u64>,
     conv_ptrs: DeviceBuffer<u64>,
@@ -131,6 +142,8 @@ pub struct BatchEngine {
     rope: Function,
     kv_copy: Function,
     gqa: Function,
+    gqa_split: Function,
+    gqa_combine: Function,
     sigmoid_gate: Function,
     embed: Function,
     argmax: Function,
@@ -184,6 +197,8 @@ impl BatchEngine {
             .map_err(|e| anyhow!("kv_copy PTX: {e}"))?;
         let gqa_ptx = PtxModule::load_from_ptx(gpu, BATCHED_GQA_ATTENTION_ONLINE_PTX)
             .map_err(|e| anyhow!("gqa PTX: {e}"))?;
+        let split_ptx = PtxModule::load_from_ptx(gpu, BATCHED_GQA_ATTENTION_SPLIT_PTX)
+            .map_err(|e| anyhow!("gqa split PTX: {e}"))?;
         let gate_ptx = PtxModule::load_from_ptx(gpu, BATCHED_SIGMOID_GATE_PTX)
             .map_err(|e| anyhow!("sigmoid gate PTX: {e}"))?;
         let embed_ptx = PtxModule::load_from_ptx(gpu, BATCHED_EMBED_LOOKUP_PTX)
@@ -215,6 +230,16 @@ impl BatchEngine {
             tokens_out: DeviceBuffer::<u32>::zeroed(gpu, max_batch).map_err(|e| anyhow!("alloc: {e}"))?,
             pos_ids: DeviceBuffer::<u32>::zeroed(gpu, b).map_err(|e| anyhow!("alloc: {e}"))?,
             seq_lens: DeviceBuffer::<u32>::zeroed(gpu, b).map_err(|e| anyhow!("alloc: {e}"))?,
+            attn_part_acc: DeviceBuffer::<f32>::zeroed(
+                gpu,
+                max_batch * MAX_ATTN_CHUNKS * NUM_Q_HEADS * HEAD_DIM,
+            )
+            .map_err(|e| anyhow!("alloc: {e}"))?,
+            attn_part_stats: DeviceBuffer::<f32>::zeroed(
+                gpu,
+                max_batch * MAX_ATTN_CHUNKS * NUM_Q_HEADS * 2,
+            )
+            .map_err(|e| anyhow!("alloc: {e}"))?,
             k_ptrs: DeviceBuffer::<u64>::zeroed(gpu, 24 * b).map_err(|e| anyhow!("alloc: {e}"))?,
             v_ptrs: DeviceBuffer::<u64>::zeroed(gpu, 24 * b).map_err(|e| anyhow!("alloc: {e}"))?,
             conv_ptrs: DeviceBuffer::<u64>::zeroed(gpu, 24 * b).map_err(|e| anyhow!("alloc: {e}"))?,
@@ -238,6 +263,8 @@ impl BatchEngine {
             rope: rope_ptx.get_function("batched_rope_fp16")?,
             kv_copy: kv_ptx.get_function("batched_kv_copy_fp16")?,
             gqa: gqa_ptx.get_function("batched_gqa_attention_online_fp16")?,
+            gqa_split: split_ptx.get_function("batched_gqa_attention_split_fp16")?,
+            gqa_combine: split_ptx.get_function("batched_gqa_attn_combine_fp16")?,
             sigmoid_gate: gate_ptx.get_function("batched_sigmoid_gate_fp16")?,
             embed: embed_ptx.get_function("batched_embed_lookup_fp16")?,
             argmax: argmax_ptx.get_function("batched_argmax_direct_f16")?,
@@ -345,6 +372,13 @@ impl BatchEngine {
             self.scratch.pos_ids.copy_from_slice(gpu, &pos_pad)?;
             self.scratch.seq_lens.copy_from_slice(gpu, &seq_pad)?;
         }
+
+        // Longest key range in this batch; decides whether decode attention
+        // splits its key loop across blocks.
+        let max_slen = seq_pad[..b].iter().copied().max().unwrap_or(0);
+        // Prefill waves already fill the GPU with one block per row; decode
+        // batches (one row per sequence) do not, so they split keys as well.
+        let decode_step = prefill.is_none();
 
         // Build all per-layer pointer tables in one shot (uploaded once per step).
         let tbl = if async_meta { 24 * b } else { 24 * mb };
@@ -627,11 +661,72 @@ impl BatchEngine {
                     &mut b_arg as *mut _ as *mut c_void,
                     &mut window_u32 as *mut _ as *mut c_void,
                 ];
-                unsafe {
-                    // One block per (KV head, row); its four warps cover the
-                    // four query heads that share that KV head.
-                    let nkv = NUM_KV_HEADS as u32;
-                    launch_kernel_on_stream(&self.gqa, (nkv, b_u32, 1), (hd, 1, 1), 0, stream, &mut args_gqa)?;
+                let eff = if rope.window > 0 {
+                    max_slen.min(rope.window) as usize
+                } else {
+                    max_slen as usize
+                };
+                let nchunks = eff
+                    .div_ceil(ATTN_CHUNK_KEYS)
+                    .clamp(1, MAX_ATTN_CHUNKS) as u32;
+                if decode_step && nchunks > 1 {
+                    // Decode: split the key range across blocks so the keys of
+                    // one sequence are not scanned by a handful of blocks.
+                    let mut chunk_keys = ATTN_CHUNK_KEYS as u32;
+                    let mut d_acc = self.scratch.attn_part_acc.inner_mut().cu_deviceptr();
+                    let mut d_stats = self.scratch.attn_part_stats.inner_mut().cu_deviceptr();
+                    let mut nch = nchunks;
+                    let mut args_split: [*mut c_void; 13] = [
+                        &mut d_q as *mut _ as *mut c_void,
+                        &mut d_kp as *mut _ as *mut c_void,
+                        &mut d_vp as *mut _ as *mut c_void,
+                        &mut d_sl as *mut _ as *mut c_void,
+                        &mut d_acc as *mut _ as *mut c_void,
+                        &mut d_stats as *mut _ as *mut c_void,
+                        &mut nq as *mut _ as *mut c_void,
+                        &mut nkv as *mut _ as *mut c_void,
+                        &mut hd as *mut _ as *mut c_void,
+                        &mut b_arg as *mut _ as *mut c_void,
+                        &mut window_u32 as *mut _ as *mut c_void,
+                        &mut chunk_keys as *mut _ as *mut c_void,
+                        &mut nch as *mut _ as *mut c_void,
+                    ];
+                    unsafe {
+                        launch_kernel_on_stream(
+                            &self.gqa_split,
+                            (nkv, b_u32, nchunks),
+                            (hd, 1, 1),
+                            0,
+                            stream,
+                            &mut args_split,
+                        )?;
+                        let mut d_ctxc = d_ctx;
+                        let mut n_heads = nq;
+                        let mut args_comb: [*mut c_void; 7] = [
+                            &mut d_ctxc as *mut _ as *mut c_void,
+                            &mut d_acc as *mut _ as *mut c_void,
+                            &mut d_stats as *mut _ as *mut c_void,
+                            &mut n_heads as *mut _ as *mut c_void,
+                            &mut hd as *mut _ as *mut c_void,
+                            &mut b_arg as *mut _ as *mut c_void,
+                            &mut nch as *mut _ as *mut c_void,
+                        ];
+                        launch_kernel_on_stream(
+                            &self.gqa_combine,
+                            (nq, b_u32, 1),
+                            (32, 1, 1),
+                            0,
+                            stream,
+                            &mut args_comb,
+                        )?;
+                    }
+                } else {
+                    unsafe {
+                        // One block per (KV head, row); its four warps cover the
+                        // four query heads that share that KV head.
+                        let nkv = NUM_KV_HEADS as u32;
+                        launch_kernel_on_stream(&self.gqa, (nkv, b_u32, 1), (hd, 1, 1), 0, stream, &mut args_gqa)?;
+                    }
                 }
 
                 // Sigmoid gating.

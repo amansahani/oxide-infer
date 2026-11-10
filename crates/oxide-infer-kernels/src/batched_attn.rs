@@ -1369,3 +1369,350 @@ EXIT:
     ret;
 }
 "#;
+
+/// Split-K attention: pass 1 of 2.
+///
+/// Same per-warp maths as `batched_gqa_attention_online_fp16`, but each block
+/// owns one key range `[ctaid.z * chunk_keys, +chunk_keys)` and writes its
+/// unnormalised partial (running max, normaliser, 128 weighted values) to
+/// `partial_acc` / `partial_stats` instead of the final context.
+///
+/// A single-block-per-row decode touches the GPU with only `num_kv_heads`
+/// blocks, so the key loop is latency bound (~0.94 ms/layer at 2 000 keys).
+/// Splitting the keys across blocks fills the SMs, and
+/// `batched_gqa_attn_combine_fp16` merges the partials exactly.
+pub const BATCHED_GQA_ATTENTION_SPLIT_PTX: &str = r#"
+.version 7.5
+.target sm_80
+.address_size 64
+
+.visible .entry batched_gqa_attention_split_fp16(
+    .param .u64 q_in,
+    .param .u64 k_ptrs,
+    .param .u64 v_ptrs,
+    .param .u64 seq_lens,
+    .param .u64 partial_acc,
+    .param .u64 partial_stats,
+    .param .u32 num_q_heads,
+    .param .u32 num_kv_heads,
+    .param .u32 head_dim,
+    .param .u32 batch_size,
+    .param .u32 window,
+    .param .u32 chunk_keys,
+    .param .u32 nchunks
+) {
+    .reg .pred %p0, %p1, %p2;
+    .reg .b32 %tidv, %lane, %warp, %head, %kvh, %b_idx, %c, %slen, %nq, %nkv, %hd;
+    .reg .b32 %t, %t_start, %t_end, %wstart, %window, %chunk, %nchunks, %kvbase, %tmp, %pidx;
+    .reg .b64 %q_ptr, %k_ptr, %v_ptr, %k_tbl, %v_tbl, %sl_tbl, %off, %addr, %laneoff8, %laneoff16, %base;
+    .reg .f32 %q0, %q1, %q2, %q3, %a0, %a1, %a2, %a3, %m, %s, %dot, %sc, %w, %corr, %tmpf, %sh;
+    .reg .f32 %k0, %k1, %k2, %k3, %v0, %v1, %v2, %v3;
+    .reg .b16 %h0, %h1, %h2, %h3, %g0, %g1, %g2, %g3;
+
+    ld.param.u32 %nq, [num_q_heads];
+    ld.param.u32 %nkv, [num_kv_heads];
+    ld.param.u32 %hd, [head_dim];
+
+    mov.u32 %b_idx, %ctaid.y;
+    ld.param.u32 %tmp, [batch_size];
+    setp.ge.u32 %p0, %b_idx, %tmp;
+    @%p0 bra EXIT;
+
+    mov.u32 %kvh, %ctaid.x;
+    setp.ge.u32 %p0, %kvh, %nkv;
+    @%p0 bra EXIT;
+
+    mov.u32 %tidv, %tid.x;
+    shr.u32 %warp, %tidv, 5;
+    and.b32 %lane, %tidv, 31;
+    shl.b32 %head, %kvh, 2;
+    add.u32 %head, %head, %warp;
+
+    cvt.u64.u32 %laneoff8, %lane;
+    shl.b64 %laneoff8, %laneoff8, 3;
+    cvt.u64.u32 %laneoff16, %lane;
+    shl.b64 %laneoff16, %laneoff16, 4;
+
+    ld.param.u64 %q_ptr, [q_in];
+    mul.lo.u32 %tmp, %b_idx, %nq;
+    add.u32 %tmp, %tmp, %head;
+    mul.lo.u32 %tmp, %tmp, %hd;
+    cvt.u64.u32 %off, %tmp;
+    shl.b64 %off, %off, 1;
+    add.u64 %q_ptr, %q_ptr, %off;
+    add.u64 %addr, %q_ptr, %laneoff8;
+    ld.global.v4.u16 {%h0, %h1, %h2, %h3}, [%addr];
+    cvt.f32.f16 %q0, %h0;
+    cvt.f32.f16 %q1, %h1;
+    cvt.f32.f16 %q2, %h2;
+    cvt.f32.f16 %q3, %h3;
+
+    ld.param.u64 %k_tbl, [k_ptrs];
+    ld.param.u64 %v_tbl, [v_ptrs];
+    mul.wide.u32 %off, %b_idx, 8;
+    add.u64 %off, %k_tbl, %off;
+    ld.global.u64 %k_ptr, [%off];
+    mul.wide.u32 %off, %b_idx, 8;
+    add.u64 %off, %v_tbl, %off;
+    ld.global.u64 %v_ptr, [%off];
+
+    ld.param.u64 %sl_tbl, [seq_lens];
+    mul.wide.u32 %off, %b_idx, 4;
+    add.u64 %off, %sl_tbl, %off;
+    ld.global.u32 %slen, [%off];
+
+    // This block's key range: the chunk intersected with the layer window.
+    ld.param.u32 %chunk, [chunk_keys];
+    ld.param.u32 %nchunks, [nchunks];
+    mov.u32 %c, %ctaid.z;
+    ld.param.u32 %window, [window];
+
+    mul.lo.u32 %t_start, %c, %chunk;
+    add.u32 %t_end, %t_start, %chunk;
+    setp.gt.u32 %p0, %t_end, %slen;
+    @%p0 mov.u32 %t_end, %slen;
+
+    setp.eq.u32 %p1, %window, 0;
+    @%p1 bra W_DONE;
+    mov.u32 %wstart, 0;
+    setp.gt.u32 %p1, %slen, %window;
+    @!%p1 bra W_CHECK;
+    sub.u32 %wstart, %slen, %window;
+W_CHECK:
+    setp.lt.u32 %p1, %t_start, %wstart;
+    @!%p1 bra W_DONE;
+    mov.u32 %t_start, %wstart;
+W_DONE:
+
+    mov.f32 %m, -1.0e30;
+    mov.f32 %s, 0.0;
+    mov.f32 %a0, 0.0;
+    mov.f32 %a1, 0.0;
+    mov.f32 %a2, 0.0;
+    mov.f32 %a3, 0.0;
+    mov.u32 %t, %t_start;
+
+KEY_LOOP:
+    setp.ge.u32 %p0, %t, %t_end;
+    @%p0 bra FINISH;
+
+    mul.lo.u32 %kvbase, %t, %nkv;
+    add.u32 %kvbase, %kvbase, %kvh;
+    mul.lo.u32 %kvbase, %kvbase, %hd;
+    cvt.u64.u32 %off, %kvbase;
+    shl.b64 %off, %off, 1;
+    add.u64 %off, %off, %laneoff8;
+
+    add.u64 %addr, %k_ptr, %off;
+    ld.global.v4.u16 {%h0, %h1, %h2, %h3}, [%addr];
+    add.u64 %addr, %v_ptr, %off;
+    ld.global.v4.u16 {%g0, %g1, %g2, %g3}, [%addr];
+
+    cvt.f32.f16 %k0, %h0;
+    cvt.f32.f16 %k1, %h1;
+    cvt.f32.f16 %k2, %h2;
+    cvt.f32.f16 %k3, %h3;
+
+    mul.f32 %dot, %q0, %k0;
+    fma.rn.f32 %dot, %q1, %k1, %dot;
+    fma.rn.f32 %dot, %q2, %k2, %dot;
+    fma.rn.f32 %dot, %q3, %k3, %dot;
+    shfl.sync.down.b32 %sh, %dot, 16, 31, 0xffffffff;
+    add.f32 %dot, %dot, %sh;
+    shfl.sync.down.b32 %sh, %dot, 8, 31, 0xffffffff;
+    add.f32 %dot, %dot, %sh;
+    shfl.sync.down.b32 %sh, %dot, 4, 31, 0xffffffff;
+    add.f32 %dot, %dot, %sh;
+    shfl.sync.down.b32 %sh, %dot, 2, 31, 0xffffffff;
+    add.f32 %dot, %dot, %sh;
+    shfl.sync.down.b32 %sh, %dot, 1, 31, 0xffffffff;
+    add.f32 %dot, %dot, %sh;
+    shfl.sync.idx.b32 %dot, %dot, 0, 31, 0xffffffff;
+    mul.f32 %sc, %dot, 0.0883883476;
+
+    setp.gt.f32 %p2, %sc, %m;
+    @!%p2 bra NO_RESCALE;
+    sub.f32 %tmpf, %m, %sc;
+    mul.f32 %tmpf, %tmpf, 1.44269504;
+    ex2.approx.ftz.f32 %corr, %tmpf;
+    mul.f32 %a0, %a0, %corr;
+    mul.f32 %a1, %a1, %corr;
+    mul.f32 %a2, %a2, %corr;
+    mul.f32 %a3, %a3, %corr;
+    mul.f32 %s, %s, %corr;
+    mov.f32 %m, %sc;
+NO_RESCALE:
+    sub.f32 %tmpf, %sc, %m;
+    mul.f32 %tmpf, %tmpf, 1.44269504;
+    ex2.approx.ftz.f32 %w, %tmpf;
+    add.f32 %s, %s, %w;
+
+    cvt.f32.f16 %v0, %g0;
+    cvt.f32.f16 %v1, %g1;
+    cvt.f32.f16 %v2, %g2;
+    cvt.f32.f16 %v3, %g3;
+    fma.rn.f32 %a0, %w, %v0, %a0;
+    fma.rn.f32 %a1, %w, %v1, %a1;
+    fma.rn.f32 %a2, %w, %v2, %a2;
+    fma.rn.f32 %a3, %w, %v3, %a3;
+
+    add.u32 %t, %t, 1;
+    bra KEY_LOOP;
+
+FINISH:
+    // Partial slot: ((row * nchunks + chunk) * nq + head).
+    mul.lo.u32 %pidx, %b_idx, %nchunks;
+    add.u32 %pidx, %pidx, %c;
+    mul.lo.u32 %pidx, %pidx, %nq;
+    add.u32 %pidx, %pidx, %head;
+
+    ld.param.u64 %base, [partial_stats];
+    cvt.u64.u32 %off, %pidx;
+    shl.b64 %off, %off, 3;
+    add.u64 %base, %base, %off;
+    setp.eq.u32 %p1, %lane, 0;
+    @!%p1 bra NO_STATS;
+    st.global.f32 [%base], %m;
+    st.global.f32 [%base+4], %s;
+NO_STATS:
+
+    ld.param.u64 %base, [partial_acc];
+    mul.lo.u32 %tmp, %pidx, %hd;
+    cvt.u64.u32 %off, %tmp;
+    shl.b64 %off, %off, 2;
+    add.u64 %base, %base, %off;
+    add.u64 %base, %base, %laneoff16;
+    st.global.v4.f32 [%base], {%a0, %a1, %a2, %a3};
+
+EXIT:
+    ret;
+}
+
+/// Split-K attention: pass 2 of 2.
+///
+/// One warp per (row, query head), 32 threads per block. Lane `l` owns dims
+/// `4l..4l+3`. Chunk partials are merged with the same online rescaling used
+/// while scanning keys, so the result is the exact softmax over the full key
+/// range intersected with the per-layer window.
+.visible .entry batched_gqa_attn_combine_fp16(
+    .param .u64 context_out,
+    .param .u64 partial_acc,
+    .param .u64 partial_stats,
+    .param .u32 num_q_heads,
+    .param .u32 head_dim,
+    .param .u32 batch_size,
+    .param .u32 nchunks
+) {
+    .reg .pred %p0, %p1;
+    .reg .b32 %tidv, %lane, %head, %b_idx, %nq, %hd, %nchunks, %c, %pidx, %tmp;
+    .reg .b64 %ctx_ptr, %acc_ptr, %st_ptr, %off, %addr, %laneoff8, %laneoff16;
+    .reg .f32 %a0, %a1, %a2, %a3, %m, %s, %mc, %sc, %w, %corr, %tmpf, %denom;
+    .reg .f32 %p0v, %p1v, %p2v, %p3v;
+    .reg .b16 %h0, %h1, %h2, %h3;
+
+    ld.param.u32 %nq, [num_q_heads];
+    ld.param.u32 %hd, [head_dim];
+    ld.param.u32 %nchunks, [nchunks];
+
+    mov.u32 %b_idx, %ctaid.y;
+    ld.param.u32 %tmp, [batch_size];
+    setp.ge.u32 %p0, %b_idx, %tmp;
+    @%p0 bra EXIT;
+
+    mov.u32 %head, %ctaid.x;
+    setp.ge.u32 %p0, %head, %nq;
+    @%p0 bra EXIT;
+
+    mov.u32 %tidv, %tid.x;
+    and.b32 %lane, %tidv, 31;
+    cvt.u64.u32 %laneoff8, %lane;
+    shl.b64 %laneoff8, %laneoff8, 3;
+    cvt.u64.u32 %laneoff16, %lane;
+    shl.b64 %laneoff16, %laneoff16, 4;
+
+    mov.f32 %m, -1.0e30;
+    mov.f32 %s, 0.0;
+    mov.f32 %a0, 0.0;
+    mov.f32 %a1, 0.0;
+    mov.f32 %a2, 0.0;
+    mov.f32 %a3, 0.0;
+    mov.u32 %c, 0;
+
+CHUNK_LOOP:
+    setp.ge.u32 %p0, %c, %nchunks;
+    @%p0 bra FINISH;
+
+    mul.lo.u32 %pidx, %b_idx, %nchunks;
+    add.u32 %pidx, %pidx, %c;
+    mul.lo.u32 %pidx, %pidx, %nq;
+    add.u32 %pidx, %pidx, %head;
+
+    ld.param.u64 %st_ptr, [partial_stats];
+    cvt.u64.u32 %off, %pidx;
+    shl.b64 %off, %off, 3;
+    add.u64 %addr, %st_ptr, %off;
+    ld.global.f32 %mc, [%addr];
+    ld.global.f32 %sc, [%addr+4];
+
+    // Fold this chunk's partial into the running (max, normaliser, acc).
+    setp.gt.f32 %p1, %mc, %m;
+    @!%p1 bra NO_RESCALE;
+    sub.f32 %tmpf, %m, %mc;
+    mul.f32 %tmpf, %tmpf, 1.44269504;
+    ex2.approx.ftz.f32 %corr, %tmpf;
+    mul.f32 %a0, %a0, %corr;
+    mul.f32 %a1, %a1, %corr;
+    mul.f32 %a2, %a2, %corr;
+    mul.f32 %a3, %a3, %corr;
+    mul.f32 %s, %s, %corr;
+    mov.f32 %m, %mc;
+NO_RESCALE:
+    sub.f32 %tmpf, %mc, %m;
+    mul.f32 %tmpf, %tmpf, 1.44269504;
+    ex2.approx.ftz.f32 %w, %tmpf;
+    // The partial accumulator is already normalised by its chunk's own
+    // normaliser, so it only takes the max correction; the denominator takes
+    // the correction times the chunk normaliser.
+    mul.f32 %tmpf, %w, %sc;
+    add.f32 %s, %s, %tmpf;
+
+    ld.param.u64 %acc_ptr, [partial_acc];
+    mul.lo.u32 %tmp, %pidx, %hd;
+    cvt.u64.u32 %off, %tmp;
+    shl.b64 %off, %off, 2;
+    add.u64 %addr, %acc_ptr, %off;
+    add.u64 %addr, %addr, %laneoff16;
+    ld.global.v4.f32 {%p0v, %p1v, %p2v, %p3v}, [%addr];
+    fma.rn.f32 %a0, %w, %p0v, %a0;
+    fma.rn.f32 %a1, %w, %p1v, %a1;
+    fma.rn.f32 %a2, %w, %p2v, %a2;
+    fma.rn.f32 %a3, %w, %p3v, %a3;
+
+    add.u32 %c, %c, 1;
+    bra CHUNK_LOOP;
+
+FINISH:
+    rcp.approx.ftz.f32 %denom, %s;
+    mul.f32 %a0, %a0, %denom;
+    mul.f32 %a1, %a1, %denom;
+    mul.f32 %a2, %a2, %denom;
+    mul.f32 %a3, %a3, %denom;
+
+    ld.param.u64 %ctx_ptr, [context_out];
+    mul.lo.u32 %tmp, %b_idx, %nq;
+    add.u32 %tmp, %tmp, %head;
+    mul.lo.u32 %tmp, %tmp, %hd;
+    cvt.u64.u32 %off, %tmp;
+    shl.b64 %off, %off, 1;
+    add.u64 %ctx_ptr, %ctx_ptr, %off;
+    add.u64 %addr, %ctx_ptr, %laneoff8;
+    cvt.rn.f16.f32 %h0, %a0;
+    cvt.rn.f16.f32 %h1, %a1;
+    cvt.rn.f16.f32 %h2, %a2;
+    cvt.rn.f16.f32 %h3, %a3;
+    st.global.v4.u16 [%addr], {%h0, %h1, %h2, %h3};
+
+EXIT:
+    ret;
+}
+"#;
