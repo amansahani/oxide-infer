@@ -10,7 +10,7 @@ use half::f16;
 use oxide_infer_core::{DeviceBuffer, GpuContext};
 use oxide_infer_kernels::batched_attn::{
     BATCHED_ARGMAX_DIRECT_PTX, BATCHED_CONV_PTR_PTX, BATCHED_EMBED_LOOKUP_PTX,
-    BATCHED_GQA_ATTENTION_PTX, BATCHED_KV_COPY_PTX, BATCHED_QK_RMSNORM_PTX, BATCHED_ROPE_PTX,
+    BATCHED_GQA_ATTENTION_ONLINE_PTX, BATCHED_KV_COPY_PTX, BATCHED_QK_RMSNORM_PTX, BATCHED_ROPE_PTX,
     BATCHED_SIGMOID_GATE_PTX, CONV_STATE_PREFILL_PTX,
 };
 use oxide_infer_kernels::PtxModule;
@@ -24,6 +24,10 @@ extern "C" {
     /// CUDA driver D2D copy, declared in server.rs too; duplicated here so
     /// the engine can persist/restore per-context hidden states.
     pub fn cuMemcpyDtoDAsync_v2(dst: u64, src: u64, byte_count: usize, stream: *mut c_void) -> i32;
+    /// Enqueue a host-to-device copy without synchronizing. Used only for
+    /// decode metadata, where the sampling tail synchronizes the stream
+    /// before this frame (and the host staging vectors) go out of scope.
+    fn cuMemcpyHtoDAsync_v2(dst: u64, src: u64, byte_count: usize, stream: *mut c_void) -> i32;
 }
 
 pub const HIDDEN: usize = 2048;
@@ -85,7 +89,7 @@ struct BatchScratch {
     v_ptrs: DeviceBuffer<u64>,
     conv_ptrs: DeviceBuffer<u64>,
     /// Per-layer slices of prefill conv-state rows. One slice per model layer
-    /// (only the conv layers are used), each with `max_batch` rows of
+    /// (only the conv layers are used), each with `rows` rows of
     /// `HIDDEN * 6` f16. Reused by every prefill wave.
     conv_pool: DeviceBuffer<f16>,
     pf_carry: DeviceBuffer<u64>,
@@ -95,7 +99,7 @@ struct BatchScratch {
 
 /// Token-batched prefill metadata for one wave.
 ///
-/// `carry_ptrs` uses the same `[layer * max_batch + row]` layout as the
+/// `carry_ptrs` uses the same `[layer * rows + row]` layout as the
 /// per-layer pointer tables and must hold each request's persistent conv
 /// state pointer for that layer. `origins[row]` is the wave row where the
 /// request's chunk begins (used to locate window tokens inside `bcx`) and
@@ -106,11 +110,18 @@ pub struct PrefillMeta {
     pub local_pos: Vec<u32>,
 }
 
-/// Batched transformer engine. All scratch buffers are allocated once for the
-/// maximum supported batch size.
+/// Batched transformer engine. All scratch buffers are allocated once.
+///
+/// `max_batch` bounds the decode/sampling batch (one row per sequence).
+/// `rows` bounds prefill waves, which pack prompt *tokens* rather than
+/// sequences; a wave of `rows` tokens re-streams each weight once while
+/// keeping the GEMMs compute-bound, so it is usually much larger than
+/// `max_batch`. Logits stay at decode size because prefill never runs the LM
+/// head.
 pub struct BatchEngine {
     scratch: BatchScratch,
     max_batch: usize,
+    rows: usize,
     lt: LtGemm,
     rms_norm: Function,
     residual_add: Function,
@@ -126,6 +137,24 @@ pub struct BatchEngine {
     conv_state_prefill: Function,
 }
 
+/// Enqueue an exact-length host-to-device copy on the compute stream without
+/// waiting. The staging slice must outlive the next stream synchronize.
+fn upload_async<T>(buf: &DeviceBuffer<T>, src: &[T], stream: &CuStream)
+where
+    T: cuda_core::DeviceCopy,
+{
+    debug_assert_eq!(buf.len(), src.len());
+    let rc = unsafe {
+        cuMemcpyHtoDAsync_v2(
+            buf.inner().cu_deviceptr(),
+            src.as_ptr() as u64,
+            std::mem::size_of_val(src),
+            stream.cu_stream() as *mut c_void,
+        )
+    };
+    debug_assert_eq!(rc, 0, "cuMemcpyHtoDAsync failed with {rc}");
+}
+
 fn fptr(buf: &DeviceBuffer<f16>) -> u64 {
     buf.inner().cu_deviceptr()
 }
@@ -135,8 +164,12 @@ fn fptr_mut(buf: &mut DeviceBuffer<f16>) -> u64 {
 }
 
 impl BatchEngine {
-    pub fn new(gpu: &GpuContext, max_batch: usize) -> Result<Self> {
-        let b = max_batch;
+    pub fn new(gpu: &GpuContext, max_batch: usize, prefill_rows: usize) -> Result<Self> {
+        let rows = prefill_rows.max(max_batch);
+        // Row-sized scratch. `logits`/`tokens_out` are only touched by the
+        // sampling tail (decode batch or `sample_only`), so they stay at
+        // `max_batch` and keep the 128k-vocab buffer from exploding.
+        let b = rows;
         let alloc_f16 = |n: usize| -> Result<DeviceBuffer<f16>> {
             DeviceBuffer::<f16>::zeroed(gpu, n).map_err(|e| anyhow!("alloc: {e}"))
         };
@@ -149,7 +182,7 @@ impl BatchEngine {
             .map_err(|e| anyhow!("rope PTX: {e}"))?;
         let kv_ptx = PtxModule::load_from_ptx(gpu, BATCHED_KV_COPY_PTX)
             .map_err(|e| anyhow!("kv_copy PTX: {e}"))?;
-        let gqa_ptx = PtxModule::load_from_ptx(gpu, BATCHED_GQA_ATTENTION_PTX)
+        let gqa_ptx = PtxModule::load_from_ptx(gpu, BATCHED_GQA_ATTENTION_ONLINE_PTX)
             .map_err(|e| anyhow!("gqa PTX: {e}"))?;
         let gate_ptx = PtxModule::load_from_ptx(gpu, BATCHED_SIGMOID_GATE_PTX)
             .map_err(|e| anyhow!("sigmoid gate PTX: {e}"))?;
@@ -177,9 +210,9 @@ impl BatchEngine {
             ffn_out: alloc_f16(b * HIDDEN)?,
             bcx: alloc_f16(b * 3 * HIDDEN)?,
             conv_y: alloc_f16(b * HIDDEN)?,
-            logits: alloc_f16(b * VOCAB)?,
+            logits: alloc_f16(max_batch * VOCAB)?,
             tokens_in: DeviceBuffer::<u32>::zeroed(gpu, b).map_err(|e| anyhow!("alloc: {e}"))?,
-            tokens_out: DeviceBuffer::<u32>::zeroed(gpu, b).map_err(|e| anyhow!("alloc: {e}"))?,
+            tokens_out: DeviceBuffer::<u32>::zeroed(gpu, max_batch).map_err(|e| anyhow!("alloc: {e}"))?,
             pos_ids: DeviceBuffer::<u32>::zeroed(gpu, b).map_err(|e| anyhow!("alloc: {e}"))?,
             seq_lens: DeviceBuffer::<u32>::zeroed(gpu, b).map_err(|e| anyhow!("alloc: {e}"))?,
             k_ptrs: DeviceBuffer::<u64>::zeroed(gpu, 24 * b).map_err(|e| anyhow!("alloc: {e}"))?,
@@ -195,6 +228,7 @@ impl BatchEngine {
         Ok(Self {
             scratch,
             max_batch,
+            rows,
             lt,
             rms_norm: norm_ptx.get_function("batched_rms_norm_vec8_fp16")?,
             residual_add: norm_ptx.get_function("batched_residual_add_fp16")?,
@@ -203,7 +237,7 @@ impl BatchEngine {
             qk_norm: attn_ptx.get_function("batched_qk_rmsnorm_fp16")?,
             rope: rope_ptx.get_function("batched_rope_fp16")?,
             kv_copy: kv_ptx.get_function("batched_kv_copy_fp16")?,
-            gqa: gqa_ptx.get_function("batched_gqa_attention_fp16")?,
+            gqa: gqa_ptx.get_function("batched_gqa_attention_online_fp16")?,
             sigmoid_gate: gate_ptx.get_function("batched_sigmoid_gate_fp16")?,
             embed: embed_ptx.get_function("batched_embed_lookup_fp16")?,
             argmax: argmax_ptx.get_function("batched_argmax_direct_f16")?,
@@ -215,11 +249,16 @@ impl BatchEngine {
         self.max_batch
     }
 
+    /// Maximum rows (prompt tokens) in one prefill wave.
+    pub fn prefill_rows(&self) -> usize {
+        self.rows
+    }
+
     /// Device pointer of a prefill conv-state row (decode-ready state of the
     /// chunk's last token). Only valid after `forward_step` with `prefill`.
     pub fn prefill_state_ptr(&self, layer: usize, row: usize) -> u64 {
         self.scratch.conv_pool.inner().cu_deviceptr()
-            + (((layer * self.max_batch + row) * HIDDEN * 6 * 2) as u64)
+            + (((layer * self.rows + row) * HIDDEN * 6 * 2) as u64)
     }
 
     /// Run one transformer step for `ctxs`.
@@ -275,31 +314,43 @@ impl BatchEngine {
         custom_embeddings: Option<&DeviceBuffer<f16>>,
     ) -> Result<Vec<u32>> {
         let b = ctxs.len();
-        if b == 0 || b > self.max_batch {
+        if b == 0 || b > self.rows {
             return Err(anyhow!("invalid batch size {b}"));
         }
         let b_u32 = b as u32;
         let stream = gpu.compute_stream();
 
-        // Device buffers are allocated for the maximum batch size; pad the
-        // tiny metadata arrays so the copy lengths always match.
-        let mb = self.max_batch;
-        let mut tokens_pad = vec![0u32; mb];
-        let mut pos_pad = vec![0u32; mb];
-        let mut seq_pad = vec![0u32; mb];
+        // Prefill waves address up to `rows` rows, so their metadata must be
+        // padded to the device buffer length (and `copy_from_slice`
+        // synchronizes, which is noise inside a multi-wave prefill). Decode
+        // only touches `b` rows and must stay synchronous-free: a stream
+        // synchronize per metadata array costs a round trip per token.
+        let mb = self.rows;
+        let async_meta = prefill.is_none() && sample;
+        let pad = if async_meta { b } else { mb };
+        let mut tokens_pad = vec![0u32; pad];
+        let mut pos_pad = vec![0u32; pad];
+        let mut seq_pad = vec![0u32; pad];
         tokens_pad[..b].copy_from_slice(tokens);
         pos_pad[..b].copy_from_slice(pos_ids);
         for i in 0..b {
             seq_pad[i] = pos_ids[i] + 1;
         }
-        self.scratch.tokens_in.copy_from_slice(gpu, &tokens_pad)?;
-        self.scratch.pos_ids.copy_from_slice(gpu, &pos_pad)?;
-        self.scratch.seq_lens.copy_from_slice(gpu, &seq_pad)?;
+        if async_meta {
+            upload_async(&self.scratch.tokens_in, &tokens_pad, stream);
+            upload_async(&self.scratch.pos_ids, &pos_pad, stream);
+            upload_async(&self.scratch.seq_lens, &seq_pad, stream);
+        } else {
+            self.scratch.tokens_in.copy_from_slice(gpu, &tokens_pad)?;
+            self.scratch.pos_ids.copy_from_slice(gpu, &pos_pad)?;
+            self.scratch.seq_lens.copy_from_slice(gpu, &seq_pad)?;
+        }
 
         // Build all per-layer pointer tables in one shot (uploaded once per step).
-        let mut k_host = vec![0u64; 24 * mb];
-        let mut v_host = vec![0u64; 24 * mb];
-        let mut conv_host = vec![0u64; 24 * mb];
+        let tbl = if async_meta { 24 * b } else { 24 * mb };
+        let mut k_host = vec![0u64; tbl];
+        let mut v_host = vec![0u64; tbl];
+        let mut conv_host = vec![0u64; tbl];
         for l in 0..layers.len() {
             if is_conv[l] {
                 for (i, ctx) in ctxs.iter().enumerate() {
@@ -318,9 +369,15 @@ impl BatchEngine {
                 }
             }
         }
-        self.scratch.k_ptrs.copy_from_slice(gpu, &k_host)?;
-        self.scratch.v_ptrs.copy_from_slice(gpu, &v_host)?;
-        self.scratch.conv_ptrs.copy_from_slice(gpu, &conv_host)?;
+        if async_meta {
+            upload_async(&self.scratch.k_ptrs, &k_host, stream);
+            upload_async(&self.scratch.v_ptrs, &v_host, stream);
+            upload_async(&self.scratch.conv_ptrs, &conv_host, stream);
+        } else {
+            self.scratch.k_ptrs.copy_from_slice(gpu, &k_host)?;
+            self.scratch.v_ptrs.copy_from_slice(gpu, &v_host)?;
+            self.scratch.conv_ptrs.copy_from_slice(gpu, &conv_host)?;
+        }
         if let Some(pf) = prefill {
             let mut carry_pad = vec![0u64; 24 * mb];
             let mut origin_pad = vec![0u32; mb];
@@ -554,9 +611,11 @@ impl BatchEngine {
                     launch_kernel_on_stream(&self.kv_copy, (b_u32, 1, 1), (64, 1, 1), 0, stream, &mut args_vc)?;
                 }
 
-                // GQA attention.
+                // GQA attention. Sliding layers carry their 256-token window
+                // in the rope table; full layers pass 0 (unmasked).
                 let mut d_sl = self.scratch.seq_lens.inner_mut().cu_deviceptr();
-                let mut args_gqa: [*mut c_void; 9] = [
+                let mut window_u32 = rope.window;
+                let mut args_gqa: [*mut c_void; 10] = [
                     &mut d_ctx as *mut _ as *mut c_void,
                     &mut d_q as *mut _ as *mut c_void,
                     &mut d_kp as *mut _ as *mut c_void,
@@ -566,9 +625,13 @@ impl BatchEngine {
                     &mut nkv as *mut _ as *mut c_void,
                     &mut hd as *mut _ as *mut c_void,
                     &mut b_arg as *mut _ as *mut c_void,
+                    &mut window_u32 as *mut _ as *mut c_void,
                 ];
                 unsafe {
-                    launch_kernel_on_stream(&self.gqa, (nq, b_u32, 1), (hd, 1, 1), 0, stream, &mut args_gqa)?;
+                    // One block per (KV head, row); its four warps cover the
+                    // four query heads that share that KV head.
+                    let nkv = NUM_KV_HEADS as u32;
+                    launch_kernel_on_stream(&self.gqa, (nkv, b_u32, 1), (hd, 1, 1), 0, stream, &mut args_gqa)?;
                 }
 
                 // Sigmoid gating.

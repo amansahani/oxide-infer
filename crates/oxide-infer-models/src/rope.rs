@@ -103,6 +103,10 @@ pub struct RotaryEmbeddingTable {
     pub ptx: PtxModule,
     pub max_seq_len: usize,
     pub head_dim: usize,
+    /// Sliding-attention window in tokens, or `0` for full attention.
+    /// LFM3 mixes both layer types; consumers pass this to the attention
+    /// kernel so the two kinds of layer see the reference mask.
+    pub window: u32,
 }
 
 impl RotaryEmbeddingTable {
@@ -112,6 +116,7 @@ impl RotaryEmbeddingTable {
         head_dim: usize,
         rope_theta: f32,
         partial_rotary_factor: f32,
+        window: u32,
     ) -> Result<Self> {
         let rope_angles = (partial_rotary_factor * head_dim as f32) as usize / 2;
         let mut inv_freq = vec![0.0f32; head_dim / 2];
@@ -146,6 +151,7 @@ impl RotaryEmbeddingTable {
             ptx,
             max_seq_len,
             head_dim,
+            window,
         })
     }
 

@@ -1176,7 +1176,20 @@ impl FullLfm3DecoderLayer {
             )?;
             let theta = if is_sliding { 10000.0 } else { 1000000.0 };
             let partial_factor = if is_sliding { 1.0 } else { 0.5 };
-            let rope_table = RotaryEmbeddingTable::new(gpu, 131072, 128, theta, partial_factor)?;
+            // LFM3 mixes full and sliding layers: the sliding ones use a
+            // 256-token window (config `sliding_window`), so the kernel must
+            // mask keys whose distance reaches the window. `OXIDE_SWA`
+            // overrides the window for A/B experiments (0 = full attention).
+            let window = if is_sliding {
+                std::env::var("OXIDE_SWA")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(256)
+            } else {
+                0
+            };
+            let rope_table =
+                RotaryEmbeddingTable::new(gpu, 131072, 128, theta, partial_factor, window)?;
             let gqa_engine = GqaAttentionEngine::new(gpu)?;
             // Cache for up to 131072 tokens: 4 kv heads * 128 head_dim = 512 elements per token
             let kc = DeviceBuffer::<half::f16>::zeroed(gpu, 4096 * 512)?;

@@ -127,6 +127,21 @@ struct ServerState {
 }
 
 const MAX_BATCH_SIZE: usize = 128;
+/// Longest sequence (prompt + generated tokens) the attention kernel can
+/// score. Its score tile is sized for this many keys, so a request that could
+/// exceed it is rejected with an error instead of overrunning the tile.
+const MAX_SEQ_TOKENS: usize = 8192;
+/// Rows (prompt tokens) per prefill wave. Packing tokens rather than
+/// sequences keeps the per-wave GEMMs compute-bound and lets a wave amortise
+/// one weight stream across many short prompts. Override with
+/// OXIDE_PREFILL_ROWS; defaults to 4x the decode batch.
+fn prefill_rows() -> usize {
+    std::env::var("OXIDE_PREFILL_ROWS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4 * MAX_BATCH_SIZE)
+        .max(MAX_BATCH_SIZE)
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -590,7 +605,7 @@ FINISH:
         let mut batch_engine = if scalar_batch {
             None
         } else {
-            Some(BatchEngine::new(&gpu_clone, MAX_BATCH_SIZE).expect("batched engine init"))
+            Some(BatchEngine::new(&gpu_clone, MAX_BATCH_SIZE, prefill_rows()).expect("batched engine init"))
         };
         let is_conv: Vec<bool> = layer_types.iter().map(|t| *t == "conv").collect();
 
@@ -710,6 +725,22 @@ FINISH:
                         let cur_token = *token_ids.last().unwrap();
                         let max_gen = req.max_tokens;
                         let need_tokens = prompt_len + max_gen + 64;
+
+                        if need_tokens > MAX_SEQ_TOKENS {
+                            eprintln!(
+                                "[ctx] rejected: prompt {} + max_tokens {} exceeds {MAX_SEQ_TOKENS}",
+                                prompt_len, max_gen
+                            );
+                            let _ = req.response_tx.send((
+                                format!(
+                                    "[error] request needs {} tokens, limit is {MAX_SEQ_TOKENS}",
+                                    need_tokens
+                                ),
+                                prompt_len,
+                                0,
+                            ));
+                            continue;
+                        }
 
                         if debug_top {
                             let ids: Vec<u32> = token_ids.iter().cloned().collect();
@@ -873,6 +904,22 @@ FINISH:
                         let max_gen = req.max_tokens;
                         let need_tokens = prompt_len + max_gen + 64;
 
+                        if need_tokens > MAX_SEQ_TOKENS {
+                            eprintln!(
+                                "[ctx] rejected: prompt {} + max_tokens {} exceeds {MAX_SEQ_TOKENS}",
+                                prompt_len, max_gen
+                            );
+                            let _ = req.response_tx.send((
+                                format!(
+                                    "[error] request needs {} tokens, limit is {MAX_SEQ_TOKENS}",
+                                    need_tokens
+                                ),
+                                prompt_len,
+                                0,
+                            ));
+                            continue;
+                        }
+
                         if debug_top {
                             let ids: Vec<u32> = token_ids.iter().cloned().collect();
                             eprintln!("[tok] n={} ids={:?} (kv_tokens={})", prompt_len, ids, need_tokens);
@@ -966,7 +1013,7 @@ FINISH:
                     // into contiguous chunks; the request's persistent conv
                     // state carries the 6-token window across chunk bounds.
                     new_contexts.sort_by_key(|(_, t, _)| t.len());
-                    let mb = engine.max_batch();
+                    let mb = engine.prefill_rows();
                     // (request index, chunk start) in execution order.
                     let mut chunks: Vec<(usize, usize)> = Vec::new();
                     for (ri, (_, t, _)) in new_contexts.iter().enumerate() {

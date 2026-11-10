@@ -4,7 +4,7 @@ use oxide_infer_models::RotaryEmbeddingTable;
 fn main() -> anyhow::Result<()> {
     let gpu = GpuContext::init(0)?;
     let stream = gpu.compute_stream();
-    let rope = RotaryEmbeddingTable::new(&gpu, 1024, 128, 1000000.0, 0.5)?;
+    let rope = RotaryEmbeddingTable::new(&gpu, 1024, 128, 1000000.0, 0.5, 0)?;
 
     let cos_host = rope.cos_table.inner().to_host_vec(stream)?;
     let sin_host = rope.sin_table.inner().to_host_vec(stream)?;

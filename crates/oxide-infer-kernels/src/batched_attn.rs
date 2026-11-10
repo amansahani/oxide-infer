@@ -304,10 +304,12 @@ pub const BATCHED_GQA_ATTENTION_PTX: &str = r#"
     .param .u32 num_q_heads,
     .param .u32 num_kv_heads,
     .param .u32 head_dim,
-    .param .u32 batch_size
+    .param .u32 batch_size,
+    .param .u32 window
 ) {
     .reg .pred %p0, %p1;
     .reg .b32 %head_idx, %dim_idx, %t_idx, %slen, %nq, %nkv, %hd, %b_idx, %b_size, %kv_head_idx, %hstride, %kv_idx_32, %tid_val, %tmp32;
+    .reg .b32 %window, %t_start, %cnt, %s_idx;
     .reg .b32 %s_offset2, %s_addrr, %lane_id_r, %warp_id_r, %wctr, %nw;
     .reg .b32 %s_offset, %s_addr;
     .reg .b64 %ctx_ptr, %q_ptr, %k_ptr, %v_ptr, %offset, %q_offset, %batch_offset, %k_tbl, %v_tbl, %sl_tbl;
@@ -358,6 +360,19 @@ pub const BATCHED_GQA_ATTENTION_PTX: &str = r#"
     add.u64 %offset, %sl_tbl, %offset;
     ld.global.u32 %slen, [%offset];
 
+    // Sliding-window mask: layer `window` (0 = full attention) keeps only the
+    // newest `window` keys, i.e. key `k` is masked when `p - k >= window`.
+    // The query is at `slen - 1`, so start the scan at `slen - window`.
+    ld.param.u32 %window, [window];
+    mov.u32 %t_start, 0;
+    setp.eq.u32 %p1, %window, 0;
+    @%p1 bra SWA_DONE;
+    setp.le.u32 %p1, %slen, %window;
+    @%p1 bra SWA_DONE;
+    sub.u32 %t_start, %slen, %window;
+SWA_DONE:
+    sub.u32 %cnt, %slen, %t_start;
+
     mov.f32 %fscale, 0.0883883476;
 
     .shared .f32 s_scores[8192];
@@ -365,7 +380,7 @@ pub const BATCHED_GQA_ATTENTION_PTX: &str = r#"
     .shared .f32 s_max;
     .shared .f32 s_denom;
 
-    mov.u32 %t_idx, 0;
+    mov.u32 %t_idx, %t_start;
 TOKEN_LOOP:
     setp.ge.u32 %p0, %t_idx, %slen;
     @%p0 bra COMPUTE_SOFTMAX;
@@ -441,7 +456,8 @@ WB_LOOP:
     bra WB_LOOP;
 W_HAVE:
     mul.f32 %fscore, %fdot, %fscale;
-    shl.b32 %s_offset, %t_idx, 2;
+    sub.u32 %s_idx, %t_idx, %t_start;
+    shl.b32 %s_offset, %s_idx, 2;
     mov.u32 %s_addr, s_scores;
     add.u32 %s_addr, %s_addr, %s_offset;
     st.shared.f32 [%s_addr], %fscore;
@@ -460,29 +476,29 @@ COMPUTE_SOFTMAX:
 
     mov.u32 %s_addr, s_scores;
     ld.shared.f32 %fmax, [%s_addr];
-    mov.u32 %t_idx, 1;
+    mov.u32 %s_idx, 1;
 MAX_LOOP:
-    setp.ge.u32 %p1, %t_idx, %slen;
+    setp.ge.u32 %p1, %s_idx, %cnt;
     @%p1 bra CALC_EXP_SUM;
 
-    shl.b32 %s_offset, %t_idx, 2;
+    shl.b32 %s_offset, %s_idx, 2;
     mov.u32 %s_addr, s_scores;
     add.u32 %s_addr, %s_addr, %s_offset;
     ld.shared.f32 %fscore, [%s_addr];
     max.f32 %fmax, %fmax, %fscore;
-    add.u32 %t_idx, %t_idx, 1;
+    add.u32 %s_idx, %s_idx, 1;
     bra MAX_LOOP;
 
 CALC_EXP_SUM:
     mov.u32 %s_addr, s_max;
     st.shared.f32 [%s_addr], %fmax;
     mov.f32 %fsum, 0.0;
-    mov.u32 %t_idx, 0;
+    mov.u32 %s_idx, 0;
 EXP_LOOP:
-    setp.ge.u32 %p1, %t_idx, %slen;
+    setp.ge.u32 %p1, %s_idx, %cnt;
     @%p1 bra NORM_SOFTMAX;
 
-    shl.b32 %s_offset, %t_idx, 2;
+    shl.b32 %s_offset, %s_idx, 2;
     mov.u32 %s_addr, s_scores;
     add.u32 %s_addr, %s_addr, %s_offset;
     ld.shared.f32 %fscore, [%s_addr];
@@ -492,7 +508,7 @@ EXP_LOOP:
     st.shared.f32 [%s_addr], %fweight;
     add.f32 %fsum, %fsum, %fweight;
 
-    add.u32 %t_idx, %t_idx, 1;
+    add.u32 %s_idx, %s_idx, 1;
     bra EXP_LOOP;
 
 NORM_SOFTMAX:
@@ -512,17 +528,18 @@ V_DIM_LOOP:
     mov.u32 %s_addr, s_denom;
     ld.shared.f32 %fsum, [%s_addr];
 
-    mov.u32 %t_idx, 0;
+    mov.u32 %s_idx, 0;
 V_TOK_LOOP:
-    setp.ge.u32 %p1, %t_idx, %slen;
+    setp.ge.u32 %p1, %s_idx, %cnt;
     @%p1 bra WRITE_CTX;
 
-    shl.b32 %s_offset, %t_idx, 2;
+    shl.b32 %s_offset, %s_idx, 2;
     mov.u32 %s_addr, s_scores;
     add.u32 %s_addr, %s_addr, %s_offset;
     ld.shared.f32 %fweight, [%s_addr];
     mul.f32 %fweight, %fweight, %fsum;
 
+    add.u32 %t_idx, %s_idx, %t_start;
     mul.lo.u32 %kv_idx_32, %t_idx, %nkv;
     add.u32 %kv_idx_32, %kv_idx_32, %kv_head_idx;
     mul.lo.u32 %kv_idx_32, %kv_idx_32, %hd;
@@ -535,7 +552,7 @@ V_TOK_LOOP:
     cvt.f32.f16 %fv, %hv;
     fma.rn.f32 %faccum, %fweight, %fv, %faccum;
 
-    add.u32 %t_idx, %t_idx, 1;
+    add.u32 %s_idx, %s_idx, 1;
     bra V_TOK_LOOP;
 
 WRITE_CTX:
@@ -1154,6 +1171,200 @@ STORE:
     bra LOOP_K;
 
 DONE:
+EXIT:
+    ret;
+}
+"#;
+
+/// Tiled online-softmax GQA kernel.
+///
+/// One warp per query head, four query heads per block (one per KV head).
+/// Lane `l` owns head dims `4l .. 4l+3`, so K/V/Q are touched with a single
+/// coalesced 8-byte `v4.u16` transaction per lane and the softmax normaliser
+/// stays in registers: no shared score tile, no barrier inside the key loop.
+/// Head dim is fixed at 128 and `num_q_heads == 4 * num_kv_heads` (LFM3).
+///
+/// `window` > 0 keeps only the newest `window` keys (`p_key - p_query >=
+/// window` is masked), matching llama.cpp's `LLAMA_SWA_TYPE_STANDARD`.
+pub const BATCHED_GQA_ATTENTION_ONLINE_PTX: &str = r#"
+.version 7.5
+.target sm_80
+.address_size 64
+
+.visible .entry batched_gqa_attention_online_fp16(
+    .param .u64 context_out,
+    .param .u64 q_in,
+    .param .u64 k_ptrs,
+    .param .u64 v_ptrs,
+    .param .u64 seq_lens,
+    .param .u32 num_q_heads,
+    .param .u32 num_kv_heads,
+    .param .u32 head_dim,
+    .param .u32 batch_size,
+    .param .u32 window
+) {
+    .reg .pred %p0, %p1, %p2;
+    .reg .b32 %tidv, %lane, %warp, %head, %kvh, %b_idx, %slen, %nq, %nkv, %hd, %t, %t_start, %window, %kvbase, %tmp;
+    .reg .b64 %q_ptr, %ctx_ptr, %k_ptr, %v_ptr, %k_tbl, %v_tbl, %sl_tbl, %off, %addr, %laneoff;
+    .reg .f32 %q0, %q1, %q2, %q3, %a0, %a1, %a2, %a3, %m, %s, %dot, %sc, %w, %corr, %tmpf, %sh;
+    .reg .f32 %k0, %k1, %k2, %k3, %v0, %v1, %v2, %v3;
+    .reg .b16 %h0, %h1, %h2, %h3, %g0, %g1, %g2, %g3;
+
+    ld.param.u32 %nq, [num_q_heads];
+    ld.param.u32 %nkv, [num_kv_heads];
+    ld.param.u32 %hd, [head_dim];
+
+    mov.u32 %b_idx, %ctaid.y;
+    ld.param.u32 %tmp, [batch_size];
+    setp.ge.u32 %p0, %b_idx, %tmp;
+    @%p0 bra EXIT;
+
+    mov.u32 %kvh, %ctaid.x;
+    setp.ge.u32 %p0, %kvh, %nkv;
+    @%p0 bra EXIT;
+
+    mov.u32 %tidv, %tid.x;
+    shr.u32 %warp, %tidv, 5;
+    and.b32 %lane, %tidv, 31;
+    // Four query heads share each KV head: head = kv_head * 4 + warp.
+    shl.b32 %head, %kvh, 2;
+    add.u32 %head, %head, %warp;
+
+    cvt.u64.u32 %laneoff, %lane;
+    shl.b64 %laneoff, %laneoff, 3;      // 4 halves per lane
+
+    ld.param.u64 %q_ptr, [q_in];
+    ld.param.u64 %ctx_ptr, [context_out];
+
+    mul.lo.u32 %tmp, %b_idx, %nq;
+    add.u32 %tmp, %tmp, %head;
+    mul.lo.u32 %tmp, %tmp, %hd;
+    cvt.u64.u32 %off, %tmp;
+    shl.b64 %off, %off, 1;
+    add.u64 %q_ptr, %q_ptr, %off;
+    add.u64 %ctx_ptr, %ctx_ptr, %off;
+    add.u64 %addr, %q_ptr, %laneoff;
+    ld.global.v4.u16 {%h0, %h1, %h2, %h3}, [%addr];
+    cvt.f32.f16 %q0, %h0;
+    cvt.f32.f16 %q1, %h1;
+    cvt.f32.f16 %q2, %h2;
+    cvt.f32.f16 %q3, %h3;
+
+    ld.param.u64 %k_tbl, [k_ptrs];
+    ld.param.u64 %v_tbl, [v_ptrs];
+    mul.wide.u32 %off, %b_idx, 8;
+    add.u64 %off, %k_tbl, %off;
+    ld.global.u64 %k_ptr, [%off];
+    mul.wide.u32 %off, %b_idx, 8;
+    add.u64 %off, %v_tbl, %off;
+    ld.global.u64 %v_ptr, [%off];
+
+    ld.param.u64 %sl_tbl, [seq_lens];
+    mul.wide.u32 %off, %b_idx, 4;
+    add.u64 %off, %sl_tbl, %off;
+    ld.global.u32 %slen, [%off];
+
+    ld.param.u32 %window, [window];
+    mov.u32 %t_start, 0;
+    setp.eq.u32 %p1, %window, 0;
+    @%p1 bra W_DONE;
+    setp.le.u32 %p1, %slen, %window;
+    @%p1 bra W_DONE;
+    sub.u32 %t_start, %slen, %window;
+W_DONE:
+
+    mov.f32 %m, -1.0e30;
+    mov.f32 %s, 0.0;
+    mov.f32 %a0, 0.0;
+    mov.f32 %a1, 0.0;
+    mov.f32 %a2, 0.0;
+    mov.f32 %a3, 0.0;
+    mov.u32 %t, %t_start;
+
+KEY_LOOP:
+    setp.ge.u32 %p0, %t, %slen;
+    @%p0 bra FINISH;
+
+    mul.lo.u32 %kvbase, %t, %nkv;
+    add.u32 %kvbase, %kvbase, %kvh;
+    mul.lo.u32 %kvbase, %kvbase, %hd;
+    cvt.u64.u32 %off, %kvbase;
+    shl.b64 %off, %off, 1;
+    add.u64 %off, %off, %laneoff;
+
+    // K and V loads are independent, so both are in flight together.
+    add.u64 %addr, %k_ptr, %off;
+    ld.global.v4.u16 {%h0, %h1, %h2, %h3}, [%addr];
+    add.u64 %addr, %v_ptr, %off;
+    ld.global.v4.u16 {%g0, %g1, %g2, %g3}, [%addr];
+
+    cvt.f32.f16 %k0, %h0;
+    cvt.f32.f16 %k1, %h1;
+    cvt.f32.f16 %k2, %h2;
+    cvt.f32.f16 %k3, %h3;
+
+    mul.f32 %dot, %q0, %k0;
+    fma.rn.f32 %dot, %q1, %k1, %dot;
+    fma.rn.f32 %dot, %q2, %k2, %dot;
+    fma.rn.f32 %dot, %q3, %k3, %dot;
+    shfl.sync.down.b32 %sh, %dot, 16, 31, 0xffffffff;
+    add.f32 %dot, %dot, %sh;
+    shfl.sync.down.b32 %sh, %dot, 8, 31, 0xffffffff;
+    add.f32 %dot, %dot, %sh;
+    shfl.sync.down.b32 %sh, %dot, 4, 31, 0xffffffff;
+    add.f32 %dot, %dot, %sh;
+    shfl.sync.down.b32 %sh, %dot, 2, 31, 0xffffffff;
+    add.f32 %dot, %dot, %sh;
+    shfl.sync.down.b32 %sh, %dot, 1, 31, 0xffffffff;
+    add.f32 %dot, %dot, %sh;
+    shfl.sync.idx.b32 %dot, %dot, 0, 31, 0xffffffff;
+    mul.f32 %sc, %dot, 0.0883883476;
+
+    // Online softmax. The rescale branch is warp-uniform because %sc is
+    // broadcast, and it is taken only when the running max grows.
+    setp.gt.f32 %p2, %sc, %m;
+    @!%p2 bra NO_RESCALE;
+    sub.f32 %tmpf, %m, %sc;
+    mul.f32 %tmpf, %tmpf, 1.44269504;
+    ex2.approx.ftz.f32 %corr, %tmpf;
+    mul.f32 %a0, %a0, %corr;
+    mul.f32 %a1, %a1, %corr;
+    mul.f32 %a2, %a2, %corr;
+    mul.f32 %a3, %a3, %corr;
+    mul.f32 %s, %s, %corr;
+    mov.f32 %m, %sc;
+NO_RESCALE:
+    sub.f32 %tmpf, %sc, %m;
+    mul.f32 %tmpf, %tmpf, 1.44269504;
+    ex2.approx.ftz.f32 %w, %tmpf;
+    add.f32 %s, %s, %w;
+
+    cvt.f32.f16 %v0, %g0;
+    cvt.f32.f16 %v1, %g1;
+    cvt.f32.f16 %v2, %g2;
+    cvt.f32.f16 %v3, %g3;
+    fma.rn.f32 %a0, %w, %v0, %a0;
+    fma.rn.f32 %a1, %w, %v1, %a1;
+    fma.rn.f32 %a2, %w, %v2, %a2;
+    fma.rn.f32 %a3, %w, %v3, %a3;
+
+    add.u32 %t, %t, 1;
+    bra KEY_LOOP;
+
+FINISH:
+    rcp.approx.ftz.f32 %tmpf, %s;
+    mul.f32 %a0, %a0, %tmpf;
+    mul.f32 %a1, %a1, %tmpf;
+    mul.f32 %a2, %a2, %tmpf;
+    mul.f32 %a3, %a3, %tmpf;
+
+    add.u64 %addr, %ctx_ptr, %laneoff;
+    cvt.rn.f16.f32 %h0, %a0;
+    cvt.rn.f16.f32 %h1, %a1;
+    cvt.rn.f16.f32 %h2, %a2;
+    cvt.rn.f16.f32 %h3, %a3;
+    st.global.v4.u16 [%addr], {%h0, %h1, %h2, %h3};
+
 EXIT:
     ret;
 }

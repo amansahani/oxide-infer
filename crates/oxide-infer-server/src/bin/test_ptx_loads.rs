@@ -5,7 +5,7 @@ use oxide_infer_models::{RotaryEmbeddingTable, GqaAttentionEngine};
 fn main() -> anyhow::Result<()> {
     let gpu = GpuContext::init(0)?;
     println!("Testing RotaryEmbeddingTable PTX load...");
-    let _ = RotaryEmbeddingTable::new(&gpu, 1024, 128, 1000000.0, 0.5)?;
+    let _ = RotaryEmbeddingTable::new(&gpu, 1024, 128, 1000000.0, 0.5, 0)?;
     println!("RotaryEmbeddingTable loaded successfully!");
 
     println!("Testing GqaAttentionEngine PTX load...");
