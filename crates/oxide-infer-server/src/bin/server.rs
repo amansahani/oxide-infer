@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use oxide_infer_core::{GpuContext, SafeTensorsLoader, DeviceBuffer, VisionPreprocessor};
 use oxide_infer_server::tokenizer::OxideTokenizer;
 use oxide_infer_models::{EmbeddingTable, FullLfm3DecoderLayer, TiedLmHead, VisionTower, LayerType, RESIDUAL_ADD_PTX};
-use oxide_infer_server::batch_engine::{BatchEngine, BatchSequence, PrefillMeta};
+use oxide_infer_server::batch_engine::{BatchEngine, BatchSequence, PrefillMeta, KV_DIM};
+use oxide_infer_server::kv_pool::{KvLayout, KvPool, Lease};
 use oxide_infer_kernels::norm::RMS_NORM_FP16_PTX;
 use oxide_infer_kernels::PtxModule;
 use cuda_core::launch_kernel_on_stream;
@@ -203,33 +204,26 @@ async fn main() -> anyhow::Result<()> {
         gate_out: DeviceBuffer<half::f16>,
         d_normed_final: DeviceBuffer<half::f16>,
         d_tok: DeviceBuffer<u32>,
-        // Per-request isolated state buffers: 24 layers of KV or Conv state
+        // Scalar reference path buffers; empty in the batched path.
         layer_k_caches: Vec<Option<DeviceBuffer<half::f16>>>,
         layer_v_caches: Vec<Option<DeviceBuffer<half::f16>>>,
         layer_conv_states: Vec<Option<DeviceBuffer<half::f16>>>,
+        // Shared pre-allocated KV/conv slab lease (see kv_pool.rs).
+        layout: Arc<KvLayout>,
+        kv_off: usize,
+        kv_len: usize,
+        kv_slot: usize,
     }
 
     impl BatchSequence for ActiveContext {
         fn k_cache_ptr(&self, layer: usize) -> u64 {
-            self.layer_k_caches[layer]
-                .as_ref()
-                .expect("missing k cache")
-                .inner()
-                .cu_deviceptr()
+            self.layout.k_cache_ptr(layer, self.kv_off)
         }
         fn v_cache_ptr(&self, layer: usize) -> u64 {
-            self.layer_v_caches[layer]
-                .as_ref()
-                .expect("missing v cache")
-                .inner()
-                .cu_deviceptr()
+            self.layout.v_cache_ptr(layer, self.kv_off)
         }
         fn conv_state_ptr(&self, layer: usize) -> u64 {
-            self.layer_conv_states[layer]
-                .as_ref()
-                .expect("missing conv state")
-                .inner()
-                .cu_deviceptr()
+            self.layout.conv_state_ptr(layer, self.kv_slot)
         }
         fn hidden_ptr(&self) -> u64 {
             self.d_hidden.inner().cu_deviceptr()
@@ -600,6 +594,25 @@ FINISH:
         };
         let is_conv: Vec<bool> = layer_types.iter().map(|t| *t == "conv").collect();
 
+        // Pre-allocated KV + conv-state slabs (see kv_pool.rs). The default
+        // 3 GiB supports one ~143k-token sequence or many short ones; tune
+        // with OXIDE_KV_POOL_MB.
+        let pool_mb: usize = std::env::var("OXIDE_KV_POOL_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3072);
+        let n_attn = is_conv.iter().filter(|c| !**c).count();
+        let pool_tokens = (pool_mb * 1024 * 1024) / (n_attn * 2 * KV_DIM * 2);
+        let mut kv_pool = KvPool::new(&gpu_clone, &is_conv, MAX_BATCH_SIZE, pool_tokens)
+            .expect("kv pool init");
+        println!(
+            "[pool] KV slab {} MiB / {} tokens across {} attention layers, {} conv slots",
+            (kv_pool.capacity_tokens() * n_attn * 2 * KV_DIM * 2) / (1024 * 1024),
+            kv_pool.capacity_tokens(),
+            n_attn,
+            MAX_BATCH_SIZE
+        );
+
         let mut active_contexts: Vec<ActiveContext> = Vec::with_capacity(MAX_BATCH_SIZE);
         let mut epsilon: f32 = 1e-5;
         let mut h_size: u32 = 2048;
@@ -696,29 +709,54 @@ FINISH:
                         let prompt_len = token_ids.len();
                         let cur_token = *token_ids.last().unwrap();
                         let max_gen = req.max_tokens;
-                        let target_seq_len = prompt_len + max_gen + 64; // dynamic capacity with safety margin
-                        let kv_elements = target_seq_len * 512; // 4 kv heads * 128 head_dim
+                        let need_tokens = prompt_len + max_gen + 64;
 
                         if debug_top {
                             let ids: Vec<u32> = token_ids.iter().cloned().collect();
-                            eprintln!("[tok] n={} ids={:?} (kv_capacity={})", prompt_len, ids, target_seq_len);
+                            eprintln!("[tok] n={} ids={:?} (kv_tokens={})", prompt_len, ids, need_tokens);
                         }
 
-                        let mut k_caches = Vec::with_capacity(24);
-                        let mut v_caches = Vec::with_capacity(24);
-                        let mut conv_states = Vec::with_capacity(24);
-                        for idx in 0..24 {
-                            if layer_types[idx] == "conv" {
-                                k_caches.push(None);
-                                v_caches.push(None);
-                                conv_states.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, 2048 * 7).expect("alloc")));
-                            } else {
-                                // Dynamic tokens capacity per request
-                                k_caches.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, kv_elements).expect("alloc")));
-                                v_caches.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, kv_elements).expect("alloc")));
-                                conv_states.push(None);
+                        let lease = match kv_pool.acquire(&gpu_clone, need_tokens) {
+                            Some(lease) => lease,
+                            None => {
+                                eprintln!(
+                                    "[pool] exhausted: need {} tokens, {} free of {} ({} active)",
+                                    need_tokens,
+                                    kv_pool.free_tokens(),
+                                    kv_pool.capacity_tokens(),
+                                    active_contexts.len()
+                                );
+                                let _ = req.response_tx.send((
+                                    "[error] kv cache pool exhausted".to_string(),
+                                    prompt_len,
+                                    0,
+                                ));
+                                continue;
                             }
-                        }
+                        };
+
+                        // The scalar reference path still owns per-request
+                        // buffers; the batched path addresses the shared slabs.
+                        let (k_caches, v_caches, conv_states) = if scalar_batch {
+                            let kv_elements = need_tokens * 512;
+                            let mut k_caches = Vec::with_capacity(24);
+                            let mut v_caches = Vec::with_capacity(24);
+                            let mut conv_states = Vec::with_capacity(24);
+                            for idx in 0..24 {
+                                if layer_types[idx] == "conv" {
+                                    k_caches.push(None);
+                                    v_caches.push(None);
+                                    conv_states.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, 2048 * 7).expect("alloc")));
+                                } else {
+                                    k_caches.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, kv_elements).expect("alloc")));
+                                    v_caches.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, kv_elements).expect("alloc")));
+                                    conv_states.push(None);
+                                }
+                            }
+                            (k_caches, v_caches, conv_states)
+                        } else {
+                            (Vec::new(), Vec::new(), Vec::new())
+                        };
 
                         let ctx = ActiveContext {
                             req,
@@ -739,6 +777,10 @@ FINISH:
                             layer_k_caches: k_caches,
                             layer_v_caches: v_caches,
                             layer_conv_states: conv_states,
+                            layout: kv_pool.layout(),
+                            kv_off: lease.tok_off,
+                            kv_len: lease.tokens,
+                            kv_slot: lease.slot,
                         };
                         new_contexts.push((ctx, token_ids, custom_embeds));
                     }
@@ -829,29 +871,54 @@ FINISH:
                         let prompt_len = token_ids.len();
                         let cur_token = *token_ids.last().unwrap();
                         let max_gen = req.max_tokens;
-                        let target_seq_len = prompt_len + max_gen + 64; // dynamic capacity with safety margin
-                        let kv_elements = target_seq_len * 512; // 4 kv heads * 128 head_dim
+                        let need_tokens = prompt_len + max_gen + 64;
 
                         if debug_top {
                             let ids: Vec<u32> = token_ids.iter().cloned().collect();
-                            eprintln!("[tok] n={} ids={:?} (kv_capacity={})", prompt_len, ids, target_seq_len);
+                            eprintln!("[tok] n={} ids={:?} (kv_tokens={})", prompt_len, ids, need_tokens);
                         }
 
-                        let mut k_caches = Vec::with_capacity(24);
-                        let mut v_caches = Vec::with_capacity(24);
-                        let mut conv_states = Vec::with_capacity(24);
-                        for idx in 0..24 {
-                            if layer_types[idx] == "conv" {
-                                k_caches.push(None);
-                                v_caches.push(None);
-                                conv_states.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, 2048 * 7).expect("alloc")));
-                            } else {
-                                // Dynamic tokens capacity per request
-                                k_caches.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, kv_elements).expect("alloc")));
-                                v_caches.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, kv_elements).expect("alloc")));
-                                conv_states.push(None);
+                        let lease = match kv_pool.acquire(&gpu_clone, need_tokens) {
+                            Some(lease) => lease,
+                            None => {
+                                eprintln!(
+                                    "[pool] exhausted: need {} tokens, {} free of {} ({} active)",
+                                    need_tokens,
+                                    kv_pool.free_tokens(),
+                                    kv_pool.capacity_tokens(),
+                                    active_contexts.len()
+                                );
+                                let _ = req.response_tx.send((
+                                    "[error] kv cache pool exhausted".to_string(),
+                                    prompt_len,
+                                    0,
+                                ));
+                                continue;
                             }
-                        }
+                        };
+
+                        // The scalar reference path still owns per-request
+                        // buffers; the batched path addresses the shared slabs.
+                        let (k_caches, v_caches, conv_states) = if scalar_batch {
+                            let kv_elements = need_tokens * 512;
+                            let mut k_caches = Vec::with_capacity(24);
+                            let mut v_caches = Vec::with_capacity(24);
+                            let mut conv_states = Vec::with_capacity(24);
+                            for idx in 0..24 {
+                                if layer_types[idx] == "conv" {
+                                    k_caches.push(None);
+                                    v_caches.push(None);
+                                    conv_states.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, 2048 * 7).expect("alloc")));
+                                } else {
+                                    k_caches.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, kv_elements).expect("alloc")));
+                                    v_caches.push(Some(DeviceBuffer::<half::f16>::zeroed(&gpu_clone, kv_elements).expect("alloc")));
+                                    conv_states.push(None);
+                                }
+                            }
+                            (k_caches, v_caches, conv_states)
+                        } else {
+                            (Vec::new(), Vec::new(), Vec::new())
+                        };
 
                         let ctx = ActiveContext {
                             req,
@@ -872,6 +939,10 @@ FINISH:
                             layer_k_caches: k_caches,
                             layer_v_caches: v_caches,
                             layer_conv_states: conv_states,
+                            layout: kv_pool.layout(),
+                            kv_off: lease.tok_off,
+                            kv_len: lease.tokens,
+                            kv_slot: lease.slot,
                         };
                         new_contexts.push((ctx, token_ids, custom_embeds));
                     }
@@ -1087,6 +1158,7 @@ FINISH:
                         let _ = stream.synchronize();
                         for &idx in early_done.iter().rev() {
                             let ctx = active_contexts.remove(idx);
+                            kv_pool.release(Lease { tok_off: ctx.kv_off, tokens: ctx.kv_len, slot: ctx.kv_slot });
                             let decoded =
                                 tokenizer_clone.decode(&ctx.gen_tokens).unwrap_or_default();
                             let _ = ctx
@@ -1157,6 +1229,7 @@ FINISH:
                     let _ = stream.synchronize();
                     for &idx in completed_indices.iter().rev() {
                         let ctx = active_contexts.remove(idx);
+                        kv_pool.release(Lease { tok_off: ctx.kv_off, tokens: ctx.kv_len, slot: ctx.kv_slot });
                         let decoded = tokenizer_clone.decode(&ctx.gen_tokens).unwrap_or_default();
                         let _ = ctx
                             .req
@@ -1447,6 +1520,7 @@ FINISH:
                     let _ = stream.synchronize();
                     for &idx in legacy_early_done.iter().rev() {
                         let ctx = active_contexts.remove(idx);
+                        kv_pool.release(Lease { tok_off: ctx.kv_off, tokens: ctx.kv_len, slot: ctx.kv_slot });
                         let decoded = tokenizer_clone.decode(&ctx.gen_tokens).unwrap_or_default();
                         let _ = ctx
                             .req
@@ -1934,6 +2008,7 @@ FINISH:
                 let _ = stream.synchronize();
                 for &idx in completed_indices.iter().rev() {
                     let ctx = active_contexts.remove(idx);
+                    kv_pool.release(Lease { tok_off: ctx.kv_off, tokens: ctx.kv_len, slot: ctx.kv_slot });
                     let decoded = tokenizer_clone.decode(&ctx.gen_tokens).unwrap_or_default();
                     let _ = ctx.req.response_tx.send((decoded, ctx.prompt_len, ctx.gen_tokens.len()));
                 }
