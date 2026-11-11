@@ -1,5 +1,6 @@
 pub mod ptx;
 pub mod gemm;
+pub mod gemv;
 pub mod norm;
 pub mod attention;
 pub mod activations;
@@ -8,6 +9,7 @@ pub mod batched_attn;
 pub mod vision;
 
 pub use ptx::PtxModule;
+pub use gemv::GEMV_FP16_PTX;
 pub use attention::PagedAttentionExecutor;
 pub use activations::{ROPE_FP16_PTX, SWIGLU_FP16_PTX};
 pub use conv::CAUSAL_CONV1D_FP16_PTX;
