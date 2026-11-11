@@ -9,10 +9,10 @@ use anyhow::{anyhow, Result};
 use half::f16;
 use oxide_infer_core::{DeviceBuffer, GpuContext};
 use oxide_infer_kernels::batched_attn::{
-    BATCHED_ARGMAX_DIRECT_PTX, BATCHED_CONV_PTR_PTX, BATCHED_EMBED_LOOKUP_PTX,
+    BATCHED_ARGMAX_DIRECT_PTX, BATCHED_ATTN_GATE_SCATTER_PTX, BATCHED_ATTN_PACK_Q_PTX,
+    BATCHED_ATTN_SOFTMAX_MASK_PTX, BATCHED_CONV_PTR_PTX, BATCHED_EMBED_LOOKUP_PTX,
     BATCHED_GQA_ATTENTION_ONLINE_PTX, BATCHED_GQA_ATTENTION_SPLIT_PTX, BATCHED_KV_COPY_PTX,
-    BATCHED_QK_RMSNORM_PTX, BATCHED_ROPE_PTX,
-    BATCHED_SIGMOID_GATE_PTX, CONV_STATE_PREFILL_PTX,
+    BATCHED_QK_RMSNORM_PTX, BATCHED_ROPE_PTX, BATCHED_SIGMOID_GATE_PTX, CONV_STATE_PREFILL_PTX,
 };
 use oxide_infer_kernels::PtxModule;
 use oxide_infer_models::{FullLfm3DecoderLayer, LayerType};
@@ -20,6 +20,11 @@ use cuda_core::{launch_kernel_on_stream, CudaEvent, Function, Stream as CuStream
 use std::ffi::c_void;
 
 use crate::lt_gemm::LtGemm;
+
+/// Remaining `OXIDE_ATTN_DEBUG` GEMM-vs-online diffs (one per attention
+/// layer of the first prefill step).
+static ATTN_DEBUG_LEFT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(40);
 
 extern "C" {
     /// CUDA driver D2D copy, declared in server.rs too; duplicated here so
@@ -41,6 +46,13 @@ pub const HEAD_DIM: usize = 128;
 /// therefore the summation order) never depend on the batch composition: a
 /// row sees identical arithmetic whether it runs alone or next to 127 others.
 const ATTN_CHUNK_KEYS: usize = 256;
+/// Largest key count a GEMM attention chunk can score. The server admits at
+/// most `MAX_SEQ_TOKENS` (8192) positions, and a chunk never needs more keys
+/// than its end position, so the score scratch is sized for this.
+const MAX_ATTN_KEYS: usize = 8192;
+/// Chunks below this row count stay on the online kernel: with fewer rows the
+/// attention GEMMs are launch-bound and the SIMT kernel is cheaper.
+const GEMM_ATTN_MIN_ROWS: usize = 64;
 /// Hard cap on attention chunks; with 256-key chunks this covers 8192 tokens.
 const MAX_ATTN_CHUNKS: usize = 32;
 pub const VOCAB: usize = 128_000;
@@ -96,6 +108,15 @@ struct BatchScratch {
     /// `[row][chunk][q_head][max, normaliser]` (f32).
     attn_part_acc: DeviceBuffer<f32>,
     attn_part_stats: DeviceBuffer<f32>,
+    /// GEMM prefill attention: Q packed to `[head][row][head_dim]`, the
+    /// unnormalised `P * V` in the same order, one KV head's f32 score matrix
+    /// `[4 * rows][keys]`, its f16 weights, and the per-column softmax sum
+    /// `[head][row]`.
+    attn_qpack: DeviceBuffer<f16>,
+    attn_tmp: DeviceBuffer<f16>,
+    attn_scores: DeviceBuffer<f32>,
+    attn_p: DeviceBuffer<f16>,
+    attn_sums: DeviceBuffer<f32>,
     k_ptrs: DeviceBuffer<u64>,
     v_ptrs: DeviceBuffer<u64>,
     conv_ptrs: DeviceBuffer<u64>,
@@ -142,6 +163,9 @@ pub struct BatchEngine {
     rope: Function,
     kv_copy: Function,
     gqa: Function,
+    attn_pack_q: Function,
+    attn_softmax: Function,
+    attn_gate_scatter: Function,
     gqa_split: Function,
     gqa_combine: Function,
     sigmoid_gate: Function,
@@ -234,6 +258,12 @@ impl BatchEngine {
             .map_err(|e| anyhow!("gqa split PTX: {e}"))?;
         let gate_ptx = PtxModule::load_from_ptx(gpu, BATCHED_SIGMOID_GATE_PTX)
             .map_err(|e| anyhow!("sigmoid gate PTX: {e}"))?;
+        let gemm_attn_ptx = PtxModule::load_from_ptx(gpu, BATCHED_ATTN_PACK_Q_PTX)
+            .map_err(|e| anyhow!("gemm attn pack PTX: {e}"))?;
+        let softmax_ptx = PtxModule::load_from_ptx(gpu, BATCHED_ATTN_SOFTMAX_MASK_PTX)
+            .map_err(|e| anyhow!("gemm attn softmax PTX: {e}"))?;
+        let scatter_ptx = PtxModule::load_from_ptx(gpu, BATCHED_ATTN_GATE_SCATTER_PTX)
+            .map_err(|e| anyhow!("gemm attn scatter PTX: {e}"))?;
         let embed_ptx = PtxModule::load_from_ptx(gpu, BATCHED_EMBED_LOOKUP_PTX)
             .map_err(|e| anyhow!("embed PTX: {e}"))?;
         let conv_ptx = PtxModule::load_from_ptx(gpu, BATCHED_CONV_PTR_PTX)
@@ -273,6 +303,13 @@ impl BatchEngine {
                 max_batch * MAX_ATTN_CHUNKS * NUM_Q_HEADS * 2,
             )
             .map_err(|e| anyhow!("alloc: {e}"))?,
+            attn_qpack: alloc_f16(b * HIDDEN)?,
+            attn_tmp: alloc_f16(b * HIDDEN)?,
+            attn_scores: DeviceBuffer::<f32>::zeroed(gpu, 4 * b * MAX_ATTN_KEYS)
+                .map_err(|e| anyhow!("alloc: {e}"))?,
+            attn_p: alloc_f16(4 * b * MAX_ATTN_KEYS)?,
+            attn_sums: DeviceBuffer::<f32>::zeroed(gpu, b * NUM_Q_HEADS)
+                .map_err(|e| anyhow!("alloc: {e}"))?,
             k_ptrs: DeviceBuffer::<u64>::zeroed(gpu, 24 * b).map_err(|e| anyhow!("alloc: {e}"))?,
             v_ptrs: DeviceBuffer::<u64>::zeroed(gpu, 24 * b).map_err(|e| anyhow!("alloc: {e}"))?,
             conv_ptrs: DeviceBuffer::<u64>::zeroed(gpu, 24 * b).map_err(|e| anyhow!("alloc: {e}"))?,
@@ -296,6 +333,9 @@ impl BatchEngine {
             rope: rope_ptx.get_function("batched_rope_fp16")?,
             kv_copy: kv_ptx.get_function("batched_kv_copy_fp16")?,
             gqa: gqa_ptx.get_function("batched_gqa_attention_online_fp16")?,
+            attn_pack_q: gemm_attn_ptx.get_function("batched_attn_pack_q_fp16")?,
+            attn_softmax: softmax_ptx.get_function("batched_attn_softmax_mask_fp16")?,
+            attn_gate_scatter: scatter_ptx.get_function("batched_attn_gate_scatter_fp16")?,
             gqa_split: split_ptx.get_function("batched_gqa_attention_split_fp16")?,
             gqa_combine: split_ptx.get_function("batched_gqa_attn_combine_fp16")?,
             sigmoid_gate: gate_ptx.get_function("batched_sigmoid_gate_fp16")?,
@@ -319,6 +359,175 @@ impl BatchEngine {
     pub fn prefill_state_ptr(&self, layer: usize, row: usize) -> u64 {
         self.scratch.conv_pool.inner().cu_deviceptr()
             + (((layer * self.rows + row) * HIDDEN * 6 * 2) as u64)
+    }
+
+    /// Score one prefill chunk with the GEMM attention path.
+    ///
+    /// `rows` consecutive tokens of one request, with absolute positions
+    /// `slen_min - 1 ..= slen_max - 1`, all read the same KV cache. Keys
+    /// `t_lo .. slen_max` are scored, where `t_lo` is the earliest key any row
+    /// may attend to (0 for full layers, `slen_min - window` for sliding
+    /// ones); the softmax kernel applies each row's own causal and window
+    /// bounds inside that range and zeroes everything else.
+    ///
+    /// Per KV head: one QK GEMM (f32 scores), one fused mask+softmax pass
+    /// (f16 weights + per-column normaliser), one PV GEMM whose transposed
+    /// output is the packed `[head][row][dim]` layout. A single gate+scatter
+    /// pass then applies `sigmoid(gate) / sum` and writes the row-major
+    /// context, so this replaces both the attention and gate launches.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_attention_chunk(
+        &mut self,
+        stream: &CuStream,
+        seg_start: usize,
+        rows: usize,
+        slen_min: u32,
+        slen_max: u32,
+        window: u32,
+        k_base: u64,
+        v_base: u64,
+        d_q: u64,
+        d_gate: u64,
+        d_ctx: u64,
+    ) -> Result<()> {
+        let t_lo = if window > 0 {
+            slen_min.saturating_sub(window)
+        } else {
+            0
+        };
+        let keys = (slen_max - t_lo) as usize;
+        if keys > MAX_ATTN_KEYS {
+            return Err(anyhow!(
+                "attention chunk needs {keys} keys, scratch holds {MAX_ATTN_KEYS}"
+            ));
+        }
+        let n = 4 * rows;
+        let mut n_u = n as u32;
+        let mut keys_u = keys as u32;
+        let mut rows_u = rows as u32;
+        let mut hd = HEAD_DIM as u32;
+        let mut nq = NUM_Q_HEADS as u32;
+        let mut t_lo_u = t_lo;
+        let mut window_u = window;
+        let mut slen_ptr = self.scratch.seq_lens.inner_mut().cu_deviceptr()
+            + (seg_start * 4) as u64;
+
+        // Q regrouped to [head][row][dim] so each KV head's four query heads
+        // are one contiguous GEMM operand.
+        let qpack = self.scratch.attn_qpack.inner_mut().cu_deviceptr();
+        let mut q_in = d_q + (seg_start * HIDDEN * 2) as u64;
+        let mut q_out = qpack;
+        let mut args_pack: [*mut c_void; 5] = [
+            &mut q_in as *mut _ as *mut c_void,
+            &mut q_out as *mut _ as *mut c_void,
+            &mut nq as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut rows_u as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(
+                &self.attn_pack_q,
+                (rows_u, 1, 1),
+                (256, 1, 1),
+                0,
+                stream,
+                &mut args_pack,
+            )?;
+        }
+
+        let mut scores = self.scratch.attn_scores.inner_mut().cu_deviceptr();
+        let mut p = self.scratch.attn_p.inner_mut().cu_deviceptr();
+        let mut attn_tmp = self.scratch.attn_tmp.inner_mut().cu_deviceptr();
+        let sums_base = self.scratch.attn_sums.inner_mut().cu_deviceptr();
+        let kv_dim = KV_DIM as i64;
+        let hd_i = HEAD_DIM as i64;
+        let keys_i = keys as i64;
+
+        for kvh in 0..NUM_KV_HEADS {
+            // QK: scores[4*rows][keys] = Q[4*rows][128] * K[keys][128]^T.
+            // K is a strided view of the interleaved slab (one head of four).
+            let a = k_base
+                + (kvh * HEAD_DIM * 2) as u64
+                + (t_lo as u64 * KV_DIM as u64 * 2);
+            let b = qpack + (kvh * n * HEAD_DIM * 2) as u64;
+            self.lt.gemm_strided(
+                stream,
+                keys,
+                HEAD_DIM,
+                n,
+                kv_dim,
+                hd_i,
+                keys_i,
+                true,
+                true,
+                1024,
+                a,
+                b,
+                scores,
+            )?;
+
+            let mut sums_k = sums_base + (kvh * 4 * rows * 4) as u64;
+            let mut sc = 0.0883883476f32;
+            let mut args_sm: [*mut c_void; 9] = [
+                &mut scores as *mut _ as *mut c_void,
+                &mut p as *mut _ as *mut c_void,
+                &mut sums_k as *mut _ as *mut c_void,
+                &mut slen_ptr as *mut _ as *mut c_void,
+                &mut rows_u as *mut _ as *mut c_void,
+                &mut keys_u as *mut _ as *mut c_void,
+                &mut t_lo_u as *mut _ as *mut c_void,
+                &mut window_u as *mut _ as *mut c_void,
+                &mut sc as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                launch_kernel_on_stream(
+                    &self.attn_softmax,
+                    (rows_u, 4, 1),
+                    (128, 1, 1),
+                    0,
+                    stream,
+                    &mut args_sm,
+                )?;
+            }
+
+            // PV: out[128][4*rows] = V[keys][128]^T * P[4*rows][keys]^T.
+            // V is read untransposed (`trans_a = false`), which makes the
+            // output already the [head][row][dim] the scatter pass expects.
+            let a = v_base
+                + (kvh * HEAD_DIM * 2) as u64
+                + (t_lo as u64 * KV_DIM as u64 * 2);
+            let c = attn_tmp + (kvh * n * HEAD_DIM * 2) as u64;
+            self.lt.gemm_strided(
+                stream, HEAD_DIM, keys, n, kv_dim, keys_i, hd_i, false, false, 1024, a, p, c,
+            )?;
+        }
+
+        // Gate + normalise + transpose to the row-major context.
+        let mut ctx_ptr = d_ctx + (seg_start * HIDDEN * 2) as u64;
+        let mut gate_ptr = d_gate + (seg_start * NUM_Q_HEADS * 2) as u64;
+        let mut tmp_ptr = attn_tmp;
+        let mut sums_ptr = sums_base;
+        let mut args_g: [*mut c_void; 7] = [
+            &mut ctx_ptr as *mut _ as *mut c_void,
+            &mut tmp_ptr as *mut _ as *mut c_void,
+            &mut gate_ptr as *mut _ as *mut c_void,
+            &mut sums_ptr as *mut _ as *mut c_void,
+            &mut rows_u as *mut _ as *mut c_void,
+            &mut nq as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(
+                &self.attn_gate_scatter,
+                (nq, rows_u, 1),
+                (hd, 1, 1),
+                0,
+                stream,
+                &mut args_g,
+            )?;
+        }
+        let _ = n_u;
+        Ok(())
     }
 
     /// Run one transformer step for `ctxs`.
@@ -508,6 +717,41 @@ impl BatchEngine {
                 launch_kernel_on_stream(&self.embed, (b_u32, 1, 1), (256, 1, 1), 0, stream, &mut args_embed)?;
             }
         }
+
+        // GEMM prefill attention: score each request chunk with tensor cores.
+        // Chunks are scored one at a time because a chunk's key count is fixed
+        // by its own position in its request, never by how the wave was
+        // packed, which is what keeps the numerics batch-shape invariant.
+        let gemm_attn_segs: Option<Vec<(usize, usize)>> = match prefill {
+            Some(pf)
+                if std::env::var("OXIDE_GEMM_ATTN").map(|v| v != "0").unwrap_or(true)
+                    && self.lt.supports_f32_c() =>
+            {
+                // `origins[row]` is the wave row where the request's chunk
+                // starts, and chunks never interleave, so equal origins form
+                // one contiguous run.
+                let mut segs: Vec<(usize, usize)> = Vec::new();
+                let mut start = 0usize;
+                for i in 1..=b {
+                    if i == b || pf.origins[i] != pf.origins[start] {
+                        segs.push((start, i - start));
+                        start = i;
+                    }
+                }
+                // Positions must be contiguous and ascending, otherwise the
+                // shared key range cannot cover every row.
+                let ok = segs.iter().all(|(s, n)| {
+                    *n >= GEMM_ATTN_MIN_ROWS
+                        && (0..*n).all(|r| pos_ids[s + r] == pos_ids[*s] + r as u32)
+                });
+                if ok {
+                    Some(segs)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
 
         for (l_idx, layer) in layers.iter_mut().enumerate() {
             // Operator RMSNorm: hidden -> norm
@@ -733,77 +977,196 @@ impl BatchEngine {
                 let nchunks = eff
                     .div_ceil(ATTN_CHUNK_KEYS)
                     .clamp(1, MAX_ATTN_CHUNKS) as u32;
-                if decode_step && nchunks > 1 {
-                    // Decode: split the key range across blocks so the keys of
-                    // one sequence are not scanned by a handful of blocks.
-                    let mut chunk_keys = ATTN_CHUNK_KEYS as u32;
-                    let mut d_acc = self.scratch.attn_part_acc.inner_mut().cu_deviceptr();
-                    let mut d_stats = self.scratch.attn_part_stats.inner_mut().cu_deviceptr();
-                    let mut nch = nchunks;
-                    let mut args_split: [*mut c_void; 13] = [
-                        &mut d_q as *mut _ as *mut c_void,
-                        &mut d_kp as *mut _ as *mut c_void,
-                        &mut d_vp as *mut _ as *mut c_void,
-                        &mut d_sl as *mut _ as *mut c_void,
-                        &mut d_acc as *mut _ as *mut c_void,
-                        &mut d_stats as *mut _ as *mut c_void,
-                        &mut nq as *mut _ as *mut c_void,
-                        &mut nkv as *mut _ as *mut c_void,
-                        &mut hd as *mut _ as *mut c_void,
-                        &mut b_arg as *mut _ as *mut c_void,
-                        &mut window_u32 as *mut _ as *mut c_void,
-                        &mut chunk_keys as *mut _ as *mut c_void,
-                        &mut nch as *mut _ as *mut c_void,
-                    ];
-                    unsafe {
-                        launch_kernel_on_stream(
-                            &self.gqa_split,
-                            (nkv, b_u32, nchunks),
-                            (hd, 1, 1),
-                            0,
-                            stream,
-                            &mut args_split,
-                        )?;
-                        let mut d_ctxc = d_ctx;
-                        let mut n_heads = nq;
-                        let mut args_comb: [*mut c_void; 7] = [
-                            &mut d_ctxc as *mut _ as *mut c_void,
-                            &mut d_acc as *mut _ as *mut c_void,
-                            &mut d_stats as *mut _ as *mut c_void,
-                            &mut n_heads as *mut _ as *mut c_void,
-                            &mut hd as *mut _ as *mut c_void,
-                            &mut b_arg as *mut _ as *mut c_void,
-                            &mut nch as *mut _ as *mut c_void,
-                        ];
-                        launch_kernel_on_stream(
-                            &self.gqa_combine,
-                            (nq, b_u32, 1),
-                            (32, 1, 1),
-                            0,
-                            stream,
-                            &mut args_comb,
-                        )?;
+                // Tensor-core prefill attention: QK and PV as cuBLASLt
+                // GEMMs over strided views of the KV slab, with one fused
+                // mask+softmax pass and one gate+scatter pass per chunk.
+                let mut gemm_done = false;
+                if let Some(segs) = gemm_attn_segs.as_ref() {
+                    // Every row of a chunk must address the same KV cache.
+                    let mut cache_ok = true;
+                    for (s0, n) in segs.iter() {
+                        let kb = ctxs[*s0].k_cache_ptr(l_idx);
+                        let vb = ctxs[*s0].v_cache_ptr(l_idx);
+                        for r in 1..*n {
+                            if ctxs[s0 + r].k_cache_ptr(l_idx) != kb
+                                || ctxs[s0 + r].v_cache_ptr(l_idx) != vb
+                            {
+                                cache_ok = false;
+                            }
+                        }
                     }
-                } else {
-                    unsafe {
-                        // One block per (KV head, row); its four warps cover the
-                        // four query heads that share that KV head.
-                        let nkv = NUM_KV_HEADS as u32;
-                        launch_kernel_on_stream(&self.gqa, (nkv, b_u32, 1), (hd, 1, 1), 0, stream, &mut args_gqa)?;
+                    if cache_ok {
+                        for (s0, n) in segs.iter() {
+                            let slen_min = pos_ids[*s0] + 1;
+                            let slen_max = pos_ids[s0 + n - 1] + 1;
+                            self.gemm_attention_chunk(
+                                stream,
+                                *s0,
+                                *n,
+                                slen_min,
+                                slen_max,
+                                rope.window,
+                                ctxs[*s0].k_cache_ptr(l_idx),
+                                ctxs[*s0].v_cache_ptr(l_idx),
+                                d_q,
+                                d_g,
+                                d_ctx,
+                            )?;
+                        }
+                        gemm_done = true;
+                        if std::env::var("OXIDE_ATTN_DEBUG").ok().as_deref() == Some("1")
+                            && ATTN_DEBUG_LEFT
+                                .fetch_update(
+                                    std::sync::atomic::Ordering::Relaxed,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                    |v| v.checked_sub(1),
+                                )
+                                .is_ok()
+                        {
+                            // Run the single-pass kernel over the same wave
+                            // into the logits scratch and diff on the host.
+                            let mut alt = self.scratch.logits.inner_mut().cu_deviceptr();
+                            let mut qq = d_q;
+                            let mut kp = d_kp;
+                            let mut vp = d_vp;
+                            let mut sll = self.scratch.seq_lens.inner_mut().cu_deviceptr();
+                            let mut nnq = nq;
+                            let mut nnkv = nkv;
+                            let mut hhd = hd;
+                            let mut bb = b_arg;
+                            let mut ww = window_u32;
+                            let mut aa: [*mut c_void; 10] = [
+                                &mut alt as *mut _ as *mut c_void,
+                                &mut qq as *mut _ as *mut c_void,
+                                &mut kp as *mut _ as *mut c_void,
+                                &mut vp as *mut _ as *mut c_void,
+                                &mut sll as *mut _ as *mut c_void,
+                                &mut nnq as *mut _ as *mut c_void,
+                                &mut nnkv as *mut _ as *mut c_void,
+                                &mut hhd as *mut _ as *mut c_void,
+                                &mut bb as *mut _ as *mut c_void,
+                                &mut ww as *mut _ as *mut c_void,
+                            ];
+                            unsafe {
+                                launch_kernel_on_stream(
+                                    &self.gqa,
+                                    (nnkv, bb, 1),
+                                    (hhd, 1, 1),
+                                    0,
+                                    stream,
+                                    &mut aa,
+                                )?;
+                            }
+                            stream.synchronize()?;
+                            let got = self.scratch.ctx.inner().to_host_vec(stream)?;
+                            let altv = self.scratch.logits.inner().to_host_vec(stream)?;
+                            let gate = self.scratch.gate.inner().to_host_vec(stream)?;
+                            let rows_dbg = b;
+                            let mut worst = (0usize, 0usize, 0.0f32);
+                            let mut per_head = vec![0f32; NUM_Q_HEADS];
+                            let mut scale = 0f32;
+                            for r in 0..rows_dbg {
+                                for h in 0..NUM_Q_HEADS {
+                                    let g =
+                                        1.0 / (1.0 + (-gate[r * NUM_Q_HEADS + h].to_f32()).exp());
+                                    for d in 0..HEAD_DIM {
+                                        let i = (r * NUM_Q_HEADS + h) * HEAD_DIM + d;
+                                        let want = altv[i].to_f32() * g;
+                                        let e = (got[i].to_f32() - want).abs();
+                                        scale = scale.max(want.abs());
+                                        per_head[h] = per_head[h].max(e);
+                                        if e > worst.2 {
+                                            worst = (r, h, e);
+                                        }
+                                    }
+                                }
+                            }
+                            println!(
+                                "[attn-debug] layer {l_idx} window {window_u32} rows {rows_dbg}: max |gemm-online| {:.5} at row {} head {} (ctx scale {:.3})",
+                                worst.2, worst.0, worst.1, scale
+                            );
+                            println!("[attn-debug] per-head max: {:?}", per_head);
+                        }
                     }
                 }
+
+                if !gemm_done {
+                    if decode_step && nchunks > 1 {
+                        // Decode: split the key range across blocks so the keys of
+                        // one sequence are not scanned by a handful of blocks.
+                        let mut chunk_keys = ATTN_CHUNK_KEYS as u32;
+                        let mut d_acc = self.scratch.attn_part_acc.inner_mut().cu_deviceptr();
+                        let mut d_stats = self.scratch.attn_part_stats.inner_mut().cu_deviceptr();
+                        let mut nch = nchunks;
+                        let mut args_split: [*mut c_void; 13] = [
+                            &mut d_q as *mut _ as *mut c_void,
+                            &mut d_kp as *mut _ as *mut c_void,
+                            &mut d_vp as *mut _ as *mut c_void,
+                            &mut d_sl as *mut _ as *mut c_void,
+                            &mut d_acc as *mut _ as *mut c_void,
+                            &mut d_stats as *mut _ as *mut c_void,
+                            &mut nq as *mut _ as *mut c_void,
+                            &mut nkv as *mut _ as *mut c_void,
+                            &mut hd as *mut _ as *mut c_void,
+                            &mut b_arg as *mut _ as *mut c_void,
+                            &mut window_u32 as *mut _ as *mut c_void,
+                            &mut chunk_keys as *mut _ as *mut c_void,
+                            &mut nch as *mut _ as *mut c_void,
+                        ];
+                        unsafe {
+                            launch_kernel_on_stream(
+                                &self.gqa_split,
+                                (nkv, b_u32, nchunks),
+                                (hd, 1, 1),
+                                0,
+                                stream,
+                                &mut args_split,
+                            )?;
+                            let mut d_ctxc = d_ctx;
+                            let mut n_heads = nq;
+                            let mut args_comb: [*mut c_void; 7] = [
+                                &mut d_ctxc as *mut _ as *mut c_void,
+                                &mut d_acc as *mut _ as *mut c_void,
+                                &mut d_stats as *mut _ as *mut c_void,
+                                &mut n_heads as *mut _ as *mut c_void,
+                                &mut hd as *mut _ as *mut c_void,
+                                &mut b_arg as *mut _ as *mut c_void,
+                                &mut nch as *mut _ as *mut c_void,
+                            ];
+                            launch_kernel_on_stream(
+                                &self.gqa_combine,
+                                (nq, b_u32, 1),
+                                (32, 1, 1),
+                                0,
+                                stream,
+                                &mut args_comb,
+                            )?;
+                        }
+                    } else {
+                        unsafe {
+                            // One block per (KV head, row); its four warps cover the
+                            // four query heads that share that KV head.
+                            let nkv = NUM_KV_HEADS as u32;
+                            launch_kernel_on_stream(&self.gqa, (nkv, b_u32, 1), (hd, 1, 1), 0, stream, &mut args_gqa)?;
+                        }
+                    }
+                }
+
                 phase!();
 
-                // Sigmoid gating.
-                let mut args_gate: [*mut c_void; 5] = [
-                    &mut d_ctx as *mut _ as *mut c_void,
-                    &mut d_gate as *mut _ as *mut c_void,
-                    &mut nq as *mut _ as *mut c_void,
-                    &mut hd as *mut _ as *mut c_void,
-                    &mut b_arg as *mut _ as *mut c_void,
-                ];
-                unsafe {
-                    launch_kernel_on_stream(&self.sigmoid_gate, (nq, b_u32, 1), (hd, 1, 1), 0, stream, &mut args_gate)?;
+                // Sigmoid gating. The GEMM path already folded it (and the
+                // softmax normaliser) into its gate+scatter pass.
+                if !gemm_done {
+                    let mut args_gate: [*mut c_void; 5] = [
+                        &mut d_ctx as *mut _ as *mut c_void,
+                        &mut d_gate as *mut _ as *mut c_void,
+                        &mut nq as *mut _ as *mut c_void,
+                        &mut hd as *mut _ as *mut c_void,
+                        &mut b_arg as *mut _ as *mut c_void,
+                    ];
+                    unsafe {
+                        launch_kernel_on_stream(&self.sigmoid_gate, (nq, b_u32, 1), (hd, 1, 1), 0, stream, &mut args_gate)?;
+                    }
                 }
 
                 // o_proj: [2048, 2048] x [2048, B]

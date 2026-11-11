@@ -2268,3 +2268,379 @@ EXIT:
     ret;
 }
 "#;
+
+/// Regroup Q from `[row][head][dim]` to `[head][row][dim]`.
+///
+/// The GEMM attention path scores four query heads that share a KV head as
+/// one `n = 4 * rows` operand, which requires those heads to be contiguous
+/// in memory. One block per row copies `num_heads * head_dim` halves; within
+/// a head the copy is contiguous, so stores coalesce in 256-byte runs.
+pub const BATCHED_ATTN_PACK_Q_PTX: &str = r#"
+.version 7.5
+.target sm_80
+.address_size 64
+
+.visible .entry batched_attn_pack_q_fp16(
+    .param .u64 q_in,
+    .param .u64 q_pack,
+    .param .u32 num_heads,
+    .param .u32 head_dim,
+    .param .u32 rows
+) {
+    .reg .pred %p0;
+    .reg .b32 %row, %idx, %nh, %hd, %units, %per_head, %head, %within, %t32, %t33, %rowv, %stride;
+    .reg .b64 %srcbase, %dstbase, %off, %addr, %addr2;
+    .reg .b16 %h0, %h1, %h2, %h3;
+
+    mov.u32 %row, %ctaid.x;
+    ld.param.u32 %nh, [num_heads];
+    ld.param.u32 %hd, [head_dim];
+    ld.param.u32 %rowv, [rows];
+
+    shr.u32 %per_head, %hd, 2;          // v4 units per head
+    mul.lo.u32 %units, %nh, %per_head;
+
+    ld.param.u64 %srcbase, [q_in];
+    ld.param.u64 %dstbase, [q_pack];
+
+    mul.lo.u32 %t32, %row, %nh;
+    mul.lo.u32 %t32, %t32, %hd;
+    cvt.u64.u32 %off, %t32;
+    shl.b64 %off, %off, 1;
+    add.u64 %srcbase, %srcbase, %off;
+
+    mov.u32 %idx, %tid.x;
+    mov.u32 %stride, %ntid.x;
+
+LOOP:
+    setp.ge.u32 %p0, %idx, %units;
+    @%p0 bra DONE;
+
+    div.u32 %head, %idx, %per_head;
+    rem.u32 %within, %idx, %per_head;
+
+    // src = q + row * nh * hd + (head * hd + within * 4)
+    mul.lo.u32 %t32, %head, %hd;
+    shl.b32 %t33, %within, 2;
+    add.u32 %t32, %t32, %t33;
+    cvt.u64.u32 %off, %t32;
+    shl.b64 %off, %off, 1;
+    add.u64 %addr, %srcbase, %off;
+
+    // dst = q_pack + ((head * rows + row) * hd + within * 4)
+    mul.lo.u32 %t32, %head, %rowv;
+    add.u32 %t32, %t32, %row;
+    mul.lo.u32 %t32, %t32, %hd;
+    add.u32 %t32, %t32, %t33;
+    cvt.u64.u32 %off, %t32;
+    shl.b64 %off, %off, 1;
+    add.u64 %addr2, %dstbase, %off;
+
+    ld.global.v4.u16 {%h0, %h1, %h2, %h3}, [%addr];
+    st.global.v4.u16 [%addr2], {%h0, %h1, %h2, %h3};
+
+    add.u32 %idx, %idx, %stride;
+    bra LOOP;
+
+DONE:
+    ret;
+}
+"#;
+
+/// Masked softmax over one score column, writing f16 weights and a sum.
+///
+/// One block per GEMM column (`grid = (rows, 4)`; column `j = h * rows + row`,
+/// which is the `[head][row]` order of the packed Q). The column is a
+/// contiguous run of `keys` f32 scores, so the block scans it with unit
+/// stride. Keys outside the row's causal and sliding window are written as
+/// exact zeros so the following PV GEMM needs no mask.
+///
+/// `scale` is `1 / sqrt(head_dim)`, applied in f32 here (not baked into Q)
+/// so this path and the single-pass kernel scale the same way. The weights
+/// are left unnormalised (`exp(s - max)`): the sum is returned so the
+/// gate-and-scatter kernel can divide once per column, which keeps the f16
+/// weights in `(0, 1]` and loses less than normalising them in f16.
+pub const BATCHED_ATTN_SOFTMAX_MASK_PTX: &str = r#"
+.version 7.5
+.target sm_80
+.address_size 64
+
+.visible .entry batched_attn_softmax_mask_fp16(
+    .param .u64 scores,
+    .param .u64 p_out,
+    .param .u64 sums,
+    .param .u64 seq_lens,
+    .param .u32 rows,
+    .param .u32 keys,
+    .param .u32 t_lo,
+    .param .u32 window,
+    .param .f32 scale
+) {
+    .reg .pred %p0, %p1, %p2;
+    .reg .b32 %row, %h, %j, %keys_r, %rows_r, %tlo, %win, %slen, %hi, %lo, %u;
+    .reg .b32 %tidv, %lane, %warp, %t32, %sad, %stride;
+    .reg .b64 %s_base, %p_base, %sum_base, %sl_base, %off, %addr;
+    .reg .f32 %m, %s, %e, %x, %v, %sh, %scl;
+    .reg .b16 %hv;
+
+    .shared .f32 s_warp[4];
+
+    mov.u32 %tidv, %tid.x;
+    ld.param.u32 %rows_r, [rows];
+    ld.param.u32 %keys_r, [keys];
+    ld.param.u32 %tlo, [t_lo];
+    ld.param.u32 %win, [window];
+    ld.param.f32 %scl, [scale];
+
+    mov.u32 %row, %ctaid.x;
+    mov.u32 %h, %ctaid.y;
+    mul.lo.u32 %j, %h, %rows_r;
+    add.u32 %j, %j, %row;
+
+    ld.param.u64 %sl_base, [seq_lens];
+    mul.wide.u32 %off, %row, 4;
+    add.u64 %off, %sl_base, %off;
+    ld.global.u32 %slen, [%off];
+
+    // hi = min(keys, slen - t_lo)
+    sub.u32 %hi, %slen, %tlo;
+    setp.gt.u32 %p0, %hi, %keys_r;
+    @%p0 mov.u32 %hi, %keys_r;
+
+    // lo = max(0, slen - window) - t_lo, or 0 without a window
+    mov.u32 %lo, 0;
+    setp.eq.u32 %p0, %win, 0;
+    @%p0 bra HAVE_LO;
+    setp.le.u32 %p0, %slen, %win;
+    @%p0 bra HAVE_LO;
+    sub.u32 %t32, %slen, %win;
+    sub.u32 %lo, %t32, %tlo;
+HAVE_LO:
+
+    mul.lo.u32 %t32, %j, %keys_r;
+    cvt.u64.u32 %off, %t32;
+    shl.b64 %off, %off, 2;
+    ld.param.u64 %s_base, [scores];
+    add.u64 %s_base, %s_base, %off;
+
+    cvt.u64.u32 %off, %t32;
+    shl.b64 %off, %off, 1;
+    ld.param.u64 %p_base, [p_out];
+    add.u64 %p_base, %p_base, %off;
+
+    // ---- pass 1: max over [lo, hi) ----
+    mov.f32 %m, -1.0e30;
+    add.u32 %u, %lo, %tidv;
+MAX_LOOP:
+    setp.ge.u32 %p0, %u, %hi;
+    @%p0 bra MAX_RED;
+    cvt.u64.u32 %off, %u;
+    shl.b64 %off, %off, 2;
+    add.u64 %addr, %s_base, %off;
+    ld.global.f32 %v, [%addr];
+    mul.f32 %v, %v, %scl;
+    max.f32 %m, %m, %v;
+    add.u32 %u, %u, 128;
+    bra MAX_LOOP;
+
+MAX_RED:
+    shfl.sync.down.b32 %sh, %m, 16, 31, 0xffffffff;
+    max.f32 %m, %m, %sh;
+    shfl.sync.down.b32 %sh, %m, 8, 31, 0xffffffff;
+    max.f32 %m, %m, %sh;
+    shfl.sync.down.b32 %sh, %m, 4, 31, 0xffffffff;
+    max.f32 %m, %m, %sh;
+    shfl.sync.down.b32 %sh, %m, 2, 31, 0xffffffff;
+    max.f32 %m, %m, %sh;
+    shfl.sync.down.b32 %sh, %m, 1, 31, 0xffffffff;
+    max.f32 %m, %m, %sh;
+
+    and.b32 %lane, %tidv, 31;
+    shr.u32 %warp, %tidv, 5;
+    setp.eq.u32 %p1, %lane, 0;
+    mov.u32 %sad, s_warp;
+    mad.lo.u32 %sad, %warp, 4, %sad;
+    @%p1 st.shared.f32 [%sad], %m;
+    bar.sync 0;
+
+    mov.u32 %sad, s_warp;
+    ld.shared.f32 %m, [%sad];
+    ld.shared.f32 %v, [%sad + 4];
+    max.f32 %m, %m, %v;
+    ld.shared.f32 %v, [%sad + 8];
+    max.f32 %m, %m, %v;
+    ld.shared.f32 %v, [%sad + 12];
+    max.f32 %m, %m, %v;
+
+    // ---- pass 2: exp(s - max) over the whole column, masked to zero ----
+    mov.f32 %s, 0.0;
+    mov.u32 %u, %tidv;
+    mov.u32 %stride, 128;
+P_LOOP:
+    setp.ge.u32 %p0, %u, %keys_r;
+    @%p0 bra P_RED;
+
+    setp.lt.u32 %p1, %u, %lo;
+    setp.ge.u32 %p2, %u, %hi;
+    or.pred %p1, %p1, %p2;
+    mov.f32 %e, 0.0;
+    @%p1 bra P_STORE;
+
+    cvt.u64.u32 %off, %u;
+    shl.b64 %off, %off, 2;
+    add.u64 %addr, %s_base, %off;
+    ld.global.f32 %x, [%addr];
+    mul.f32 %x, %x, %scl;
+    sub.f32 %x, %x, %m;
+    mul.f32 %x, %x, 1.44269504;
+    ex2.approx.ftz.f32 %e, %x;
+    add.f32 %s, %s, %e;
+
+P_STORE:
+    cvt.u64.u32 %off, %u;
+    shl.b64 %off, %off, 1;
+    add.u64 %addr, %p_base, %off;
+    cvt.rn.f16.f32 %hv, %e;
+    st.global.u16 [%addr], %hv;
+
+    add.u32 %u, %u, %stride;
+    bra P_LOOP;
+
+P_RED:
+    shfl.sync.down.b32 %sh, %s, 16, 31, 0xffffffff;
+    add.f32 %s, %s, %sh;
+    shfl.sync.down.b32 %sh, %s, 8, 31, 0xffffffff;
+    add.f32 %s, %s, %sh;
+    shfl.sync.down.b32 %sh, %s, 4, 31, 0xffffffff;
+    add.f32 %s, %s, %sh;
+    shfl.sync.down.b32 %sh, %s, 2, 31, 0xffffffff;
+    add.f32 %s, %s, %sh;
+    shfl.sync.down.b32 %sh, %s, 1, 31, 0xffffffff;
+    add.f32 %s, %s, %sh;
+
+    bar.sync 0;
+    setp.eq.u32 %p1, %lane, 0;
+    mov.u32 %sad, s_warp;
+    mad.lo.u32 %sad, %warp, 4, %sad;
+    @%p1 st.shared.f32 [%sad], %s;
+    bar.sync 0;
+
+    mov.u32 %sad, s_warp;
+    ld.shared.f32 %s, [%sad];
+    ld.shared.f32 %v, [%sad + 4];
+    add.f32 %s, %s, %v;
+    ld.shared.f32 %v, [%sad + 8];
+    add.f32 %s, %s, %v;
+    ld.shared.f32 %v, [%sad + 12];
+    add.f32 %s, %s, %v;
+
+    setp.eq.u32 %p0, %tidv, 0;
+    @!%p0 bra DONE;
+    mul.wide.u32 %off, %j, 4;
+    ld.param.u64 %sum_base, [sums];
+    add.u64 %off, %sum_base, %off;
+    st.global.f32 [%off], %s;
+
+DONE:
+    ret;
+}
+"#;
+
+/// Fold the sigmoid gate, the softmax normaliser and the `[head][row]` to
+/// `[row][head]` transpose into one pass.
+///
+/// `attn_tmp` holds unnormalised `P * V` in the packed `[head][row][dim]`
+/// order the PV GEMM writes. Each block applies `sigmoid(gate) / sum` and
+/// writes the row-major context the o_proj GEMM reads, so the GEMM attention
+/// path needs no separate scatter or gate launch.
+pub const BATCHED_ATTN_GATE_SCATTER_PTX: &str = r#"
+.version 7.5
+.target sm_80
+.address_size 64
+
+.visible .entry batched_attn_gate_scatter_fp16(
+    .param .u64 context_out,
+    .param .u64 attn_tmp,
+    .param .u64 gate_in,
+    .param .u64 sums,
+    .param .u32 rows,
+    .param .u32 num_heads,
+    .param .u32 head_dim
+) {
+    .reg .pred %p0;
+    .reg .b32 %head, %row, %j, %nh, %hd, %rows_r, %d, %t32, %stride;
+    .reg .b64 %off, %ctx_base, %tmp_base, %gate_ptr, %sum_ptr, %addr;
+    .reg .f32 %sig, %den, %scale, %v, %x;
+    .reg .b16 %hx, %hy;
+
+    mov.u32 %head, %ctaid.x;
+    mov.u32 %row, %ctaid.y;
+    ld.param.u32 %nh, [num_heads];
+    ld.param.u32 %hd, [head_dim];
+    ld.param.u32 %rows_r, [rows];
+
+    setp.ge.u32 %p0, %head, %nh;
+    @%p0 bra DONE;
+    setp.ge.u32 %p0, %row, %rows_r;
+    @%p0 bra DONE;
+
+    mul.lo.u32 %j, %head, %rows_r;
+    add.u32 %j, %j, %row;
+
+    // sigmoid(gate[row][head]); gate is f16.
+    ld.param.u64 %gate_ptr, [gate_in];
+    mul.lo.u32 %t32, %row, %nh;
+    add.u32 %t32, %t32, %head;
+    mul.wide.u32 %off, %t32, 2;
+    add.u64 %gate_ptr, %gate_ptr, %off;
+    ld.global.u16 %hx, [%gate_ptr];
+    cvt.f32.f16 %x, %hx;
+    neg.f32 %x, %x;
+    mul.f32 %x, %x, 1.44269504;
+    ex2.approx.ftz.f32 %x, %x;
+    add.f32 %x, %x, 1.0;
+    rcp.approx.ftz.f32 %sig, %x;
+
+    ld.param.u64 %sum_ptr, [sums];
+    mul.wide.u32 %off, %j, 4;
+    add.u64 %off, %sum_ptr, %off;
+    ld.global.f32 %den, [%off];
+    div.rn.f32 %scale, %sig, %den;
+
+    mul.lo.u32 %t32, %j, %hd;
+    cvt.u64.u32 %off, %t32;
+    shl.b64 %off, %off, 1;
+    ld.param.u64 %tmp_base, [attn_tmp];
+    add.u64 %tmp_base, %tmp_base, %off;
+
+    mul.lo.u32 %t32, %row, %nh;
+    add.u32 %t32, %t32, %head;
+    mul.lo.u32 %t32, %t32, %hd;
+    cvt.u64.u32 %off, %t32;
+    shl.b64 %off, %off, 1;
+    ld.param.u64 %ctx_base, [context_out];
+    add.u64 %ctx_base, %ctx_base, %off;
+
+    mov.u32 %d, %tid.x;
+    mov.u32 %stride, %ntid.x;
+LOOP:
+    setp.ge.u32 %p0, %d, %hd;
+    @%p0 bra DONE;
+    cvt.u64.u32 %off, %d;
+    shl.b64 %off, %off, 1;
+
+    add.u64 %addr, %tmp_base, %off;
+    ld.global.u16 %hx, [%addr];
+    cvt.f32.f16 %v, %hx;
+    mul.f32 %v, %v, %scale;
+    cvt.rn.f16.f32 %hy, %v;
+    add.u64 %addr, %ctx_base, %off;
+    st.global.u16 [%addr], %hy;
+
+    add.u32 %d, %d, %stride;
+    bra LOOP;
+
+DONE:
+    ret;
+}
+"#;

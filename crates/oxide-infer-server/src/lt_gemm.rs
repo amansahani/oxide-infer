@@ -325,6 +325,12 @@ impl LtGemm {
         })
     }
 
+    /// Whether the configured compute mode can produce an f32 C. The
+    /// attention score GEMMs need it; an f16 scale would silently round them.
+    pub fn supports_f32_c(&self) -> bool {
+        self.scale_type == CUDA_R_32F
+    }
+
     /// Create a deterministic config for a layout with explicit leading
     /// dimensions.
     ///
