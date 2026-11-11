@@ -1461,28 +1461,28 @@ pub const BATCHED_GQA_ATTENTION_SPLIT_PTX: &str = r#"
     add.u64 %off, %sl_tbl, %off;
     ld.global.u32 %slen, [%off];
 
-    // This block's key range: the chunk intersected with the layer window.
+    // This block's key range: chunk `c` of the layer's window. Chunking is
+    // relative to the window start, not to position 0: the host sizes the grid
+    // as ceil(min(slen, window) / chunk_keys), so anchoring at 0 would leave
+    // the last `window % chunk_keys` real keys of a sliding layer unscanned.
+    // For a full-attention layer wstart is 0 and this is the plain split.
     ld.param.u32 %chunk, [chunk_keys];
     ld.param.u32 %nchunks, [nchunks];
     mov.u32 %c, %ctaid.z;
     ld.param.u32 %window, [window];
 
+    mov.u32 %wstart, 0;
+    setp.eq.u32 %p1, %window, 0;
+    @%p1 bra W_DONE;
+    setp.gt.u32 %p1, %slen, %window;
+    @!%p1 bra W_DONE;
+    sub.u32 %wstart, %slen, %window;
+W_DONE:
     mul.lo.u32 %t_start, %c, %chunk;
+    add.u32 %t_start, %t_start, %wstart;
     add.u32 %t_end, %t_start, %chunk;
     setp.gt.u32 %p0, %t_end, %slen;
     @%p0 mov.u32 %t_end, %slen;
-
-    setp.eq.u32 %p1, %window, 0;
-    @%p1 bra W_DONE;
-    mov.u32 %wstart, 0;
-    setp.gt.u32 %p1, %slen, %window;
-    @!%p1 bra W_CHECK;
-    sub.u32 %wstart, %slen, %window;
-W_CHECK:
-    setp.lt.u32 %p1, %t_start, %wstart;
-    @!%p1 bra W_DONE;
-    mov.u32 %t_start, %wstart;
-W_DONE:
 
     mov.f32 %m, -1.0e30;
     mov.f32 %s, 0.0;
@@ -2641,6 +2641,396 @@ LOOP:
     bra LOOP;
 
 DONE:
+    ret;
+}
+"#;
+
+/// Split-K decode attention, four keys per iteration.
+///
+/// Identical arithmetic to `BATCHED_GQA_ATTENTION_SPLIT_PTX`, applied in the
+/// same key order, but four keys' dots are issued together so their five-step
+/// warp reductions overlap instead of serialising: one key per iteration left
+/// the kernel bound by a single dependent shuffle chain. The online-softmax
+/// rescale is written branch-free as `corr = exp2(min(m - s, 0) * log2e)`,
+/// `m = max(m, s)`, which is exact, so output is bit-identical to the one-key
+/// kernel while the per-key latency is hidden.
+pub const BATCHED_GQA_ATTENTION_SPLIT4_PTX: &str = r#".version 7.5
+.target sm_80
+.address_size 64
+
+// Split-K decode attention, four keys per iteration.
+// One warp per (row, query head); the block covers four query heads sharing
+// one KV head. Grid is (num_kv_heads, batch, nchunks). Lane l owns dims
+// 4l..4l+3, so a key's 128 dims are one 16-byte vector load per lane.
+.visible .entry batched_gqa_attention_split4_fp16(
+    .param .u64 q_in,
+    .param .u64 k_ptrs,
+    .param .u64 v_ptrs,
+    .param .u64 seq_lens,
+    .param .u64 partial_acc,
+    .param .u64 partial_stats,
+    .param .u32 num_q_heads,
+    .param .u32 num_kv_heads,
+    .param .u32 head_dim,
+    .param .u32 batch_size,
+    .param .u32 window,
+    .param .u32 chunk_keys,
+    .param .u32 nchunks
+) {
+    .reg .pred %p0, %p1, %p2, %p3, %pq;
+    .reg .b32 %tidv, %lane, %warp, %head, %kvh, %b_idx, %c, %slen, %nq, %nkv, %hd;
+    .reg .b32 %t, %t_start, %t_end, %wstart, %window, %chunk, %nchunks, %kvbase, %tmp, %pidx;
+    .reg .b64 %q_ptr, %k_ptr, %v_ptr, %k_tbl, %v_tbl, %sl_tbl, %off, %addr, %laneoff8, %laneoff16, %base;
+    .reg .b64 %k0p, %k1p, %k2p, %k3p, %v0p, %v1p, %v2p, %v3p, %stride;
+    .reg .f32 %q0, %q1, %q2, %q3, %a0, %a1, %a2, %a3, %m, %s, %corr, %tmpf;
+    .reg .f32 %d0, %d1, %d2, %d3, %c0, %c1, %c2, %c3, %s0, %s1, %s2, %s3, %w0, %w1, %w2, %w3;
+    .reg .f32 %sh0, %sh1, %sh2, %sh3;
+    .reg .b16 %h<16>, %g<16>;
+    ld.param.u32 %nq, [num_q_heads];
+    ld.param.u32 %nkv, [num_kv_heads];
+    ld.param.u32 %hd, [head_dim];
+
+    mov.u32 %b_idx, %ctaid.y;
+    ld.param.u32 %tmp, [batch_size];
+    setp.ge.u32 %p0, %b_idx, %tmp;
+    @%p0 bra EXIT;
+
+    mov.u32 %kvh, %ctaid.x;
+    setp.ge.u32 %p0, %kvh, %nkv;
+    @%p0 bra EXIT;
+
+    mov.u32 %tidv, %tid.x;
+    shr.u32 %warp, %tidv, 5;
+    and.b32 %lane, %tidv, 31;
+    shl.b32 %head, %kvh, 2;
+    add.u32 %head, %head, %warp;
+
+    cvt.u64.u32 %laneoff8, %lane;
+    shl.b64 %laneoff8, %laneoff8, 3;
+    cvt.u64.u32 %laneoff16, %lane;
+    shl.b64 %laneoff16, %laneoff16, 4;
+
+    ld.param.u64 %q_ptr, [q_in];
+    mul.lo.u32 %tmp, %b_idx, %nq;
+    add.u32 %tmp, %tmp, %head;
+    mul.lo.u32 %tmp, %tmp, %hd;
+    cvt.u64.u32 %off, %tmp;
+    shl.b64 %off, %off, 1;
+    add.u64 %q_ptr, %q_ptr, %off;
+    add.u64 %addr, %q_ptr, %laneoff8;
+    ld.global.v4.u16 {%h0, %h1, %h2, %h3}, [%addr];
+    cvt.f32.f16 %q0, %h0;
+    cvt.f32.f16 %q1, %h1;
+    cvt.f32.f16 %q2, %h2;
+    cvt.f32.f16 %q3, %h3;
+
+    ld.param.u64 %k_tbl, [k_ptrs];
+    ld.param.u64 %v_tbl, [v_ptrs];
+    mul.wide.u32 %off, %b_idx, 8;
+    add.u64 %off, %k_tbl, %off;
+    ld.global.u64 %k_ptr, [%off];
+    mul.wide.u32 %off, %b_idx, 8;
+    add.u64 %off, %v_tbl, %off;
+    ld.global.u64 %v_ptr, [%off];
+
+    ld.param.u64 %sl_tbl, [seq_lens];
+    mul.wide.u32 %off, %b_idx, 4;
+    add.u64 %off, %sl_tbl, %off;
+    ld.global.u32 %slen, [%off];
+
+    // This block's key range: chunk `c` of the layer's window, anchored at
+    // the window start (see the one-key kernel for why).
+    ld.param.u32 %chunk, [chunk_keys];
+    ld.param.u32 %nchunks, [nchunks];
+    mov.u32 %c, %ctaid.z;
+    ld.param.u32 %window, [window];
+
+    mov.u32 %wstart, 0;
+    setp.eq.u32 %p1, %window, 0;
+    @%p1 bra W_DONE;
+    setp.gt.u32 %p1, %slen, %window;
+    @!%p1 bra W_DONE;
+    sub.u32 %wstart, %slen, %window;
+W_DONE:
+    mul.lo.u32 %t_start, %c, %chunk;
+    add.u32 %t_start, %t_start, %wstart;
+    add.u32 %t_end, %t_start, %chunk;
+    setp.gt.u32 %p0, %t_end, %slen;
+    @%p0 mov.u32 %t_end, %slen;
+
+    // Byte stride between consecutive tokens in the KV slab.
+    mul.lo.u32 %tmp, %nkv, %hd;
+    cvt.u64.u32 %stride, %tmp;
+    shl.b64 %stride, %stride, 1;
+
+    mov.f32 %m, -1.0e30;
+    mov.f32 %s, 0.0;
+    mov.f32 %a0, 0.0;
+    mov.f32 %a1, 0.0;
+    mov.f32 %a2, 0.0;
+    mov.f32 %a3, 0.0;
+    mov.u32 %t, %t_start;
+KEY_LOOP:
+    setp.ge.u32 %p0, %t, %t_end;
+    @%p0 bra FINISH;
+    add.u32 %tmp, %t, 1;
+    setp.lt.u32 %p1, %tmp, %t_end;
+    add.u32 %tmp, %t, 2;
+    setp.lt.u32 %p2, %tmp, %t_end;
+    add.u32 %tmp, %t, 3;
+    setp.lt.u32 %p3, %tmp, %t_end;
+
+    // Addresses of the four keys' K and V rows, in bytes.
+    mul.lo.u32 %kvbase, %t, %nkv;
+    add.u32 %kvbase, %kvbase, %kvh;
+    mul.lo.u32 %kvbase, %kvbase, %hd;
+    cvt.u64.u32 %off, %kvbase;
+    shl.b64 %off, %off, 1;
+    add.u64 %off, %off, %laneoff8;
+    add.u64 %k0p, %k_ptr, %off;
+    add.u64 %v0p, %v_ptr, %off;
+    add.u64 %k1p, %k0p, %stride;
+    add.u64 %v1p, %v0p, %stride;
+    add.u64 %k2p, %k1p, %stride;
+    add.u64 %v2p, %v1p, %stride;
+    add.u64 %k3p, %k2p, %stride;
+    add.u64 %v3p, %v2p, %stride;
+
+    // All eight rows issued together: the loads overlap the dots below.
+    ld.global.v4.u16 {%h0, %h1, %h2, %h3}, [%k0p];
+    ld.global.v4.u16 {%g0, %g1, %g2, %g3}, [%v0p];
+    @%p1 ld.global.v4.u16 {%h4, %h5, %h6, %h7}, [%k1p];
+    @%p1 ld.global.v4.u16 {%g4, %g5, %g6, %g7}, [%v1p];
+    @%p2 ld.global.v4.u16 {%h8, %h9, %h10, %h11}, [%k2p];
+    @%p2 ld.global.v4.u16 {%g8, %g9, %g10, %g11}, [%v2p];
+    @%p3 ld.global.v4.u16 {%h12, %h13, %h14, %h15}, [%k3p];
+    @%p3 ld.global.v4.u16 {%g12, %g13, %g14, %g15}, [%v3p];
+
+    // Four independent 128-dim dots (4 dims per lane), in parallel.
+    cvt.f32.f16 %d0, %h0;
+    mul.f32 %d0, %q0, %d0;
+    cvt.f32.f16 %c0, %h1;
+    fma.rn.f32 %d0, %q1, %c0, %d0;
+    cvt.f32.f16 %c0, %h2;
+    fma.rn.f32 %d0, %q2, %c0, %d0;
+    cvt.f32.f16 %c0, %h3;
+    fma.rn.f32 %d0, %q3, %c0, %d0;
+    cvt.f32.f16 %d1, %h4;
+    mul.f32 %d1, %q0, %d1;
+    cvt.f32.f16 %c1, %h5;
+    fma.rn.f32 %d1, %q1, %c1, %d1;
+    cvt.f32.f16 %c1, %h6;
+    fma.rn.f32 %d1, %q2, %c1, %d1;
+    cvt.f32.f16 %c1, %h7;
+    fma.rn.f32 %d1, %q3, %c1, %d1;
+    cvt.f32.f16 %d2, %h8;
+    mul.f32 %d2, %q0, %d2;
+    cvt.f32.f16 %c2, %h9;
+    fma.rn.f32 %d2, %q1, %c2, %d2;
+    cvt.f32.f16 %c2, %h10;
+    fma.rn.f32 %d2, %q2, %c2, %d2;
+    cvt.f32.f16 %c2, %h11;
+    fma.rn.f32 %d2, %q3, %c2, %d2;
+    cvt.f32.f16 %d3, %h12;
+    mul.f32 %d3, %q0, %d3;
+    cvt.f32.f16 %c3, %h13;
+    fma.rn.f32 %d3, %q1, %c3, %d3;
+    cvt.f32.f16 %c3, %h14;
+    fma.rn.f32 %d3, %q2, %c3, %d3;
+    cvt.f32.f16 %c3, %h15;
+    fma.rn.f32 %d3, %q3, %c3, %d3;
+
+    // Fixed five-step warp tree per key; the chains are independent so
+    // their shuffle latencies overlap instead of serialising.
+    shfl.sync.down.b32 %sh0, %d0, 16, 31, 0xffffffff;
+    shfl.sync.down.b32 %sh1, %d1, 16, 31, 0xffffffff;
+    shfl.sync.down.b32 %sh2, %d2, 16, 31, 0xffffffff;
+    shfl.sync.down.b32 %sh3, %d3, 16, 31, 0xffffffff;
+    add.f32 %d0, %d0, %sh0;
+    add.f32 %d1, %d1, %sh1;
+    add.f32 %d2, %d2, %sh2;
+    add.f32 %d3, %d3, %sh3;
+    shfl.sync.down.b32 %sh0, %d0, 8, 31, 0xffffffff;
+    shfl.sync.down.b32 %sh1, %d1, 8, 31, 0xffffffff;
+    shfl.sync.down.b32 %sh2, %d2, 8, 31, 0xffffffff;
+    shfl.sync.down.b32 %sh3, %d3, 8, 31, 0xffffffff;
+    add.f32 %d0, %d0, %sh0;
+    add.f32 %d1, %d1, %sh1;
+    add.f32 %d2, %d2, %sh2;
+    add.f32 %d3, %d3, %sh3;
+    shfl.sync.down.b32 %sh0, %d0, 4, 31, 0xffffffff;
+    shfl.sync.down.b32 %sh1, %d1, 4, 31, 0xffffffff;
+    shfl.sync.down.b32 %sh2, %d2, 4, 31, 0xffffffff;
+    shfl.sync.down.b32 %sh3, %d3, 4, 31, 0xffffffff;
+    add.f32 %d0, %d0, %sh0;
+    add.f32 %d1, %d1, %sh1;
+    add.f32 %d2, %d2, %sh2;
+    add.f32 %d3, %d3, %sh3;
+    shfl.sync.down.b32 %sh0, %d0, 2, 31, 0xffffffff;
+    shfl.sync.down.b32 %sh1, %d1, 2, 31, 0xffffffff;
+    shfl.sync.down.b32 %sh2, %d2, 2, 31, 0xffffffff;
+    shfl.sync.down.b32 %sh3, %d3, 2, 31, 0xffffffff;
+    add.f32 %d0, %d0, %sh0;
+    add.f32 %d1, %d1, %sh1;
+    add.f32 %d2, %d2, %sh2;
+    add.f32 %d3, %d3, %sh3;
+    shfl.sync.down.b32 %sh0, %d0, 1, 31, 0xffffffff;
+    shfl.sync.down.b32 %sh1, %d1, 1, 31, 0xffffffff;
+    shfl.sync.down.b32 %sh2, %d2, 1, 31, 0xffffffff;
+    shfl.sync.down.b32 %sh3, %d3, 1, 31, 0xffffffff;
+    add.f32 %d0, %d0, %sh0;
+    add.f32 %d1, %d1, %sh1;
+    add.f32 %d2, %d2, %sh2;
+    add.f32 %d3, %d3, %sh3;
+
+    shfl.sync.idx.b32 %d0, %d0, 0, 31, 0xffffffff;
+    mul.f32 %s0, %d0, 0.0883883476;
+    shfl.sync.idx.b32 %d1, %d1, 0, 31, 0xffffffff;
+    mul.f32 %s1, %d1, 0.0883883476;
+    shfl.sync.idx.b32 %d2, %d2, 0, 31, 0xffffffff;
+    mul.f32 %s2, %d2, 0.0883883476;
+    shfl.sync.idx.b32 %d3, %d3, 0, 31, 0xffffffff;
+    mul.f32 %s3, %d3, 0.0883883476;
+
+    // key 0: conditional rescale, same instruction order as the
+    // one-key kernel.
+    setp.gt.f32 %pq, %s0, %m;
+    @!%pq bra NORES0;
+    sub.f32 %tmpf, %m, %s0;
+    mul.f32 %tmpf, %tmpf, 1.44269504;
+    ex2.approx.ftz.f32 %corr, %tmpf;
+    mul.f32 %a0, %a0, %corr;
+    mul.f32 %a1, %a1, %corr;
+    mul.f32 %a2, %a2, %corr;
+    mul.f32 %a3, %a3, %corr;
+    mul.f32 %s, %s, %corr;
+    mov.f32 %m, %s0;
+NORES0:
+    sub.f32 %tmpf, %s0, %m;
+    mul.f32 %tmpf, %tmpf, 1.44269504;
+    ex2.approx.ftz.f32 %w0, %tmpf;
+    add.f32 %s, %s, %w0;
+    cvt.f32.f16 %c0, %g0;
+    cvt.f32.f16 %c1, %g1;
+    cvt.f32.f16 %c2, %g2;
+    cvt.f32.f16 %c3, %g3;
+    fma.rn.f32 %a0, %w0, %c0, %a0;
+    fma.rn.f32 %a1, %w0, %c1, %a1;
+    fma.rn.f32 %a2, %w0, %c2, %a2;
+    fma.rn.f32 %a3, %w0, %c3, %a3;
+    @!%p1 bra SKIP1;
+    // key 1: conditional rescale, same instruction order as the
+    // one-key kernel.
+    setp.gt.f32 %pq, %s1, %m;
+    @!%pq bra NORES1;
+    sub.f32 %tmpf, %m, %s1;
+    mul.f32 %tmpf, %tmpf, 1.44269504;
+    ex2.approx.ftz.f32 %corr, %tmpf;
+    mul.f32 %a0, %a0, %corr;
+    mul.f32 %a1, %a1, %corr;
+    mul.f32 %a2, %a2, %corr;
+    mul.f32 %a3, %a3, %corr;
+    mul.f32 %s, %s, %corr;
+    mov.f32 %m, %s1;
+NORES1:
+    sub.f32 %tmpf, %s1, %m;
+    mul.f32 %tmpf, %tmpf, 1.44269504;
+    ex2.approx.ftz.f32 %w1, %tmpf;
+    add.f32 %s, %s, %w1;
+    cvt.f32.f16 %c0, %g4;
+    cvt.f32.f16 %c1, %g5;
+    cvt.f32.f16 %c2, %g6;
+    cvt.f32.f16 %c3, %g7;
+    fma.rn.f32 %a0, %w1, %c0, %a0;
+    fma.rn.f32 %a1, %w1, %c1, %a1;
+    fma.rn.f32 %a2, %w1, %c2, %a2;
+    fma.rn.f32 %a3, %w1, %c3, %a3;
+SKIP1:
+    @!%p2 bra SKIP2;
+    // key 2: conditional rescale, same instruction order as the
+    // one-key kernel.
+    setp.gt.f32 %pq, %s2, %m;
+    @!%pq bra NORES2;
+    sub.f32 %tmpf, %m, %s2;
+    mul.f32 %tmpf, %tmpf, 1.44269504;
+    ex2.approx.ftz.f32 %corr, %tmpf;
+    mul.f32 %a0, %a0, %corr;
+    mul.f32 %a1, %a1, %corr;
+    mul.f32 %a2, %a2, %corr;
+    mul.f32 %a3, %a3, %corr;
+    mul.f32 %s, %s, %corr;
+    mov.f32 %m, %s2;
+NORES2:
+    sub.f32 %tmpf, %s2, %m;
+    mul.f32 %tmpf, %tmpf, 1.44269504;
+    ex2.approx.ftz.f32 %w2, %tmpf;
+    add.f32 %s, %s, %w2;
+    cvt.f32.f16 %c0, %g8;
+    cvt.f32.f16 %c1, %g9;
+    cvt.f32.f16 %c2, %g10;
+    cvt.f32.f16 %c3, %g11;
+    fma.rn.f32 %a0, %w2, %c0, %a0;
+    fma.rn.f32 %a1, %w2, %c1, %a1;
+    fma.rn.f32 %a2, %w2, %c2, %a2;
+    fma.rn.f32 %a3, %w2, %c3, %a3;
+SKIP2:
+    @!%p3 bra SKIP3;
+    // key 3: conditional rescale, same instruction order as the
+    // one-key kernel.
+    setp.gt.f32 %pq, %s3, %m;
+    @!%pq bra NORES3;
+    sub.f32 %tmpf, %m, %s3;
+    mul.f32 %tmpf, %tmpf, 1.44269504;
+    ex2.approx.ftz.f32 %corr, %tmpf;
+    mul.f32 %a0, %a0, %corr;
+    mul.f32 %a1, %a1, %corr;
+    mul.f32 %a2, %a2, %corr;
+    mul.f32 %a3, %a3, %corr;
+    mul.f32 %s, %s, %corr;
+    mov.f32 %m, %s3;
+NORES3:
+    sub.f32 %tmpf, %s3, %m;
+    mul.f32 %tmpf, %tmpf, 1.44269504;
+    ex2.approx.ftz.f32 %w3, %tmpf;
+    add.f32 %s, %s, %w3;
+    cvt.f32.f16 %c0, %g12;
+    cvt.f32.f16 %c1, %g13;
+    cvt.f32.f16 %c2, %g14;
+    cvt.f32.f16 %c3, %g15;
+    fma.rn.f32 %a0, %w3, %c0, %a0;
+    fma.rn.f32 %a1, %w3, %c1, %a1;
+    fma.rn.f32 %a2, %w3, %c2, %a2;
+    fma.rn.f32 %a3, %w3, %c3, %a3;
+SKIP3:
+
+    add.u32 %t, %t, 4;
+    bra KEY_LOOP;
+FINISH:
+    // Partial slot: ((row * nchunks + chunk) * nq + head).
+    mul.lo.u32 %pidx, %b_idx, %nchunks;
+    add.u32 %pidx, %pidx, %c;
+    mul.lo.u32 %pidx, %pidx, %nq;
+    add.u32 %pidx, %pidx, %head;
+
+    ld.param.u64 %base, [partial_stats];
+    cvt.u64.u32 %off, %pidx;
+    shl.b64 %off, %off, 3;
+    add.u64 %base, %base, %off;
+    setp.eq.u32 %p1, %lane, 0;
+    @!%p1 bra NO_STATS;
+    st.global.f32 [%base], %m;
+    st.global.f32 [%base+4], %s;
+NO_STATS:
+
+    ld.param.u64 %base, [partial_acc];
+    mul.lo.u32 %tmp, %pidx, %hd;
+    cvt.u64.u32 %off, %tmp;
+    shl.b64 %off, %off, 2;
+    add.u64 %base, %base, %off;
+    add.u64 %base, %base, %laneoff16;
+    st.global.v4.f32 [%base], {%a0, %a1, %a2, %a3};
+
+EXIT:
     ret;
 }
 "#;

@@ -11,7 +11,8 @@ use oxide_infer_core::{DeviceBuffer, GpuContext};
 use oxide_infer_kernels::batched_attn::{
     BATCHED_ARGMAX_DIRECT_PTX, BATCHED_ATTN_GATE_SCATTER_PTX, BATCHED_ATTN_PACK_Q_PTX,
     BATCHED_ATTN_SOFTMAX_MASK_PTX, BATCHED_CONV_PTR_PTX, BATCHED_EMBED_LOOKUP_PTX,
-    BATCHED_GQA_ATTENTION_ONLINE_PTX, BATCHED_GQA_ATTENTION_SPLIT_PTX, BATCHED_KV_COPY_PTX,
+    BATCHED_GQA_ATTENTION_ONLINE_PTX, BATCHED_GQA_ATTENTION_SPLIT4_PTX,
+    BATCHED_GQA_ATTENTION_SPLIT_PTX, BATCHED_KV_COPY_PTX,
     BATCHED_QK_RMSNORM_PTX, BATCHED_ROPE_PTX, BATCHED_SIGMOID_GATE_PTX, CONV_STATE_PREFILL_PTX,
 };
 use oxide_infer_kernels::PtxModule;
@@ -45,7 +46,7 @@ pub const HEAD_DIM: usize = 128;
 /// Keys per block in split-K decode attention. Fixed so chunk boundaries (and
 /// therefore the summation order) never depend on the batch composition: a
 /// row sees identical arithmetic whether it runs alone or next to 127 others.
-const ATTN_CHUNK_KEYS: usize = 256;
+const ATTN_CHUNK_KEYS: usize = 128;
 /// Largest key count a GEMM attention chunk can score. The server admits at
 /// most `MAX_SEQ_TOKENS` (8192) positions, and a chunk never needs more keys
 /// than its end position, so the score scratch is sized for this.
@@ -53,8 +54,8 @@ const MAX_ATTN_KEYS: usize = 8192;
 /// Chunks below this row count stay on the online kernel: with fewer rows the
 /// attention GEMMs are launch-bound and the SIMT kernel is cheaper.
 const GEMM_ATTN_MIN_ROWS: usize = 64;
-/// Hard cap on attention chunks; with 256-key chunks this covers 8192 tokens.
-const MAX_ATTN_CHUNKS: usize = 32;
+/// Hard cap on attention chunks; with 128-key chunks this covers 8192 tokens.
+const MAX_ATTN_CHUNKS: usize = 64;
 pub const VOCAB: usize = 128_000;
 
 /// Per-sequence GPU state needed by the batched engine.
@@ -167,6 +168,8 @@ pub struct BatchEngine {
     attn_softmax: Function,
     attn_gate_scatter: Function,
     gqa_split: Function,
+    /// Four-key-per-iteration variant; bit-identical output, more ILP.
+    gqa_split4: Function,
     gqa_combine: Function,
     sigmoid_gate: Function,
     embed: Function,
@@ -273,6 +276,8 @@ impl BatchEngine {
             .map_err(|e| anyhow!("gqa PTX: {e}"))?;
         let split_ptx = PtxModule::load_from_ptx(gpu, BATCHED_GQA_ATTENTION_SPLIT_PTX)
             .map_err(|e| anyhow!("gqa split PTX: {e}"))?;
+        let split4_ptx = PtxModule::load_from_ptx(gpu, BATCHED_GQA_ATTENTION_SPLIT4_PTX)
+            .map_err(|e| anyhow!("gqa split4 PTX: {e}"))?;
         let gate_ptx = PtxModule::load_from_ptx(gpu, BATCHED_SIGMOID_GATE_PTX)
             .map_err(|e| anyhow!("sigmoid gate PTX: {e}"))?;
         let gemm_attn_ptx = PtxModule::load_from_ptx(gpu, BATCHED_ATTN_PACK_Q_PTX)
@@ -367,6 +372,7 @@ impl BatchEngine {
             attn_softmax: softmax_ptx.get_function("batched_attn_softmax_mask_fp16")?,
             attn_gate_scatter: scatter_ptx.get_function("batched_attn_gate_scatter_fp16")?,
             gqa_split: split_ptx.get_function("batched_gqa_attention_split_fp16")?,
+            gqa_split4: split4_ptx.get_function("batched_gqa_attention_split4_fp16")?,
             gqa_combine: split_ptx.get_function("batched_gqa_attn_combine_fp16")?,
             sigmoid_gate: gate_ptx.get_function("batched_sigmoid_gate_fp16")?,
             embed: embed_ptx.get_function("batched_embed_lookup_fp16")?,
@@ -1143,9 +1149,17 @@ impl BatchEngine {
                             &mut chunk_keys as *mut _ as *mut c_void,
                             &mut nch as *mut _ as *mut c_void,
                         ];
+                        let split_fn = if std::env::var("OXIDE_ATTN_SPLIT4")
+                            .map(|v| v != "0")
+                            .unwrap_or(true)
+                        {
+                            &self.gqa_split4
+                        } else {
+                            &self.gqa_split
+                        };
                         unsafe {
                             launch_kernel_on_stream(
-                                &self.gqa_split,
+                                split_fn,
                                 (nkv, b_u32, nchunks),
                                 (hd, 1, 1),
                                 0,

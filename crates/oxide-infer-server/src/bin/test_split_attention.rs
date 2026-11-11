@@ -10,7 +10,8 @@ use cuda_core::launch_kernel_on_stream;
 use half::f16;
 use oxide_infer_core::{DeviceBuffer, GpuContext};
 use oxide_infer_kernels::batched_attn::{
-    BATCHED_GQA_ATTENTION_ONLINE_PTX, BATCHED_GQA_ATTENTION_SPLIT_PTX,
+    BATCHED_GQA_ATTENTION_ONLINE_PTX, BATCHED_GQA_ATTENTION_SPLIT4_PTX,
+    BATCHED_GQA_ATTENTION_SPLIT_PTX,
 };
 use oxide_infer_kernels::PtxModule;
 use std::ffi::c_void;
@@ -20,8 +21,8 @@ const NKV: usize = 4;
 const HD: usize = 128;
 const MAX_SEQ: usize = 300;
 const ROWS: [usize; 4] = [300, 180, 64, 300];
-const CHUNK_KEYS: u32 = 64;
-const NCHUNKS: usize = 5; // ceil(MAX_SEQ / CHUNK_KEYS)
+const CHUNK_KEYS: u32 = 128;
+const NCHUNKS: usize = 3; // ceil(MAX_SEQ / CHUNK_KEYS)
 const SCALE: f64 = 0.0883883476;
 
 fn pat(seed: u64, idx: usize) -> f32 {
@@ -88,6 +89,9 @@ fn main() -> Result<()> {
         .map_err(|e| anyhow!("split PTX: {e}"))?;
     let split = split_mod.get_function("batched_gqa_attention_split_fp16")?;
     let combine = split_mod.get_function("batched_gqa_attn_combine_fp16")?;
+    let split4_mod = PtxModule::load_from_ptx(&gpu, BATCHED_GQA_ATTENTION_SPLIT4_PTX)
+        .map_err(|e| anyhow!("split4 PTX: {e}"))?;
+    let split4 = split4_mod.get_function("batched_gqa_attention_split4_fp16")?;
 
     let nrows = ROWS.len();
 
@@ -122,6 +126,7 @@ fn main() -> Result<()> {
     let mut d_stats = DeviceBuffer::<f32>::zeroed(&gpu, nrows * NCHUNKS * NQ * 2)?;
     let mut d_ctx = DeviceBuffer::<f16>::zeroed(&gpu, NQ * HD)?;
     let mut d_occ = DeviceBuffer::<f16>::zeroed(&gpu, nrows * NQ * HD)?;
+    let mut d_occ4 = DeviceBuffer::<f16>::zeroed(&gpu, nrows * NQ * HD)?;
 
     let mut failed = false;
     for window in [0u32, 256] {
@@ -159,7 +164,17 @@ fn main() -> Result<()> {
         }
 
         // --- split + combine over all rows at once ---
-        let nchunks = NCHUNKS as u32;
+        // Mirror the engine's grid sizing exactly: ceil(min(slen, window) /
+        // chunk_keys) chunks, maximised over the rows (window 0 = full).
+        let nchunks = ROWS
+            .iter()
+            .map(|&s| {
+                let eff = if window == 0 { s } else { s.min(window as usize) };
+                eff.div_ceil(CHUNK_KEYS as usize)
+            })
+            .max()
+            .unwrap()
+            .max(1) as u32;
         {
             let mut d_qp = d_qall.inner().cu_deviceptr();
             let mut d_kpp = d_kp.inner().cu_deviceptr();
@@ -213,6 +228,92 @@ fn main() -> Result<()> {
         }
         stream.synchronize()?;
         let occ = d_occ.inner().to_host_vec(stream)?;
+        let acc_split: Vec<f32> = d_acc.inner().to_host_vec(stream)?;
+        let stats_split: Vec<f32> = d_stats.inner().to_host_vec(stream)?;
+
+        // --- four-key variant must reproduce those partials bit for bit ---
+        {
+            let mut d_qp = d_qall.inner().cu_deviceptr();
+            let mut d_kpp = d_kp.inner().cu_deviceptr();
+            let mut d_vpp = d_vp.inner().cu_deviceptr();
+            let mut d_slp = d_sl.inner().cu_deviceptr();
+            let mut d_accp = d_acc.inner_mut().cu_deviceptr();
+            let mut d_stp = d_stats.inner_mut().cu_deviceptr();
+            let (mut nq, mut nkv, mut hd) = (NQ as u32, NKV as u32, HD as u32);
+            let mut b = nrows as u32;
+            let mut w = window;
+            let mut ck = CHUNK_KEYS;
+            let mut nc = nchunks;
+            let mut args: [*mut c_void; 13] = [
+                &mut d_qp as *mut _ as *mut c_void,
+                &mut d_kpp as *mut _ as *mut c_void,
+                &mut d_vpp as *mut _ as *mut c_void,
+                &mut d_slp as *mut _ as *mut c_void,
+                &mut d_accp as *mut _ as *mut c_void,
+                &mut d_stp as *mut _ as *mut c_void,
+                &mut nq as *mut _ as *mut c_void,
+                &mut nkv as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut b as *mut _ as *mut c_void,
+                &mut w as *mut _ as *mut c_void,
+                &mut ck as *mut _ as *mut c_void,
+                &mut nc as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                launch_kernel_on_stream(&split4, (NKV as u32, b, nc), (HD as u32, 1, 1), 0, stream, &mut args)?;
+            }
+        }
+        {
+            let mut d_ctxp = d_occ4.inner_mut().cu_deviceptr();
+            let mut d_accp = d_acc.inner_mut().cu_deviceptr();
+            let mut d_stp = d_stats.inner_mut().cu_deviceptr();
+            let (mut nq, mut hd) = (NQ as u32, HD as u32);
+            let mut b = nrows as u32;
+            let mut nc = nchunks;
+            let mut args: [*mut c_void; 7] = [
+                &mut d_ctxp as *mut _ as *mut c_void,
+                &mut d_accp as *mut _ as *mut c_void,
+                &mut d_stp as *mut _ as *mut c_void,
+                &mut nq as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut b as *mut _ as *mut c_void,
+                &mut nc as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                launch_kernel_on_stream(&combine, (nq, b, 1), (32, 1, 1), 0, stream, &mut args)?;
+            }
+        }
+        stream.synchronize()?;
+        let acc4: Vec<f32> = d_acc.inner().to_host_vec(stream)?;
+        let stats4: Vec<f32> = d_stats.inner().to_host_vec(stream)?;
+        let occ4 = d_occ4.inner().to_host_vec(stream)?;
+        let bits = |a: &[f32], b: &[f32]| a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+        let n_acc = bits(&acc_split, &acc4);
+        let n_stats = bits(&stats_split, &stats4);
+        let n_ctx = occ
+            .iter()
+            .zip(occ4.iter())
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        if n_stats != 0 {
+            for (i, (a, b)) in stats_split.iter().zip(&stats4).enumerate() {
+                if a.to_bits() != b.to_bits() {
+                    let slot = i / 2;
+                    let which = if i % 2 == 0 { "m" } else { "s" };
+                    let head = slot % NQ;
+                    let chunk = (slot / NQ) % nchunks as usize;
+                    let row = slot / (NQ * nchunks as usize);
+                    println!("   stat diff row {row} chunk {chunk} head {head} {which}: {a:e} vs {b:e}");
+                }
+            }
+        }
+        let same = n_acc == 0 && n_stats == 0 && n_ctx == 0;
+        failed |= !same;
+        println!(
+            "window={window:4} split4 vs split: differing acc {n_acc}/{} stats {n_stats}/{} ctx {n_ctx}/{} {}",
+            acc4.len(), stats4.len(), occ4.len(),
+            if same { "BIT-IDENTICAL" } else { "MISMATCH" }
+        );
 
         for (r, &slen) in ROWS.iter().enumerate() {
             let want = reference(&qh[r * NQ * HD..(r + 1) * NQ * HD], &kv[r].0, &kv[r].1, slen, window);
