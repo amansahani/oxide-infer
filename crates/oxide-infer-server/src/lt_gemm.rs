@@ -17,6 +17,18 @@ use std::ffi::c_void;
 use std::ptr;
 
 pub type CublasStatus = i32;
+
+/// One heuristic algorithm candidate, timed at several batch sizes.
+pub struct AlgoCandidate {
+    pub index: usize,
+    pub times_ms: Vec<f64>,
+    /// Max difference of the first output column between the smallest and
+    /// largest timed `n`; zero means the candidate is batch-shape invariant
+    /// on this shape.
+    pub col0_diff: f32,
+    pub waves: f32,
+    pub workspace: usize,
+}
 type Handle = *mut c_void;
 type Desc = *mut c_void;
 
@@ -43,6 +55,7 @@ struct LtAlgo {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct LtHeuristic {
     algo: LtAlgo,
     workspace_size: usize,
@@ -570,6 +583,209 @@ impl LtGemm {
             },
             "cublasLtMatmul(strided)",
         )
+    }
+
+    /// Create the cuBLASLt config for every weight shape and run one tiny
+    /// matmul on each.
+    ///
+    /// The first real matmul of a shape pays the heuristic search plus the
+    /// lazy load of the algorithm's kernel module, and that cost lands inside
+    /// the first prefill wave (measured ~150 ms for the whole layer set). The
+    /// dummy runs move it to engine construction, where it is invisible to a
+    /// request's latency. The column count here does not matter: the config is
+    /// keyed by `(m, k)` and the reduction order is fixed by the algorithm, not
+    /// by `n`, which is the property the engine relies on.
+    pub fn warm(&mut self, gpu: &GpuContext, shapes: &[(usize, usize)]) -> Result<()> {
+        let stream = gpu.compute_stream().clone();
+        let n = 8usize;
+        for &(m, k) in shapes {
+            let a = DeviceBuffer::<f16>::zeroed(gpu, m * k)?;
+            let b = DeviceBuffer::<f16>::zeroed(gpu, k * n)?;
+            let mut c = DeviceBuffer::<f16>::zeroed(gpu, m * n)?;
+            self.gemm(
+                &stream,
+                m,
+                k,
+                n,
+                a.inner().cu_deviceptr(),
+                b.inner().cu_deviceptr(),
+                c.inner_mut().cu_deviceptr(),
+            )?;
+        }
+        stream.synchronize()?;
+        Ok(())
+    }
+
+    /// Enumerate the heuristic's algorithm candidates for `(m, k)` and time
+    /// each at several batch sizes. Benchmark-only: the production path keeps
+    /// index 0 (`OXIDE_LT_ALGO_INDEX` selects another for experiments).
+    ///
+    /// Every candidate uses one algorithm for all `n`, so each one is a
+    /// legitimate batch-invariant choice; this only asks which of them is
+    /// fastest at the batch sizes the decoder actually sees. `col0_diff`
+    /// re-runs the extremes and compares the first output column bitwise, so
+    /// a candidate whose reduction order shifts with `n` is visible.
+    pub fn bench_candidates(
+        &self,
+        gpu: &GpuContext,
+        m: usize,
+        k: usize,
+        ns: &[usize],
+        top: i32,
+        reps: usize,
+    ) -> Result<Vec<AlgoCandidate>> {
+        let algo_n = std::env::var("OXIDE_LT_ALGO_N")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(32)
+            .clamp(1, self.max_batch) as u64;
+        let mut a_desc = ptr::null_mut();
+        let mut b_desc = ptr::null_mut();
+        let mut c_desc = ptr::null_mut();
+        status(
+            unsafe { cublasLtMatrixLayoutCreate(&mut a_desc, CUDA_R_16F, k as u64, m as u64, k as i64) },
+            "cublasLtMatrixLayoutCreate(A)",
+        )?;
+        status(
+            unsafe { cublasLtMatrixLayoutCreate(&mut b_desc, CUDA_R_16F, k as u64, algo_n, k as i64) },
+            "cublasLtMatrixLayoutCreate(B)",
+        )?;
+        status(
+            unsafe { cublasLtMatrixLayoutCreate(&mut c_desc, CUDA_R_16F, m as u64, algo_n, m as i64) },
+            "cublasLtMatrixLayoutCreate(C)",
+        )?;
+
+        let mut pref = ptr::null_mut();
+        status(unsafe { cublasLtMatmulPreferenceCreate(&mut pref) }, "pref create")?;
+        let ws = self.workspace_size;
+        status(
+            unsafe {
+                cublasLtMatmulPreferenceSetAttribute(
+                    pref,
+                    CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                    &ws as *const usize as *const c_void,
+                    std::mem::size_of::<usize>(),
+                )
+            },
+            "pref workspace",
+        )?;
+        let mut results = vec![
+            LtHeuristic { algo: LtAlgo { data: [0; 8] }, workspace_size: 0, state: -1, waves_count: 0.0, reserved: [0; 4] };
+            top.max(1) as usize
+        ];
+        let mut count = 0i32;
+        status(
+            unsafe {
+                cublasLtMatmulAlgoGetHeuristic(
+                    self.handle, self.op_desc, a_desc, b_desc, c_desc, c_desc,
+                    pref, top, results.as_mut_ptr(), &mut count,
+                )
+            },
+            "algo heuristic (candidates)",
+        )?;
+        unsafe { cublasLtMatmulPreferenceDestroy(pref) };
+        results.truncate(count.max(0) as usize);
+
+        // Non-zero operands: the invariance check compares real values.
+        let pat = |i: usize, seed: u64| -> f16 {
+            let mut x = seed.wrapping_mul(6364136223846793005).wrapping_add(i as u64);
+            x ^= x >> 33;
+            x = x.wrapping_mul(0xff51afd7ed558ccd);
+            x ^= x >> 33;
+            f16::from_f32(((x & 0xffff) as f32 / 32767.5) - 1.0)
+        };
+        let a_host: Vec<f16> = (0..m * k).map(|i| pat(i, 7)).collect();
+        let max_n = *ns.iter().max().unwrap_or(&1);
+        let b_host: Vec<f16> = (0..k * max_n).map(|i| pat(i, 11)).collect();
+        let d_a = DeviceBuffer::from_slice(gpu, &a_host)?;
+        let d_b = DeviceBuffer::from_slice(gpu, &b_host)?;
+        let mut d_c = DeviceBuffer::<f16>::zeroed(gpu, m * max_n)?;
+        let ev0 = gpu.context().new_event()?;
+        let ev1 = gpu.context().new_event()?;
+
+        let set_cols = |cols: u64| -> Result<()> {
+            for desc in [b_desc, c_desc] {
+                status(
+                    unsafe {
+                        cublasLtMatrixLayoutSetAttribute(
+                            desc, CUBLASLT_MATRIX_LAYOUT_COLS,
+                            &cols as *const u64 as *const c_void, std::mem::size_of::<u64>(),
+                        )
+                    },
+                    "set cols",
+                )?;
+            }
+            Ok(())
+        };
+        let (alpha_f32, beta_f32) = (1.0f32, 0.0f32);
+        let launch = |algo: &LtAlgo, n: usize| -> Result<()> {
+            status(
+                unsafe {
+                    cublasLtMatmul(
+                        self.handle, self.op_desc,
+                        &alpha_f32 as *const f32 as *const c_void,
+                        d_a.inner().cu_deviceptr() as *const c_void, a_desc,
+                        d_b.inner().cu_deviceptr() as *const c_void, b_desc,
+                        &beta_f32 as *const f32 as *const c_void,
+                        d_c.inner().cu_deviceptr() as *const c_void, c_desc,
+                        d_c.inner().cu_deviceptr() as *mut c_void, c_desc,
+                        algo,
+                        self.workspace.inner().cu_deviceptr() as *mut c_void,
+                        self.workspace_size,
+                        gpu.compute_stream().cu_stream() as *mut c_void,
+                    )
+                },
+                "cublasLtMatmul(bench)",
+            )?;
+            let _ = n;
+            Ok(())
+        };
+
+        let stream = gpu.compute_stream().clone();
+        let mut out = Vec::with_capacity(results.len());
+        for (index, cand) in results.iter().enumerate() {
+            let mut times = Vec::with_capacity(ns.len());
+            let mut col0 = Vec::new();
+            for &n in ns {
+                set_cols(n as u64)?;
+                for _ in 0..3 {
+                    launch(&cand.algo, n)?;
+                }
+                stream.synchronize()?;
+                let mut v = Vec::with_capacity(reps);
+                for _ in 0..reps {
+                    ev0.record(&stream)?;
+                    launch(&cand.algo, n)?;
+                    ev1.record(&stream)?;
+                    ev1.synchronize()?;
+                    v.push(ev0.elapsed_time(&ev1)? as f64);
+                }
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                times.push(v[v.len() / 2]);
+                if n == 1 || n == max_n {
+                    let host = d_c.inner().to_host_vec(&stream)?;
+                    col0.push(host[..m].iter().map(|x| x.to_f32()).collect::<Vec<_>>());
+                }
+            }
+            let diff = if col0.len() == 2 {
+                col0[0].iter().zip(&col0[1]).fold(0f32, |acc, (a, b)| acc.max((a - b).abs()))
+            } else {
+                0.0
+            };
+            out.push(AlgoCandidate {
+                index,
+                times_ms: times,
+                col0_diff: diff,
+                waves: cand.waves_count,
+                workspace: cand.workspace_size,
+            });
+        }
+        unsafe {
+            cublasLtMatrixLayoutDestroy(a_desc);
+            cublasLtMatrixLayoutDestroy(b_desc);
+            cublasLtMatrixLayoutDestroy(c_desc);
+        }
+        Ok(out)
     }
 
     /// Compute `C[m, n] = A[m, k] * B[k, n]` for column-major operands.

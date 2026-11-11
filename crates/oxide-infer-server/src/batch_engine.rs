@@ -198,7 +198,7 @@ where
 /// the seven per-layer boundaries, so the segments are: operator norm,
 /// qkv/in-proj gemm, attention setup (or conv state prep), attention (or conv)
 /// kernel, out-proj gemm, ffn gemms + swiglu, post-ffn norm + residual.
-fn report_phases(ev: &[CudaEvent], n_layers: usize, rows: usize) {
+fn report_phases(ev: &[CudaEvent], n_layers: usize, rows: usize, is_conv: &[bool]) {
     // `elapsed_time` rejects an unfinished end event, and the prefill path
     // returns without a synchronize, so wait once here (profiling only).
     if let Some(last) = ev.last() {
@@ -219,6 +219,23 @@ fn report_phases(ev: &[CudaEvent], n_layers: usize, rows: usize) {
     }
     let total = ev[0].elapsed_time(&ev[ev.len() - 1]).unwrap_or(0.0) as f64;
     let sum: f64 = cats.iter().sum();
+    if std::env::var("OXIDE_PROFILE_LAYERS").is_ok() && rows == 1 {
+        for i in 0..n_layers {
+            let base = 1 + i * 7;
+            let mut prev = if i == 0 { 0 } else { base - 1 };
+            let mut seg = [0f64; 7];
+            for (k, c) in seg.iter_mut().enumerate() {
+                *c = ev[prev].elapsed_time(&ev[base + k]).unwrap_or(0.0) as f64;
+                prev = base + k;
+            }
+            eprintln!(
+                "[layer] {:3} {:4} norm={:5.2} qkv={:6.2} setup={:5.2} attn={:6.2} oproj={:5.2} ffn={:6.2} post={:5.2}",
+                i,
+                if is_conv[i] { "conv" } else { "attn" },
+                seg[0], seg[1], seg[2], seg[3], seg[4], seg[5], seg[6]
+            );
+        }
+    }
     eprintln!(
         "[phases] rows={rows:4} op_norm={:6.1} qkv={:6.1} setup={:6.1} attn={:6.1} oproj={:6.1} ffn={:6.1} post={:5.1} other={:5.1} total={:7.1} ms",
         cats[0], cats[1], cats[2], cats[3], cats[4], cats[5], cats[6], total - sum, total
@@ -319,7 +336,20 @@ impl BatchEngine {
             pf_pos: DeviceBuffer::<u32>::zeroed(gpu, b).map_err(|e| anyhow!("alloc: {e}"))?,
         };
 
-        let lt = LtGemm::new(gpu, max_batch)?;
+        let mut lt = LtGemm::new(gpu, max_batch)?;
+        // Pay the cuBLASLt algorithm search and kernel-module load for every
+        // weight shape here instead of inside the first prefill wave.
+        lt.warm(
+            gpu,
+            &[
+                (3 * HIDDEN, HIDDEN),
+                (HIDDEN, HIDDEN),
+                (KV_DIM, HIDDEN),
+                (NUM_Q_HEADS, HIDDEN),
+                (INTER, HIDDEN),
+                (HIDDEN, INTER),
+            ],
+        )?;
         Ok(Self {
             scratch,
             max_batch,
@@ -1255,7 +1285,7 @@ impl BatchEngine {
                 }
             }
             if prof {
-                report_phases(&prof_ev[..mark], layers.len(), b);
+                report_phases(&prof_ev[..mark], layers.len(), b, is_conv);
             }
             return Ok(Vec::new());
         }
@@ -1264,7 +1294,7 @@ impl BatchEngine {
         let mut out = self.sample_tail(gpu, b_u32, embed_table, emb_norm, stream)?;
 
         if prof {
-            report_phases(&prof_ev[..mark], layers.len(), b);
+            report_phases(&prof_ev[..mark], layers.len(), b, is_conv);
         }
         out.truncate(b);
         Ok(out)

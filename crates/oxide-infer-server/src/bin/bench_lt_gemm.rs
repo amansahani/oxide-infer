@@ -43,8 +43,42 @@ fn bench(
     Ok(t0.elapsed().as_secs_f64() / s.reps as f64)
 }
 
+fn candidates(gpu: &GpuContext) -> Result<()> {
+    let lt = LtGemm::new(gpu, 1024)?;
+    let ns = [1usize, 8, 32, 128];
+    println!("algorithm candidates per weight shape (median ms, 30 reps), col0 diff = invariance");
+    for &(name, m, k) in &[
+        ("q   2048x2048", 2048usize, 2048usize),
+        ("k    512x2048", 512, 2048),
+        ("v    512x2048", 512, 2048),
+        ("gate  16x2048", 16, 2048),
+        ("o   2048x2048", 2048, 2048),
+        ("ffn 7680x2048", 7680, 2048),
+        ("dn  2048x7680", 2048, 7680),
+    ] {
+        let cands = lt.bench_candidates(gpu, m, k, &ns, 8, 30)?;
+        println!("{name}:");
+        for c in &cands {
+            let t: Vec<String> = c.times_ms.iter().map(|x| format!("{x:7.3}")).collect();
+            println!(
+                "  idx {}{} waves {:5.1} ws {:7} col0diff {:.1e} | n=1 {} n=8 {} n=32 {} n=128 {}",
+                c.index,
+                if c.index == 0 { " *" } else { "  " },
+                c.waves,
+                c.workspace,
+                c.col0_diff,
+                t[0], t[1], t[2], t[3]
+            );
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let gpu = GpuContext::init(0)?;
+    if std::env::args().any(|a| a == "--candidates") {
+        return candidates(&gpu);
+    }
     let stream = gpu.compute_stream().clone();
     let mut lt = LtGemm::new(&gpu, 1024)?;
 
