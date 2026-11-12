@@ -1,0 +1,21 @@
+# Production quantized GEMV kernels for oxide-infer, compiled by cuda-oxide
+# (pure Rust -> PTX). Standalone workspace, pinned via rust-toolchain.toml.
+# The generated PTX is committed to the repo (gemv.ptx) and embedded by the
+# engine; regenerate with:
+#   <path-to-cuda-oxide-checkout>/cuda-oxide/target/debug/cargo-oxide run .
+[package]
+name = "quant_gemv"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace]
+
+[dependencies]
+cuda-device = { path = "../../../cuda-oxide/cuda-oxide/crates/cuda-device" }
+cuda-host = { path = "../../../cuda-oxide/cuda-oxide/crates/cuda-host" }
+cuda-core = { path = "../../../cuda-oxide/cuda-core" }
+half = "2.4"
+ptx-parse = { path = "../../../cuda-oxide/cuda-oxide/crates/ptx-parse" }
+
+oxide-infer-core = { path = "../../crates/oxide-infer-core" }
