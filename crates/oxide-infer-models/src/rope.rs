@@ -97,6 +97,51 @@ EXIT:
 }
 "#;
 
+/// Process-wide cache of RoPE tables.
+///
+/// A table depends only on `(theta, partial factor, window, max_seq_len)` and
+/// is read-only at inference, so layers that share those parameters can share
+/// one allocation. LFM3 has only two distinct configurations (full attention:
+/// theta 1e6, partial 0.5; sliding: theta 1e4, partial 1.0), so 11 tables
+/// collapse to 2. At a 262144-token limit that is 1.48 GiB -> 0.27 GiB.
+static ROPE_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(u32, u32, u32, usize), std::sync::Arc<RotaryEmbeddingTable>>>,
+> = std::sync::OnceLock::new();
+
+/// Get the shared table for these parameters, creating it on first use.
+pub fn shared_rope_table(
+    gpu: &GpuContext,
+    max_seq_len: usize,
+    head_dim: usize,
+    rope_theta: f32,
+    partial_rotary_factor: f32,
+    window: u32,
+) -> Result<std::sync::Arc<RotaryEmbeddingTable>> {
+    let key = (
+        rope_theta.to_bits(),
+        partial_rotary_factor.to_bits(),
+        window,
+        max_seq_len,
+    );
+    let mut cache = ROPE_CACHE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .expect("rope cache lock");
+    if let Some(t) = cache.get(&key) {
+        return Ok(t.clone());
+    }
+    let table = std::sync::Arc::new(RotaryEmbeddingTable::new(
+        gpu,
+        max_seq_len,
+        head_dim,
+        rope_theta,
+        partial_rotary_factor,
+        window,
+    )?);
+    cache.insert(key, table.clone());
+    Ok(table)
+}
+
 pub struct RotaryEmbeddingTable {
     pub cos_table: DeviceBuffer<half::f16>,
     pub sin_table: DeviceBuffer<half::f16>,

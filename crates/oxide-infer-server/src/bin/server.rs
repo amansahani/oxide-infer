@@ -147,6 +147,27 @@ fn max_batch_size() -> usize {
 /// the mismatch as an error rather than truncating context). The KV pool
 /// must also hold the sequence: 22,528 bytes per token at 11 attention
 /// layers. Default keeps the original 8k footprint.
+/// Print device memory used/total after a startup stage. Off unless
+/// `OXIDE_VRAM_REPORT=1`; used to attribute the footprint to weights, engine
+/// scratch, KV pool and CUDA context instead of guessing.
+fn vram_used(tag: &str) {
+    if std::env::var("OXIDE_VRAM_REPORT").is_err() {
+        return;
+    }
+    unsafe {
+        let mut free: usize = 0;
+        let mut total: usize = 0;
+        let rc = cuda_core::sys::cuMemGetInfo_v2(&mut free as *mut _, &mut total as *mut _);
+        if rc == 0 {
+            eprintln!(
+                "[vram] {tag:22} used {:6.2} GiB / {:6.2} GiB",
+                (total - free) as f64 / 1073741824.0,
+                total as f64 / 1073741824.0
+            );
+        }
+    }
+}
+
 fn max_seq_tokens() -> usize {
     std::env::var("OXIDE_MAX_SEQ_TOKENS")
         .ok()
@@ -183,27 +204,44 @@ async fn main() -> anyhow::Result<()> {
     println!("[1/3] Initializing Tokenizer from {}...", tokenizer_path);
     let tokenizer = Arc::new(OxideTokenizer::from_file(&tokenizer_path)?);
 
-    println!("[2/3] Initializing GPU Context & Single Shared Model Weights (2.88 GB)...");
+    let ckpt_bytes = std::fs::metadata(&weights_path)?.len();
+    println!(
+        "[2/3] Initializing GPU Context & Single Shared Model Weights ({:.2} GiB)...",
+        ckpt_bytes as f64 / 1073741824.0
+    );
     let gpu = Arc::new(GpuContext::init(0)?);
     let stream = gpu.compute_stream();
+    vram_used("cuda context");
 
     let loader = SafeTensorsLoader::open(&weights_path)?;
-    let embed_bf16 = loader.load_tensor::<half::bf16>(&gpu, "model.language_model.embed_tokens.weight")?;
-    let host_bf16 = embed_bf16.inner().to_host_vec(stream)?;
-    let host_f16: Vec<half::f16> = host_bf16.into_iter().map(|b| half::f16::from_f32(b.to_f32())).collect();
-    let embed_table = Arc::new(EmbeddingTable::new(&gpu, &host_f16, 128000, 2048)?);
+    // The bf16 staging copy must not outlive the conversion: it is a full
+    // 128000x2048 f16 duplicate (0.49 GiB) and, being bound in this scope,
+    // would otherwise stay resident for the life of the process.
+    let embed_table = Arc::new({
+        let embed_bf16 =
+            loader.load_tensor::<half::bf16>(&gpu, "model.language_model.embed_tokens.weight")?;
+        let host_bf16 = embed_bf16.inner().to_host_vec(stream)?;
+        let host_f16: Vec<half::f16> =
+            host_bf16.into_iter().map(|b| half::f16::from_f32(b.to_f32())).collect();
+        EmbeddingTable::new(&gpu, &host_f16, 128000, 2048)?
+    });
     let mut lm_head = TiedLmHead::new(&gpu, 128000, 2048)?;
+    vram_used("embed + lm_head");
 
-    let norm_bf16 = loader.load_tensor::<half::bf16>(&gpu, "model.language_model.embedding_norm.weight")?;
-    let norm_f16: Vec<half::f16> = norm_bf16.inner().to_host_vec(stream)?
-        .into_iter().map(|b| half::f16::from_f32(b.to_f32())).collect();
-    let embedding_norm = Arc::new(DeviceBuffer::from_slice(&gpu, &norm_f16)?);
+    let embedding_norm = Arc::new({
+        let norm_bf16 =
+            loader.load_tensor::<half::bf16>(&gpu, "model.language_model.embedding_norm.weight")?;
+        let norm_f16: Vec<half::f16> = norm_bf16.inner().to_host_vec(stream)?
+            .into_iter().map(|b| half::f16::from_f32(b.to_f32())).collect();
+        DeviceBuffer::from_slice(&gpu, &norm_f16)?
+    });
     let norm_ptx = Arc::new(PtxModule::load_from_ptx(&gpu, RMS_NORM_FP16_PTX)?);
     let rms_func = norm_ptx.get_function("rms_norm_fp16")?;
     let mut d_logits = DeviceBuffer::<f32>::zeroed(&gpu, 128000)?;
 
     println!("      Loading VisionTower & MultiModal Projector...");
     let vision_tower = VisionTower::load_from_safetensors(&gpu, &loader)?;
+    vram_used("vision tower");
     let preprocessor = VisionPreprocessor::default();
 
     let layer_types = [
@@ -221,6 +259,7 @@ async fn main() -> anyhow::Result<()> {
         let layer = FullLfm3DecoderLayer::load_from_safetensors(&gpu, &loader, idx, is_attn, is_sliding, 2048, 7680)?;
         layers.push(layer);
     }
+    vram_used("24 layers loaded");
     println!("      All weights loaded into GPU VRAM.\n");
 
     println!("[3/3] Setting up dynamic continuous batch pool (Max capacity: {} concurrent sequences)...", max_batch_size());
@@ -629,6 +668,7 @@ FINISH:
         } else {
             Some(BatchEngine::new(&gpu_clone, max_batch_size(), prefill_rows()).expect("batched engine init"))
         };
+        vram_used("batch engine");
         let is_conv: Vec<bool> = layer_types.iter().map(|t| *t == "conv").collect();
 
         // Pre-allocated KV + conv-state slabs (see kv_pool.rs). The default
@@ -642,6 +682,7 @@ FINISH:
         let pool_tokens = (pool_mb * 1024 * 1024) / (n_attn * 2 * KV_DIM * 2);
         let mut kv_pool = KvPool::new(&gpu_clone, &is_conv, max_batch_size(), pool_tokens)
             .expect("kv pool init");
+        vram_used("kv pool");
         println!(
             "[pool] KV slab {} MiB / {} tokens across {} attention layers, {} conv slots",
             (kv_pool.capacity_tokens() * n_attn * 2 * KV_DIM * 2) / (1024 * 1024),

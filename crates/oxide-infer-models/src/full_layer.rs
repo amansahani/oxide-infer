@@ -1116,7 +1116,7 @@ pub struct FullLfm3DecoderLayer {
     pub norm_ptx: PtxModule,
     pub add_ptx: PtxModule,
     pub hidden_size: usize,
-    pub rope: Option<RotaryEmbeddingTable>,
+    pub rope: Option<std::sync::Arc<RotaryEmbeddingTable>>,
     pub gqa: Option<GqaAttentionEngine>,
     pub k_cache: Option<DeviceBuffer<half::f16>>,
     pub v_cache: Option<DeviceBuffer<half::f16>>,
@@ -1163,6 +1163,16 @@ impl FullLfm3DecoderLayer {
         hidden_size: usize,
         intermediate_size: usize,
     ) -> Result<Self> {
+        // RoPE tables are pure functions of (theta, partial factor, window)
+        // and position, and are read-only at inference. Size them to the
+        // server's sequence limit rather than a hard 131072: at the default
+        // 8192 that is 11 layers x 2 tables x 64 MiB -> 8 MiB, a 0.68 GiB
+        // saving. `OXIDE_MAX_SEQ_TOKENS` must match the server's admission
+        // limit or a long position would index past the table.
+        let max_seq_tokens = std::env::var("OXIDE_MAX_SEQ_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(8192);
         let stream = gpu.compute_stream();
         let convert_bf16_to_f16 = |buf: &DeviceBuffer<half::bf16>| -> Result<DeviceBuffer<half::f16>> {
             let host_bf16 = buf.inner().to_host_vec(stream)?;
@@ -1189,12 +1199,23 @@ impl FullLfm3DecoderLayer {
                 0
             };
             let rope_table =
-                RotaryEmbeddingTable::new(gpu, 131072, 128, theta, partial_factor, window)?;
+                crate::rope::shared_rope_table(
+                    gpu, max_seq_tokens, 128, theta, partial_factor, window,
+                )?;
             let gqa_engine = GqaAttentionEngine::new(gpu)?;
-            // Cache for up to 131072 tokens: 4 kv heads * 128 head_dim = 512 elements per token
-            let kc = DeviceBuffer::<half::f16>::zeroed(gpu, 4096 * 512)?;
-            let vc = DeviceBuffer::<half::f16>::zeroed(gpu, 4096 * 512)?;
-            (LayerType::Attention(attn), Some(rope_table), Some(gqa_engine), Some(kc), Some(vc))
+            // Per-layer KV caches exist only for the scalar forward path;
+            // the batched engine keeps its sequences in the shared KV pool.
+            // Skip them (11 layers x 8 MiB) when the batched engine is used.
+            let scalar = std::env::var("OXIDE_SCALAR_BATCH").is_ok();
+            let (kc, vc) = if scalar {
+                (
+                    Some(DeviceBuffer::<half::f16>::zeroed(gpu, 4096 * 512)?),
+                    Some(DeviceBuffer::<half::f16>::zeroed(gpu, 4096 * 512)?),
+                )
+            } else {
+                (None, None)
+            };
+            (LayerType::Attention(attn), Some(rope_table), Some(gqa_engine), kc, vc)
         } else {
             let conv = CausalConvLayer::load_from_safetensors(
                 gpu, loader, layer_idx, hidden_size, 7,
