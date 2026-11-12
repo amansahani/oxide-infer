@@ -94,11 +94,16 @@ mod kernels {
             let mut i = 0usize;
             while i < 16 {
                 let byte = packed[off + 2 + i];
-                let x0 = f16::from_bits(x[x_base + 2 * i]) as f32;
-                let x1 = f16::from_bits(x[x_base + 2 * i + 1]) as f32;
+                let x0 = f16::from_bits(x[x_base + i]) as f32;
                 let w0 = d * ((byte & 0x0F) as f32 - 8.0);
-                let w1 = d * (((byte >> 4) & 0x0F) as f32 - 8.0);
                 acc = float::fma_rn_f32(w0, x0, acc);
+                i += 1;
+            }
+            let mut i = 0usize;
+            while i < 16 {
+                let byte = packed[off + 2 + i];
+                let x1 = f16::from_bits(x[x_base + 16 + i]) as f32;
+                let w1 = d * (((byte >> 4) & 0x0F) as f32 - 8.0);
                 acc = float::fma_rn_f32(w1, x1, acc);
                 i += 1;
             }
@@ -121,11 +126,16 @@ mod kernels {
             let mut i = 0usize;
             while i < 16 {
                 let byte = packed[off + 4 + i];
-                let x0 = f16::from_bits(x[x_base + 2 * i]) as f32;
-                let x1 = f16::from_bits(x[x_base + 2 * i + 1]) as f32;
+                let x0 = f16::from_bits(x[x_base + i]) as f32;
                 let w0 = d * (byte & 0x0F) as f32 + m;
-                let w1 = d * ((byte >> 4) & 0x0F) as f32 + m;
                 acc = float::fma_rn_f32(w0, x0, acc);
+                i += 1;
+            }
+            let mut i = 0usize;
+            while i < 16 {
+                let byte = packed[off + 4 + i];
+                let x1 = f16::from_bits(x[x_base + 16 + i]) as f32;
+                let w1 = d * ((byte >> 4) & 0x0F) as f32 + m;
                 acc = float::fma_rn_f32(w1, x1, acc);
                 i += 1;
             }
@@ -147,13 +157,18 @@ mod kernels {
             let mut j = 0usize;
             while j < 16 {
                 let xh_0 = ((qh >> (j + 0)) << 4) & 0x10;
-                let xh_1 = ((qh >> (j + 12)) & 0x10) << 0;
                 let byte = packed[off + 6 + j];
                 let x0 = (((byte & 0x0F) as u32 | xh_0) as f32 - 16.0) * d;
-                let x1 = (((byte >> 4) as u32 | xh_1) as f32 - 16.0) * d;
-                let xi0 = f16::from_bits(x[x_base + 2 * j]) as f32;
-                let xi1 = f16::from_bits(x[x_base + 2 * j + 1]) as f32;
+                let xi0 = f16::from_bits(x[x_base + j]) as f32;
                 acc = float::fma_rn_f32(x0, xi0, acc);
+                j += 1;
+            }
+            let mut j = 0usize;
+            while j < 16 {
+                let xh_1 = ((qh >> (j + 12)) & 0x10) << 0;
+                let byte = packed[off + 6 + j];
+                let x1 = ((((byte >> 4) as u32) | xh_1) as f32 - 16.0) * d;
+                let xi1 = f16::from_bits(x[x_base + 16 + j]) as f32;
                 acc = float::fma_rn_f32(x1, xi1, acc);
                 j += 1;
             }
@@ -177,13 +192,18 @@ mod kernels {
             let mut j = 0usize;
             while j < 16 {
                 let xh_0 = ((qh >> (j + 0)) << 4) & 0x10;
-                let xh_1 = ((qh >> (j + 12)) & 0x10) << 0;
                 let byte = packed[off + 8 + j];
                 let x0 = ((byte & 0x0F) as u32 | xh_0) as f32 * d + m;
-                let x1 = (((byte >> 4) as u32) | xh_1) as f32 * d + m;
-                let xi0 = f16::from_bits(x[x_base + 2 * j]) as f32;
-                let xi1 = f16::from_bits(x[x_base + 2 * j + 1]) as f32;
+                let xi0 = f16::from_bits(x[x_base + j]) as f32;
                 acc = float::fma_rn_f32(x0, xi0, acc);
+                j += 1;
+            }
+            let mut j = 0usize;
+            while j < 16 {
+                let xh_1 = ((qh >> (j + 12)) & 0x10) << 0;
+                let byte = packed[off + 8 + j];
+                let x1 = ((((byte >> 4) as u32) | xh_1) as f32) * d + m;
+                let xi1 = f16::from_bits(x[x_base + 16 + j]) as f32;
                 acc = float::fma_rn_f32(x1, xi1, acc);
                 j += 1;
             }
@@ -344,9 +364,10 @@ fn dequant_q4_0(packed: &[u8]) -> Vec<f64> {
         let off = b * 18;
         let d = f16::from_bits(u16::from_le_bytes([packed[off], packed[off + 1]])).to_f64();
         for i in 0..16 {
-            let byte = packed[off + 2 + i];
-            out.push(d * ((byte & 0x0F) as f64 - 8.0));
-            out.push(d * (((byte >> 4) & 0x0F) as f64 - 8.0));
+            out.push(d * ((packed[off + 2 + i] & 0x0F) as f64 - 8.0));
+        }
+        for i in 0..16 {
+            out.push(d * (((packed[off + 2 + i] >> 4) & 0x0F) as f64 - 8.0));
         }
     }
     out
@@ -358,9 +379,10 @@ fn dequant_q4_1(packed: &[u8]) -> Vec<f64> {
         let d = f16::from_bits(u16::from_le_bytes([packed[off], packed[off + 1]])).to_f64();
         let m = f16::from_bits(u16::from_le_bytes([packed[off + 2], packed[off + 3]])).to_f64();
         for i in 0..16 {
-            let byte = packed[off + 4 + i];
-            out.push(d * (byte & 0x0F) as f64 + m);
-            out.push(d * ((byte >> 4) & 0x0F) as f64 + m);
+            out.push(d * (packed[off + 4 + i] & 0x0F) as f64 + m);
+        }
+        for i in 0..16 {
+            out.push(d * ((packed[off + 4 + i] >> 4) & 0x0F) as f64 + m);
         }
     }
     out
@@ -373,12 +395,13 @@ fn dequant_q5_0(packed: &[u8]) -> Vec<f64> {
         let qh = u32::from_le_bytes([packed[off + 2], packed[off + 3], packed[off + 4], packed[off + 5]]);
         for j in 0..16 {
             let xh_0 = ((qh >> (j + 0)) << 4) & 0x10;
+            let byte = packed[off + 6 + j];
+            out.push((((byte & 0x0F) as u32 | xh_0) as f64 - 16.0) * d);
+        }
+        for j in 0..16 {
             let xh_1 = ((qh >> (j + 12)) & 0x10) << 0;
             let byte = packed[off + 6 + j];
-            let x0 = (((byte & 0x0F) as u32 | xh_0) as f64 - 16.0) * d;
-            let x1 = ((((byte >> 4) as u32) | xh_1) as f64 - 16.0) * d;
-            out.push(x0);
-            out.push(x1);
+            out.push(((((byte >> 4) as u32) | xh_1) as f64 - 16.0) * d);
         }
     }
     out
@@ -392,12 +415,13 @@ fn dequant_q5_1(packed: &[u8]) -> Vec<f64> {
         let qh = u32::from_le_bytes([packed[off + 4], packed[off + 5], packed[off + 6], packed[off + 7]]);
         for j in 0..16 {
             let xh_0 = ((qh >> (j + 0)) << 4) & 0x10;
+            let byte = packed[off + 8 + j];
+            out.push(((byte & 0x0F) as u32 | xh_0) as f64 * d + m);
+        }
+        for j in 0..16 {
             let xh_1 = ((qh >> (j + 12)) & 0x10) << 0;
             let byte = packed[off + 8 + j];
-            let x0 = ((byte & 0x0F) as u32 | xh_0) as f64 * d + m;
-            let x1 = (((byte >> 4) as u32) | xh_1) as f64 * d + m;
-            out.push(x0);
-            out.push(x1);
+            out.push(((((byte >> 4) as u32) | xh_1) as f64) * d + m);
         }
     }
     out
