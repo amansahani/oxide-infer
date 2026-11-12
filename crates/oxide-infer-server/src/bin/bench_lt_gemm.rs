@@ -57,6 +57,8 @@ fn candidates(gpu: &GpuContext) -> Result<()> {
         ("dn  2048x7680", 2048, 7680),
         ("qkv 3088x2048", 3088, 2048),
         ("ffn 15360x2048", 15360, 2048),
+        ("conv 6144x2048", 6144, 2048),
+        ("lm 128000x2048", 128000, 2048),
     ] {
         let cands = lt.bench_candidates(gpu, m, k, &ns, 8, 30)?;
         println!("{name}:");
