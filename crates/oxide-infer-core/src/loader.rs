@@ -9,13 +9,13 @@ use crate::memory::DeviceBuffer;
 
 /// Zero-copy weights loader for SafeTensors files directly into GPU VRAM.
 ///
-/// Supports plain F16/BF16 checkpoints (loaded as-is or cast to F16) and
-/// Q4_0-quantized checkpoints produced by `quant_weights`. Quantized tensors
-/// are dequantized to F16 on the host during load, so callers always receive
-/// F16 weights and no part of the engine needs to know about Q4_0 layout.
+/// Supports plain F16/BF16 checkpoints and ggml-quantized checkpoints
+/// produced by `quant_weights`. Quantized tensors are dequantized to BF16 on
+/// the host during load, so callers always receive BF16 weights and no part
+/// of the engine needs to know about the quantization layout.
 pub struct SafeTensorsLoader {
     mmap: Mmap,
-    quantized: bool,
+    quantized: Option<crate::quant::QuantType>,
 }
 
 impl SafeTensorsLoader {
@@ -28,22 +28,48 @@ impl SafeTensorsLoader {
         Ok(Self { mmap, quantized })
     }
 
-    /// Whether the checkpoint carries the `__quantized__: ["q4_0"]` marker.
+    /// Whether the checkpoint carries a `__quantized__` marker.
     pub fn is_quantized(&self) -> bool {
+        self.quantized.is_some()
+    }
+
+    /// The quantization type, if any.
+    pub fn quant_type(&self) -> Option<crate::quant::QuantType> {
         self.quantized
     }
 
-    fn detect_quantized(mmap: &Mmap) -> bool {
+    fn detect_quantized(mmap: &Mmap) -> Option<crate::quant::QuantType> {
         let mut buf = [0u8; 8];
-        if mmap.len() < 16 { return false; }
+        if mmap.len() < 16 { return None; }
         buf.copy_from_slice(&mmap[..8]);
         let hdr_len = u64::from_le_bytes(buf) as usize;
-        if hdr_len == 0 || 8 + hdr_len > mmap.len() { return false; }
+        if hdr_len == 0 || 8 + hdr_len > mmap.len() { return None; }
         let hdr = &mmap[8..8 + hdr_len];
-        match std::str::from_utf8(hdr) {
-            Ok(s) => s.contains("\"__quantized__\""),
-            Err(_) => false,
-        }
+        let s = std::str::from_utf8(hdr).ok()?;
+        let key = "__quantized__";
+        let pos = s.find(key)?;
+        let rest = &s[pos + key.len()..];
+        // skip the colon and opening quote
+        let rest = rest.trim_start_matches(&[':', '"', ' '][..]);
+        let end = rest.find('"')?;
+        crate::quant::QuantType::from_str(&rest[..end])
+    }
+
+    /// Return the raw packed bytes for a U8 tensor without copying or
+    /// dequantizing. For quantized checkpoints this is the Q4_0 stream that
+    /// `dequantize` produces. Callers use this when they want to dequantize
+    /// on the host once (e.g. to build a scratch buffer) or to upload raw
+    /// blocks for in-kernel dequantization.
+    pub fn load_tensor_packed(
+        &self,
+        tensor_name: &str,
+    ) -> Result<&[u8]> {
+        let tensors = SafeTensors::deserialize(&self.mmap)
+            .context("Failed to deserialize safetensors header")?;
+        let tensor = tensors
+            .tensor(tensor_name)
+            .with_context(|| format!("Tensor '{}' not found in safetensors file", tensor_name))?;
+        Ok(tensor.data())
     }
 
     /// Load a specific tensor from the safetensors file directly into a GPU `DeviceBuffer`.
@@ -63,37 +89,18 @@ impl SafeTensorsLoader {
             .with_context(|| format!("Tensor '{}' not found in safetensors file", tensor_name))?;
 
         let bytes = tensor.data();
-        if self.quantized && tensor.dtype() == safetensors::tensor::Dtype::U8 {
-            let f16_values = Self::dequantize_q4_0(bytes);
-            // Caller asked for a specific T; we always return f16 for quantized
-            // tensors, so require T == f16.
-            let slice: &[T] = bytemuck::cast_slice(&f16_values);
-            return DeviceBuffer::from_slice(gpu, slice);
-        }
-        let slice: &[T] = bytemuck::cast_slice(bytes);
-        DeviceBuffer::from_slice(gpu, slice)
-    }
-
-    /// Dequantize Q4_0 packed blocks to BF16 on the host.
-    fn dequantize_q4_0(packed: &[u8]) -> Vec<half::bf16> {
-        const BLOCK: usize = 32;
-        const BYTES_PER_BLOCK: usize = 18;
-        let nblocks = packed.len() / BYTES_PER_BLOCK;
-        let mut out = Vec::with_capacity(nblocks * BLOCK);
-        for b in 0..nblocks {
-            let off = b * BYTES_PER_BLOCK;
-            let d_bits = u16::from_le_bytes([packed[off], packed[off + 1]]);
-            let d = half::f16::from_bits(d_bits).to_f32();
-            let qs = &packed[off + 2..off + BYTES_PER_BLOCK];
-            for i in 0..16 {
-                let byte = qs[i];
-                let lo = (byte & 0x0F) as f32;
-                let hi = ((byte >> 4) & 0x0F) as f32;
-                out.push(half::bf16::from_f32(d * (lo - 8.0)));
-                out.push(half::bf16::from_f32(d * (hi - 8.0)));
+        if let Some(qt) = self.quantized {
+            if tensor.dtype() == safetensors::tensor::Dtype::U8 {
+                let f16_values = crate::quant::dequantize(bytes, qt);
+                let slice: &[T] = bytemuck::cast_slice(&f16_values);
+                return DeviceBuffer::from_slice(gpu, slice);
             }
         }
-        out
+        // Copy to an aligned Vec before casting: mmap byte pointers at odd
+        // offsets are not aligned for every Pod type, and cast_slice panics.
+        let owned = bytes.to_vec();
+        let slice: &[T] = bytemuck::cast_slice(&owned);
+        DeviceBuffer::from_slice(gpu, slice)
     }
 
     /// List all tensor names available in the file.

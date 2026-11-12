@@ -2,6 +2,7 @@ pub mod context;
 pub mod memory;
 pub mod paged_pool;
 pub mod loader;
+pub mod quant;
 pub mod vision_preprocessor;
 
 pub use context::GpuContext;
