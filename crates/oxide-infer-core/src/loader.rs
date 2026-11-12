@@ -72,6 +72,24 @@ impl SafeTensorsLoader {
         Ok(tensor.data())
     }
 
+    /// Upload raw tensor bytes to the GPU without dequantization. Callers
+    /// use this when they want to run in-kernel dequantization on Q4 blocks,
+    /// which avoids both the host dequantization pass and the F16 VRAM cost
+    /// of a fully expanded model.
+    pub fn load_tensor_packed_gpu(
+        &self,
+        gpu: &GpuContext,
+        tensor_name: &str,
+    ) -> Result<DeviceBuffer<u8>> {
+        let tensors = SafeTensors::deserialize(&self.mmap)
+            .context("Failed to deserialize safetensors header")?;
+        let tensor = tensors
+            .tensor(tensor_name)
+            .with_context(|| format!("Tensor '{}' not found in safetensors file", tensor_name))?;
+        let data = tensor.data().to_vec();
+        DeviceBuffer::from_slice(gpu, &data)
+    }
+
     /// Load a specific tensor from the safetensors file directly into a GPU `DeviceBuffer`.
     ///
     /// In a quantized checkpoint, U8 tensors are Q4_0 blocks and are
