@@ -47,15 +47,31 @@ pub const HEAD_DIM: usize = 128;
 /// therefore the summation order) never depend on the batch composition: a
 /// row sees identical arithmetic whether it runs alone or next to 127 others.
 const ATTN_CHUNK_KEYS: usize = 128;
-/// Largest key count a GEMM attention chunk can score. The server admits at
-/// most `MAX_SEQ_TOKENS` (8192) positions, and a chunk never needs more keys
-/// than its end position, so the score scratch is sized for this.
-const MAX_ATTN_KEYS: usize = 8192;
+/// Largest key count a GEMM attention chunk can score. Must cover the
+/// server's sequence limit (`OXIDE_MAX_SEQ_TOKENS`, default 8192) because a
+/// chunk never needs more keys than its end position, and the score scratch
+/// is sized for it. Configurable because the scratch is 4 * prefill_rows *
+/// keys f32 + the same in f16, which grows quickly.
+fn max_attn_keys() -> usize {
+    std::env::var("OXIDE_MAX_ATTN_KEYS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8192)
+}
 /// Chunks below this row count stay on the online kernel: with fewer rows the
 /// attention GEMMs are launch-bound and the SIMT kernel is cheaper.
 const GEMM_ATTN_MIN_ROWS: usize = 64;
 /// Hard cap on attention chunks; with 128-key chunks this covers 8192 tokens.
-const MAX_ATTN_CHUNKS: usize = 64;
+/// The decode split-K path clamps `nchunks` to this, so it must be at least
+/// ceil(max_seq_tokens / ATTN_CHUNK_KEYS) or decode would silently score only
+/// the first few thousand keys of a long context. Configurable for the same
+/// reason as `max_attn_keys`: the partials are max_batch * chunks * heads.
+fn max_attn_chunks() -> usize {
+    std::env::var("OXIDE_MAX_ATTN_CHUNKS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(64)
+}
 pub const VOCAB: usize = 128_000;
 
 /// Per-sequence GPU state needed by the batched engine.
@@ -155,6 +171,10 @@ pub struct BatchEngine {
     scratch: BatchScratch,
     max_batch: usize,
     rows: usize,
+    /// Sequence-limit ceilings, read once at construction so the scratch
+    /// buffers and the runtime checks agree.
+    max_attn_keys: usize,
+    max_attn_chunks: usize,
     lt: LtGemm,
     rms_norm: Function,
     residual_add: Function,
@@ -256,6 +276,8 @@ fn fptr_mut(buf: &mut DeviceBuffer<f16>) -> u64 {
 impl BatchEngine {
     pub fn new(gpu: &GpuContext, max_batch: usize, prefill_rows: usize) -> Result<Self> {
         let rows = prefill_rows.max(max_batch);
+        let max_attn_keys = max_attn_keys();
+        let max_attn_chunks = max_attn_chunks();
         // Row-sized scratch. `logits`/`tokens_out` are only touched by the
         // sampling tail (decode batch or `sample_only`), so they stay at
         // `max_batch` and keep the 128k-vocab buffer from exploding.
@@ -317,19 +339,19 @@ impl BatchEngine {
             seq_lens: DeviceBuffer::<u32>::zeroed(gpu, b).map_err(|e| anyhow!("alloc: {e}"))?,
             attn_part_acc: DeviceBuffer::<f32>::zeroed(
                 gpu,
-                max_batch * MAX_ATTN_CHUNKS * NUM_Q_HEADS * HEAD_DIM,
+                max_batch * max_attn_chunks * NUM_Q_HEADS * HEAD_DIM,
             )
             .map_err(|e| anyhow!("alloc: {e}"))?,
             attn_part_stats: DeviceBuffer::<f32>::zeroed(
                 gpu,
-                max_batch * MAX_ATTN_CHUNKS * NUM_Q_HEADS * 2,
+                max_batch * max_attn_chunks * NUM_Q_HEADS * 2,
             )
             .map_err(|e| anyhow!("alloc: {e}"))?,
             attn_qpack: alloc_f16(b * HIDDEN)?,
             attn_tmp: alloc_f16(b * HIDDEN)?,
-            attn_scores: DeviceBuffer::<f32>::zeroed(gpu, 4 * b * MAX_ATTN_KEYS)
+            attn_scores: DeviceBuffer::<f32>::zeroed(gpu, 4 * b * max_attn_keys)
                 .map_err(|e| anyhow!("alloc: {e}"))?,
-            attn_p: alloc_f16(4 * b * MAX_ATTN_KEYS)?,
+            attn_p: alloc_f16(4 * b * max_attn_keys)?,
             attn_sums: DeviceBuffer::<f32>::zeroed(gpu, b * NUM_Q_HEADS)
                 .map_err(|e| anyhow!("alloc: {e}"))?,
             k_ptrs: DeviceBuffer::<u64>::zeroed(gpu, 24 * b).map_err(|e| anyhow!("alloc: {e}"))?,
@@ -359,6 +381,8 @@ impl BatchEngine {
             scratch,
             max_batch,
             rows,
+            max_attn_keys,
+            max_attn_chunks,
             lt,
             rms_norm: norm_ptx.get_function("batched_rms_norm_vec8_fp16")?,
             residual_add: norm_ptx.get_function("batched_residual_add_fp16")?,
@@ -432,9 +456,10 @@ impl BatchEngine {
             0
         };
         let keys = (slen_max - t_lo) as usize;
-        if keys > MAX_ATTN_KEYS {
+        if keys > self.max_attn_keys {
             return Err(anyhow!(
-                "attention chunk needs {keys} keys, scratch holds {MAX_ATTN_KEYS}"
+                "attention chunk needs {keys} keys, scratch holds {}",
+                self.max_attn_keys
             ));
         }
         let n = 4 * rows;
@@ -1012,7 +1037,7 @@ impl BatchEngine {
                 };
                 let nchunks = eff
                     .div_ceil(ATTN_CHUNK_KEYS)
-                    .clamp(1, MAX_ATTN_CHUNKS) as u32;
+                    .clamp(1, self.max_attn_chunks) as u32;
                 // Tensor-core prefill attention: QK and PV as cuBLASLt
                 // GEMMs over strided views of the KV slab, with one fused
                 // mask+softmax pass and one gate+scatter pass per chunk.

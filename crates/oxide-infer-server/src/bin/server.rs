@@ -126,11 +126,33 @@ struct ServerState {
     tx: mpsc::Sender<ServingRequest>,
 }
 
-const MAX_BATCH_SIZE: usize = 128;
+/// Largest number of sequences the continuous batcher will hold at once.
+/// Lower it for very long contexts: the decode split-K partials are
+/// max_batch * max_attn_chunks * 16 heads * 128 dim f32, so a 256k context
+/// (2048 chunks) costs 2.15 GB at the default 128 sequences and only 134 MB
+/// at 8. Default keeps the original serving capacity.
+fn max_batch_size() -> usize {
+    std::env::var("OXIDE_MAX_BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(128)
+}
 /// Longest sequence (prompt + generated tokens) the attention kernel can
 /// score. Its score tile is sized for this many keys, so a request that could
 /// exceed it is rejected with an error instead of overrunning the tile.
-const MAX_SEQ_TOKENS: usize = 8192;
+/// Longest sequence (prompt + generated tokens) the engine will admit. The
+/// attention scratch must cover it: `OXIDE_MAX_ATTN_KEYS` sizes the prefill
+/// score tile and `OXIDE_MAX_ATTN_CHUNKS` the decode split-K grid, so raising
+/// this above their defaults requires raising those too (the engine reports
+/// the mismatch as an error rather than truncating context). The KV pool
+/// must also hold the sequence: 22,528 bytes per token at 11 attention
+/// layers. Default keeps the original 8k footprint.
+fn max_seq_tokens() -> usize {
+    std::env::var("OXIDE_MAX_SEQ_TOKENS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8192)
+}
 /// Rows (prompt tokens) per prefill wave. Packing tokens rather than
 /// sequences keeps the per-wave GEMMs compute-bound and lets a wave amortise
 /// one weight stream across many short prompts. Override with
@@ -139,8 +161,8 @@ fn prefill_rows() -> usize {
     std::env::var("OXIDE_PREFILL_ROWS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(4 * MAX_BATCH_SIZE)
-        .max(MAX_BATCH_SIZE)
+        .unwrap_or(4 * max_batch_size())
+        .max(max_batch_size())
 }
 
 #[tokio::main]
@@ -201,7 +223,7 @@ async fn main() -> anyhow::Result<()> {
     }
     println!("      All weights loaded into GPU VRAM.\n");
 
-    println!("[3/3] Setting up dynamic continuous batch pool (Max capacity: {} concurrent sequences)...", MAX_BATCH_SIZE);
+    println!("[3/3] Setting up dynamic continuous batch pool (Max capacity: {} concurrent sequences)...", max_batch_size());
 
     struct ActiveContext {
         req: ServingRequest,
@@ -574,18 +596,18 @@ FINISH:
         let batched_conv_func = conv_ptx.get_function("batched_fused_causal_conv1d_gating_fp16").expect("batched_fused_causal_conv1d_gating_fp16 not found");
 
 
-        let mut d_batch_x = DeviceBuffer::<half::f16>::zeroed(&gpu_clone, MAX_BATCH_SIZE * 2048).expect("d_batch_x");
-        let mut d_batch_gate = DeviceBuffer::<half::f16>::zeroed(&gpu_clone, MAX_BATCH_SIZE * 7680).expect("d_batch_gate");
-        let mut d_batch_up = DeviceBuffer::<half::f16>::zeroed(&gpu_clone, MAX_BATCH_SIZE * 7680).expect("d_batch_up");
-        let mut d_batch_act = DeviceBuffer::<half::f16>::zeroed(&gpu_clone, MAX_BATCH_SIZE * 7680).expect("d_batch_act");
-        let mut d_batch_ffn_out = DeviceBuffer::<half::f16>::zeroed(&gpu_clone, MAX_BATCH_SIZE * 2048).expect("d_batch_ffn_out");
-        let mut d_batch_logits_f16 = DeviceBuffer::<half::f16>::zeroed(&gpu_clone, MAX_BATCH_SIZE * 128000).expect("d_batch_logits_f16");
-        let mut d_batch_tokens = DeviceBuffer::<u32>::zeroed(&gpu_clone, MAX_BATCH_SIZE).expect("d_batch_tokens");
-        let mut d_batch_bcx = DeviceBuffer::<half::f16>::zeroed(&gpu_clone, MAX_BATCH_SIZE * 6144).expect("d_batch_bcx");
-        let mut d_batch_conv_y = DeviceBuffer::<half::f16>::zeroed(&gpu_clone, MAX_BATCH_SIZE * 2048).expect("d_batch_conv_y");
+        let mut d_batch_x = DeviceBuffer::<half::f16>::zeroed(&gpu_clone, max_batch_size() * 2048).expect("d_batch_x");
+        let mut d_batch_gate = DeviceBuffer::<half::f16>::zeroed(&gpu_clone, max_batch_size() * 7680).expect("d_batch_gate");
+        let mut d_batch_up = DeviceBuffer::<half::f16>::zeroed(&gpu_clone, max_batch_size() * 7680).expect("d_batch_up");
+        let mut d_batch_act = DeviceBuffer::<half::f16>::zeroed(&gpu_clone, max_batch_size() * 7680).expect("d_batch_act");
+        let mut d_batch_ffn_out = DeviceBuffer::<half::f16>::zeroed(&gpu_clone, max_batch_size() * 2048).expect("d_batch_ffn_out");
+        let mut d_batch_logits_f16 = DeviceBuffer::<half::f16>::zeroed(&gpu_clone, max_batch_size() * 128000).expect("d_batch_logits_f16");
+        let mut d_batch_tokens = DeviceBuffer::<u32>::zeroed(&gpu_clone, max_batch_size()).expect("d_batch_tokens");
+        let mut d_batch_bcx = DeviceBuffer::<half::f16>::zeroed(&gpu_clone, max_batch_size() * 6144).expect("d_batch_bcx");
+        let mut d_batch_conv_y = DeviceBuffer::<half::f16>::zeroed(&gpu_clone, max_batch_size() * 2048).expect("d_batch_conv_y");
         // Conv state layout is [batch, hidden, k_len - 1] = [batch, 2048, 6].
         // The per-request buffers are allocated with 7 slots, but only 6 are live.
-        let mut d_batch_state_pool = DeviceBuffer::<half::f16>::zeroed(&gpu_clone, MAX_BATCH_SIZE * 2048 * 6).expect("d_batch_state_pool");
+        let mut d_batch_state_pool = DeviceBuffer::<half::f16>::zeroed(&gpu_clone, max_batch_size() * 2048 * 6).expect("d_batch_state_pool");
 
 
         // Temporary fidelity-isolation switches. Remove once the batched paths are verified.
@@ -605,7 +627,7 @@ FINISH:
         let mut batch_engine = if scalar_batch {
             None
         } else {
-            Some(BatchEngine::new(&gpu_clone, MAX_BATCH_SIZE, prefill_rows()).expect("batched engine init"))
+            Some(BatchEngine::new(&gpu_clone, max_batch_size(), prefill_rows()).expect("batched engine init"))
         };
         let is_conv: Vec<bool> = layer_types.iter().map(|t| *t == "conv").collect();
 
@@ -618,17 +640,17 @@ FINISH:
             .unwrap_or(3072);
         let n_attn = is_conv.iter().filter(|c| !**c).count();
         let pool_tokens = (pool_mb * 1024 * 1024) / (n_attn * 2 * KV_DIM * 2);
-        let mut kv_pool = KvPool::new(&gpu_clone, &is_conv, MAX_BATCH_SIZE, pool_tokens)
+        let mut kv_pool = KvPool::new(&gpu_clone, &is_conv, max_batch_size(), pool_tokens)
             .expect("kv pool init");
         println!(
             "[pool] KV slab {} MiB / {} tokens across {} attention layers, {} conv slots",
             (kv_pool.capacity_tokens() * n_attn * 2 * KV_DIM * 2) / (1024 * 1024),
             kv_pool.capacity_tokens(),
             n_attn,
-            MAX_BATCH_SIZE
+            max_batch_size()
         );
 
-        let mut active_contexts: Vec<ActiveContext> = Vec::with_capacity(MAX_BATCH_SIZE);
+        let mut active_contexts: Vec<ActiveContext> = Vec::with_capacity(max_batch_size());
         let mut epsilon: f32 = 1e-5;
         let mut h_size: u32 = 2048;
         let alpha = half::f16::from_f32(1.0);
@@ -726,14 +748,16 @@ FINISH:
                         let max_gen = req.max_tokens;
                         let need_tokens = prompt_len + max_gen + 64;
 
-                        if need_tokens > MAX_SEQ_TOKENS {
+                        if need_tokens > max_seq_tokens() {
                             eprintln!(
-                                "[ctx] rejected: prompt {} + max_tokens {} exceeds {MAX_SEQ_TOKENS}",
+                                "[ctx] rejected: prompt {} + max_tokens {} exceeds {}",
+                            max_seq_tokens(),
                                 prompt_len, max_gen
                             );
                             let _ = req.response_tx.send((
                                 format!(
-                                    "[error] request needs {} tokens, limit is {MAX_SEQ_TOKENS}",
+                                    "[error] request needs {} tokens, limit is {}",
+                                        max_seq_tokens(),
                                     need_tokens
                                 ),
                                 prompt_len,
@@ -819,7 +843,7 @@ FINISH:
                 }
             }
 
-            while active_contexts.len() + new_contexts.len() < MAX_BATCH_SIZE {
+            while active_contexts.len() + new_contexts.len() < max_batch_size() {
                 match req_rx.try_recv() {
                     Ok(req) => {
                         let mut token_ids = tokenizer_clone.encode(&req.prompt).unwrap_or_else(|_| vec![124894, 2048]);
@@ -904,14 +928,16 @@ FINISH:
                         let max_gen = req.max_tokens;
                         let need_tokens = prompt_len + max_gen + 64;
 
-                        if need_tokens > MAX_SEQ_TOKENS {
+                        if need_tokens > max_seq_tokens() {
                             eprintln!(
-                                "[ctx] rejected: prompt {} + max_tokens {} exceeds {MAX_SEQ_TOKENS}",
+                                "[ctx] rejected: prompt {} + max_tokens {} exceeds {}",
+                            max_seq_tokens(),
                                 prompt_len, max_gen
                             );
                             let _ = req.response_tx.send((
                                 format!(
-                                    "[error] request needs {} tokens, limit is {MAX_SEQ_TOKENS}",
+                                    "[error] request needs {} tokens, limit is {}",
+                                        max_seq_tokens(),
                                     need_tokens
                                 ),
                                 prompt_len,
@@ -2085,7 +2111,7 @@ async fn health_check() -> impl IntoResponse {
         "status": "healthy",
         "engine": "oxide-infer",
         "mode": "dynamic_continuous_batching_cublas_hgemm",
-        "max_batch_size": MAX_BATCH_SIZE,
+        "max_batch_size": max_batch_size(),
         "model": "LFM3-VL-2B"
     }))
 }
