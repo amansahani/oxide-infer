@@ -7,8 +7,10 @@ pub mod activations;
 pub mod conv;
 pub mod batched_attn;
 pub mod vision;
+pub mod quant_gemv;
 
 pub use ptx::PtxModule;
+pub use quant_gemv::{QuantGemv, QUANT_GEMV_PTX, supported as quant_gemv_supported};
 pub use gemv::GEMV_FP16_PTX;
 pub use attention::PagedAttentionExecutor;
 pub use activations::{ROPE_FP16_PTX, SWIGLU_FP16_PTX};

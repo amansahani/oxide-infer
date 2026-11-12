@@ -4,6 +4,7 @@ use oxide_infer_kernels::PtxModule;
 use oxide_infer_kernels::norm::RMS_NORM_FP16_PTX;
 use oxide_infer_kernels::gemm::FUSED_GEMV_FP16_FP32ACCUM_PTX;
 use oxide_infer_kernels::activations::SWIGLU_FP16_PTX;
+use oxide_infer_kernels::quant_gemv::{QuantGemv, supported as quant_gemv_supported};
 use cuda_core::launch_kernel_on_stream;
 
 /// SwiGLU Gated Feed-Forward Network Layer.
@@ -19,6 +20,13 @@ pub struct FfnLayer {
     rms_module: PtxModule,
     pub gemv_module: PtxModule,
     swiglu_module: PtxModule,
+    /// Packed ggml bytes for quantized checkpoints (additive to the f16
+    /// path: the prefill path and any unsupported consumer still use f16).
+    pub w1_packed: Option<DeviceBuffer<u8>>,
+    pub w2_packed: Option<DeviceBuffer<u8>>,
+    pub w3_packed: Option<DeviceBuffer<u8>>,
+    pub quant_type: Option<oxide_infer_core::quant::QuantType>,
+    quant_gemv: Option<QuantGemv>,
 }
 
 impl FfnLayer {
@@ -50,6 +58,23 @@ impl FfnLayer {
         let ffn_norm = convert_bf16_to_f16(&norm_bf16)?;
         let activated_buf = DeviceBuffer::<half::f16>::zeroed(gpu, intermediate_size)?;
 
+        // Additive: keep the packed ggml blocks too, when the checkpoint is
+        // quantized and we have a packed kernel for the type. Decode-time
+        // GEMVs then run directly on the packed bytes in VRAM.
+        let quant_type = loader.quant_type();
+        let (w1_packed, w2_packed, w3_packed, quant_gemv) = if let Some(qt) = quant_type {
+            if quant_gemv_supported(qt) {
+                let w1p = loader.load_tensor_packed_gpu(gpu, &format!("{}.w1.weight", prefix))?;
+                let w2p = loader.load_tensor_packed_gpu(gpu, &format!("{}.w2.weight", prefix))?;
+                let w3p = loader.load_tensor_packed_gpu(gpu, &format!("{}.w3.weight", prefix))?;
+                (Some(w1p), Some(w2p), Some(w3p), Some(QuantGemv::new(gpu)?))
+            } else {
+                (None, None, None, None)
+            }
+        } else {
+            (None, None, None, None)
+        };
+
         let rms_module = PtxModule::load_from_ptx(gpu, RMS_NORM_FP16_PTX)?;
         let gemv_module = PtxModule::load_from_ptx(gpu, FUSED_GEMV_FP16_FP32ACCUM_PTX)?;
         let swiglu_module = PtxModule::load_from_ptx(gpu, SWIGLU_FP16_PTX)?;
@@ -65,6 +90,11 @@ impl FfnLayer {
             rms_module,
             gemv_module,
             swiglu_module,
+            w1_packed,
+            w2_packed,
+            w3_packed,
+            quant_type,
+            quant_gemv,
         })
     }
 
@@ -75,6 +105,51 @@ impl FfnLayer {
         normed_x: &DeviceBuffer<half::f16>,
         out: &mut DeviceBuffer<half::f16>,
     ) -> Result<()> {
+        if let (Some(w1p), Some(w3p), Some(w2p), Some(qt), Some(gemv)) = (
+            &self.w1_packed,
+            &self.w3_packed,
+            &self.w2_packed,
+            &self.quant_type,
+            &self.quant_gemv,
+        ) {
+            let stream = gpu.compute_stream();
+            let x_len = normed_x.inner().len() as u64;
+            let w1_ptr = w1p.inner().cu_deviceptr();
+            let w1_len = w1p.inner().len() as u64;
+            let w3_ptr = w3p.inner().cu_deviceptr();
+            let w3_len = w3p.inner().len() as u64;
+            let w2_ptr = w2p.inner().cu_deviceptr();
+            let w2_len = w2p.inner().len() as u64;
+            let act_ptr = self.activated_buf.inner_mut().cu_deviceptr();
+            let act_len = self.activated_buf.inner().len() as u64;
+            let out_ptr = out.inner_mut().cu_deviceptr();
+            let out_len = out.inner().len() as u64;
+            let b = x_len / self.hidden_size as u64; // x is [b * hidden]
+
+            gemv.dual_swiglu(
+                &stream,
+                *qt,
+                (w1_ptr, w1_len),
+                (w3_ptr, w3_len),
+                (normed_x.inner().cu_deviceptr(), x_len),
+                (act_ptr, act_len),
+                self.hidden_size as u32,
+                self.intermediate_size as u32,
+                b as u32,
+            )?;
+            gemv.gemv(
+                &stream,
+                *qt,
+                (w2_ptr, w2_len),
+                (act_ptr, act_len),
+                (out_ptr, out_len),
+                self.intermediate_size as u32,
+                self.hidden_size as u32,
+                b as u32,
+            )?;
+            return Ok(());
+        }
+
         let stream = gpu.compute_stream();
         let mut d_normed_ptr = normed_x.inner().cu_deviceptr();
 

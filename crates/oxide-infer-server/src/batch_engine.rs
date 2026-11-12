@@ -16,6 +16,7 @@ use oxide_infer_kernels::batched_attn::{
     BATCHED_QK_RMSNORM_PTX, BATCHED_ROPE_PTX, BATCHED_SIGMOID_GATE_PTX, CONV_STATE_PREFILL_PTX,
 };
 use oxide_infer_kernels::PtxModule;
+use oxide_infer_kernels::quant_gemv::QuantGemv;
 use oxide_infer_models::{FullLfm3DecoderLayer, LayerType};
 use cuda_core::{launch_kernel_on_stream, CudaEvent, Function, Stream as CuStream};
 use std::ffi::c_void;
@@ -195,6 +196,7 @@ pub struct BatchEngine {
     embed: Function,
     argmax: Function,
     conv_state_prefill: Function,
+    quant_gemv: QuantGemv,
 }
 
 /// Enqueue an exact-length host-to-device copy on the compute stream without
@@ -402,6 +404,7 @@ impl BatchEngine {
             embed: embed_ptx.get_function("batched_embed_lookup_fp16")?,
             argmax: argmax_ptx.get_function("batched_argmax_direct_f16")?,
             conv_state_prefill: pf_ptx.get_function("conv_state_prefill_fp16")?,
+            quant_gemv: QuantGemv::new(gpu)?,
         })
     }
 
@@ -1269,31 +1272,75 @@ impl BatchEngine {
 
             // FFN: W1/W3 -> SwiGLU -> W2.
             let d_x = self.scratch.norm.inner().cu_deviceptr();
-            let d_w1 = layer.ffn.w1_gate.inner().cu_deviceptr();
-            let d_gate = self.scratch.ffn_gate.inner_mut().cu_deviceptr();
-            self.lt.gemm(stream, INTER, HIDDEN, b, d_w1, d_x, d_gate)?;
-            let d_w3 = layer.ffn.w3_up.inner().cu_deviceptr();
-            let d_up = self.scratch.ffn_up.inner_mut().cu_deviceptr();
-            self.lt.gemm(stream, INTER, HIDDEN, b, d_w3, d_x, d_up)?;
+            let x_len = b_u32 as u64 * HIDDEN as u64;
 
-            let mut d_act = fptr_mut(&mut self.scratch.ffn_act);
-            let mut d_fg = fptr(&self.scratch.ffn_gate);
-            let mut d_fu = fptr(&self.scratch.ffn_up);
-            let mut inter = INTER as u32;
-            let mut args_sw: [*mut c_void; 5] = [
-                &mut d_act as *mut _ as *mut c_void,
-                &mut d_fg as *mut _ as *mut c_void,
-                &mut d_fu as *mut _ as *mut c_void,
-                &mut inter as *mut _ as *mut c_void,
-                &mut b_arg as *mut _ as *mut c_void,
-            ];
-            unsafe {
-                launch_kernel_on_stream(&self.swiglu, (30, b_u32, 1), (256, 1, 1), 0, stream, &mut args_sw)?;
+            let packed_disabled = std::env::var("OXIDE_DISABLE_PACKED").is_ok();
+            let packed_ready = !packed_disabled
+                && layer.ffn.w1_packed.is_some()
+                && layer.ffn.w3_packed.is_some()
+                && layer.ffn.w2_packed.is_some()
+                && layer.ffn.quant_type.is_some();
+            if packed_ready {
+                let qt = layer.ffn.quant_type.unwrap();
+                static PRINTED: std::sync::Once = std::sync::Once::new();
+                PRINTED.call_once(|| eprintln!("[quant-gemv] packed FFN path active (type {:?})", qt));
+                // Packed path: fused dual GEMV + SwiGLU straight from packed
+                // ggml weights in VRAM.
+                let act_ptr = self.scratch.ffn_act.inner_mut().cu_deviceptr();
+                let act_len = b_u32 as u64 * INTER as u64;
+                self.quant_gemv.dual_swiglu(
+                    stream,
+                    qt,
+                    (layer.ffn.w1_packed.as_ref().unwrap().inner().cu_deviceptr(),
+                     layer.ffn.w1_packed.as_ref().unwrap().inner().len() as u64),
+                    (layer.ffn.w3_packed.as_ref().unwrap().inner().cu_deviceptr(),
+                     layer.ffn.w3_packed.as_ref().unwrap().inner().len() as u64),
+                    (d_x, x_len),
+                    (act_ptr, act_len),
+                    HIDDEN as u32,
+                    INTER as u32,
+                    b_u32,
+                )?;
+                let out_ptr = self.scratch.ffn_out.inner_mut().cu_deviceptr();
+                let out_len = b_u32 as u64 * HIDDEN as u64;
+                self.quant_gemv.gemv(
+                    stream,
+                    qt,
+                    (layer.ffn.w2_packed.as_ref().unwrap().inner().cu_deviceptr(),
+                     layer.ffn.w2_packed.as_ref().unwrap().inner().len() as u64),
+                    (act_ptr, act_len),
+                    (out_ptr, out_len),
+                    INTER as u32,
+                    HIDDEN as u32,
+                    b_u32,
+                )?;
+            } else {
+                let d_w1 = layer.ffn.w1_gate.inner().cu_deviceptr();
+                let d_gate = self.scratch.ffn_gate.inner_mut().cu_deviceptr();
+                self.lt.gemm(stream, INTER, HIDDEN, b, d_w1, d_x, d_gate)?;
+                let d_w3 = layer.ffn.w3_up.inner().cu_deviceptr();
+                let d_up = self.scratch.ffn_up.inner_mut().cu_deviceptr();
+                self.lt.gemm(stream, INTER, HIDDEN, b, d_w3, d_x, d_up)?;
+
+                let mut d_act = fptr_mut(&mut self.scratch.ffn_act);
+                let mut d_fg = fptr(&self.scratch.ffn_gate);
+                let mut d_fu = fptr(&self.scratch.ffn_up);
+                let mut inter = INTER as u32;
+                let mut args_sw: [*mut c_void; 5] = [
+                    &mut d_act as *mut _ as *mut c_void,
+                    &mut d_fg as *mut _ as *mut c_void,
+                    &mut d_fu as *mut _ as *mut c_void,
+                    &mut inter as *mut _ as *mut c_void,
+                    &mut b_arg as *mut _ as *mut c_void,
+                ];
+                unsafe {
+                    launch_kernel_on_stream(&self.swiglu, (30, b_u32, 1), (256, 1, 1), 0, stream, &mut args_sw)?;
+                }
+                let d_w2 = layer.ffn.w2_down.inner().cu_deviceptr();
+                let d_act = self.scratch.ffn_act.inner().cu_deviceptr();
+                let d_out = self.scratch.ffn_out.inner_mut().cu_deviceptr();
+                self.lt.gemm(stream, HIDDEN, INTER, b, d_w2, d_act, d_out)?;
             }
-            let d_w2 = layer.ffn.w2_down.inner().cu_deviceptr();
-            let d_act = self.scratch.ffn_act.inner().cu_deviceptr();
-            let d_out = self.scratch.ffn_out.inner_mut().cu_deviceptr();
-            self.lt.gemm(stream, HIDDEN, INTER, b, d_w2, d_act, d_out)?;
             phase!();
 
             // Post-FFN norm (in place) + residual add.

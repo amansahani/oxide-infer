@@ -1,3 +1,6 @@
 target/
 **/.oxide-artifacts/
 *.ll
+quant_gemv.ptx
+quant_gemv.ll
+quant_gemv.opt.ll
