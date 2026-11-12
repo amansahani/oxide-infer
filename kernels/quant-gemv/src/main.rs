@@ -35,14 +35,21 @@ mod kernels {
         fn dot_block(packed: &[u8], off: usize, x: &[u16], x_base: usize) -> f32 {
             let d = f16::from_bits(u16::from_le_bytes([packed[off], packed[off + 1]])) as f32;
             let mut acc = 0.0f32;
-            let mut j = 0usize;
-            while j < 128 {
-                let byte = packed[off + 2 + j / 8];
-                let bit = (byte >> (j % 8)) & 1;
-                let xj = f16::from_bits(x[x_base + j]) as f32;
-                let w = if bit != 0 { d } else { -d };
-                acc = float::fma_rn_f32(w, xj, acc);
-                j += 1;
+            let mut w_idx = 0usize;
+            while w_idx < 8 {
+                let q = u16::from_le_bytes([packed[off + 2 + w_idx * 2], packed[off + 3 + w_idx * 2]]);
+                let lo = (q & 0x00FF) as u8;
+                let hi = (q >> 8) as u8;
+                let mut bit = 0usize;
+                while bit < 16 {
+                    let byte = if bit < 8 { lo } else { hi };
+                    let b = (byte >> (bit % 8)) & 1;
+                    let xj = f16::from_bits(x[x_base + w_idx * 16 + bit]) as f32;
+                    let w = if b != 0 { d } else { -d };
+                    acc = float::fma_rn_f32(w, xj, acc);
+                    bit += 1;
+                }
+                w_idx += 1;
             }
             acc
         }
@@ -56,13 +63,22 @@ mod kernels {
         fn dot_block(packed: &[u8], off: usize, x: &[u16], x_base: usize) -> f32 {
             let d = f16::from_bits(u16::from_le_bytes([packed[off], packed[off + 1]])) as f32;
             let mut acc = 0.0f32;
-            let mut j = 0usize;
-            while j < 64 {
-                let byte = packed[off + 2 + j / 4];
-                let q = (byte >> ((j % 4) * 2)) & 0x03;
-                let xj = f16::from_bits(x[x_base + j]) as f32;
-                acc = float::fma_rn_f32((q as f32 - 1.0) * d, xj, acc);
-                j += 1;
+            let mut i = 0usize;
+            while i < 16 {
+                let q = u16::from_le_bytes([packed[off + 2 + i], packed[off + 3 + i]]);
+                let bytes = [(q & 0x00FF) as u8, (q >> 8) as u8];
+                for bi in 0..2 {
+                    let byte = bytes[bi];
+                    let elem_base = (i + bi) * 4;
+                    let mut k = 0usize;
+                    while k < 4 {
+                        let v = ((byte >> (k * 2)) & 0x03) as f32 - 1.0;
+                        let xj = f16::from_bits(x[x_base + elem_base + k]) as f32;
+                        acc = float::fma_rn_f32(v * d, xj, acc);
+                        k += 1;
+                    }
+                }
+                i += 2;
             }
             acc
         }
@@ -78,17 +94,20 @@ mod kernels {
             let mut acc = 0.0f32;
             let mut i = 0usize;
             while i < 16 {
-                let byte = packed[off + 2 + i];
-                let x0 = f16::from_bits(x[x_base + i]) as f32;
-                acc = float::fma_rn_f32(d * ((byte & 0x0F) as f32 - 8.0), x0, acc);
-                i += 1;
-            }
-            let mut i = 0usize;
-            while i < 16 {
-                let byte = packed[off + 2 + i];
-                let x1 = f16::from_bits(x[x_base + 16 + i]) as f32;
-                acc = float::fma_rn_f32(d * (((byte >> 4) & 0x0F) as f32 - 8.0), x1, acc);
-                i += 1;
+                let q = u16::from_le_bytes([packed[off + 2 + i], packed[off + 3 + i]]);
+                let w_i = ((q & 0x000F) as f32 - 8.0) * d;
+                let w_i1 = (((q >> 8) & 0x000F) as f32 - 8.0) * d;
+                let w_i16 = (((q >> 4) & 0x000F) as f32 - 8.0) * d;
+                let w_i17 = (((q >> 12) & 0x000F) as f32 - 8.0) * d;
+                let xi = f16::from_bits(x[x_base + i]) as f32;
+                let xi1 = f16::from_bits(x[x_base + i + 1]) as f32;
+                let xi16 = f16::from_bits(x[x_base + 16 + i]) as f32;
+                let xi17 = f16::from_bits(x[x_base + 16 + i + 1]) as f32;
+                acc = float::fma_rn_f32(w_i, xi, acc);
+                acc = float::fma_rn_f32(w_i1, xi1, acc);
+                acc = float::fma_rn_f32(w_i16, xi16, acc);
+                acc = float::fma_rn_f32(w_i17, xi17, acc);
+                i += 2;
             }
             acc
         }
@@ -105,17 +124,20 @@ mod kernels {
             let mut acc = 0.0f32;
             let mut i = 0usize;
             while i < 16 {
-                let byte = packed[off + 4 + i];
-                let x0 = f16::from_bits(x[x_base + i]) as f32;
-                acc = float::fma_rn_f32(d * (byte & 0x0F) as f32 + m, x0, acc);
-                i += 1;
-            }
-            let mut i = 0usize;
-            while i < 16 {
-                let byte = packed[off + 4 + i];
-                let x1 = f16::from_bits(x[x_base + 16 + i]) as f32;
-                acc = float::fma_rn_f32(d * ((byte >> 4) & 0x0F) as f32 + m, x1, acc);
-                i += 1;
+                let q = u16::from_le_bytes([packed[off + 4 + i], packed[off + 5 + i]]);
+                let w_i = (q & 0x000F) as f32 * d + m;
+                let w_i1 = ((q >> 8) & 0x000F) as f32 * d + m;
+                let w_i16 = ((q >> 4) & 0x000F) as f32 * d + m;
+                let w_i17 = ((q >> 12) & 0x000F) as f32 * d + m;
+                let xi = f16::from_bits(x[x_base + i]) as f32;
+                let xi1 = f16::from_bits(x[x_base + i + 1]) as f32;
+                let xi16 = f16::from_bits(x[x_base + 16 + i]) as f32;
+                let xi17 = f16::from_bits(x[x_base + 16 + i + 1]) as f32;
+                acc = float::fma_rn_f32(w_i, xi, acc);
+                acc = float::fma_rn_f32(w_i1, xi1, acc);
+                acc = float::fma_rn_f32(w_i16, xi16, acc);
+                acc = float::fma_rn_f32(w_i17, xi17, acc);
+                i += 2;
             }
             acc
         }
@@ -128,25 +150,35 @@ mod kernels {
         const BLOCK_ELEMS: usize = 32;
         fn dot_block(packed: &[u8], off: usize, x: &[u16], x_base: usize) -> f32 {
             let d = f16::from_bits(u16::from_le_bytes([packed[off], packed[off + 1]])) as f32;
-            let qh = u32::from_le_bytes([packed[off + 2], packed[off + 3], packed[off + 4], packed[off + 5]]);
+            let qh0 = u16::from_le_bytes([packed[off + 2], packed[off + 3]]);
+            let qh1 = u16::from_le_bytes([packed[off + 4], packed[off + 5]]);
+            let qh = (qh0 as u32) | ((qh1 as u32) << 16);
             let mut acc = 0.0f32;
             let mut j = 0usize;
             while j < 16 {
+                let q = u16::from_le_bytes([packed[off + 6 + j], packed[off + 7 + j]]);
                 let xh_0 = ((qh >> (j + 0)) << 4) & 0x10;
-                let byte = packed[off + 6 + j];
-                let w0 = (((byte & 0x0F) as u32 | xh_0) as f32 - 16.0) * d;
-                let xi0 = f16::from_bits(x[x_base + j]) as f32;
-                acc = float::fma_rn_f32(w0, xi0, acc);
-                j += 1;
+                let xh_1 = ((qh >> (j + 1 + 0)) << 4) & 0x10;
+                let xi0 = ((q & 0x000F) as u32 | xh_0) as f32 - 16.0;
+                let xi1 = (((q >> 8) & 0x000F) as u32 | xh_1) as f32 - 16.0;
+                let x0 = f16::from_bits(x[x_base + j]) as f32;
+                let x1 = f16::from_bits(x[x_base + j + 1]) as f32;
+                acc = float::fma_rn_f32(d * xi0, x0, acc);
+                acc = float::fma_rn_f32(d * xi1, x1, acc);
+                j += 2;
             }
             let mut j = 0usize;
             while j < 16 {
-                let xh_1 = ((qh >> (j + 12)) & 0x10) << 0;
-                let byte = packed[off + 6 + j];
-                let w1 = ((((byte >> 4) as u32) | xh_1) as f32 - 16.0) * d;
-                let xi1 = f16::from_bits(x[x_base + 16 + j]) as f32;
-                acc = float::fma_rn_f32(w1, xi1, acc);
-                j += 1;
+                let q = u16::from_le_bytes([packed[off + 6 + j], packed[off + 7 + j]]);
+                let xh_0 = (qh >> (j + 12)) & 0x10;
+                let xh_1 = (qh >> (j + 13)) & 0x10;
+                let xi0 = ((((q >> 4) & 0x000F) as u32) | xh_0) as f32 - 16.0;
+                let xi1 = ((((q >> 12) & 0x000F) as u32) | xh_1) as f32 - 16.0;
+                let x0 = f16::from_bits(x[x_base + 16 + j]) as f32;
+                let x1 = f16::from_bits(x[x_base + 16 + j + 1]) as f32;
+                acc = float::fma_rn_f32(d * xi0, x0, acc);
+                acc = float::fma_rn_f32(d * xi1, x1, acc);
+                j += 2;
             }
             acc
         }
@@ -160,25 +192,35 @@ mod kernels {
         fn dot_block(packed: &[u8], off: usize, x: &[u16], x_base: usize) -> f32 {
             let d = f16::from_bits(u16::from_le_bytes([packed[off], packed[off + 1]])) as f32;
             let m = f16::from_bits(u16::from_le_bytes([packed[off + 2], packed[off + 3]])) as f32;
-            let qh = u32::from_le_bytes([packed[off + 4], packed[off + 5], packed[off + 6], packed[off + 7]]);
+            let qh0 = u16::from_le_bytes([packed[off + 4], packed[off + 5]]);
+            let qh1 = u16::from_le_bytes([packed[off + 6], packed[off + 7]]);
+            let qh = (qh0 as u32) | ((qh1 as u32) << 16);
             let mut acc = 0.0f32;
             let mut j = 0usize;
             while j < 16 {
+                let q = u16::from_le_bytes([packed[off + 8 + j], packed[off + 9 + j]]);
                 let xh_0 = ((qh >> (j + 0)) << 4) & 0x10;
-                let byte = packed[off + 8 + j];
-                let w0 = ((byte & 0x0F) as u32 | xh_0) as f32 * d + m;
-                let xi0 = f16::from_bits(x[x_base + j]) as f32;
-                acc = float::fma_rn_f32(w0, xi0, acc);
-                j += 1;
+                let xh_1 = ((qh >> (j + 1)) << 4) & 0x10;
+                let xi0 = ((q & 0x000F) as u32 | xh_0) as f32 * d + m;
+                let xi1 = (((q >> 8) & 0x000F) as u32 | xh_1) as f32 * d + m;
+                let x0 = f16::from_bits(x[x_base + j]) as f32;
+                let x1 = f16::from_bits(x[x_base + j + 1]) as f32;
+                acc = float::fma_rn_f32(xi0, x0, acc);
+                acc = float::fma_rn_f32(xi1, x1, acc);
+                j += 2;
             }
             let mut j = 0usize;
             while j < 16 {
-                let xh_1 = ((qh >> (j + 12)) & 0x10) << 0;
-                let byte = packed[off + 8 + j];
-                let w1 = ((((byte >> 4) as u32) | xh_1) as f32) * d + m;
-                let xi1 = f16::from_bits(x[x_base + 16 + j]) as f32;
-                acc = float::fma_rn_f32(w1, xi1, acc);
-                j += 1;
+                let q = u16::from_le_bytes([packed[off + 8 + j], packed[off + 9 + j]]);
+                let xh_0 = (qh >> (j + 12)) & 0x10;
+                let xh_1 = (qh >> (j + 13)) & 0x10;
+                let xi0 = ((((q >> 4) & 0x000F) as u32) | xh_0) as f32 * d + m;
+                let xi1 = ((((q >> 12) & 0x000F) as u32) | xh_1) as f32 * d + m;
+                let x0 = f16::from_bits(x[x_base + 16 + j]) as f32;
+                let x1 = f16::from_bits(x[x_base + 16 + j + 1]) as f32;
+                acc = float::fma_rn_f32(xi0, x0, acc);
+                acc = float::fma_rn_f32(xi1, x1, acc);
+                j += 2;
             }
             acc
         }
@@ -194,10 +236,14 @@ mod kernels {
             let mut acc = 0.0f32;
             let mut i = 0usize;
             while i < 32 {
-                let q = packed[off + 2 + i] as i8 as f32;
-                let xi = f16::from_bits(x[x_base + i]) as f32;
-                acc = float::fma_rn_f32(d * q, xi, acc);
-                i += 1;
+                let q = u16::from_le_bytes([packed[off + 2 + i], packed[off + 3 + i]]);
+                let q0 = (q & 0x00FF) as u8 as i8 as f32;
+                let q1 = (q >> 8) as u8 as i8 as f32;
+                let x0 = f16::from_bits(x[x_base + i]) as f32;
+                let x1 = f16::from_bits(x[x_base + i + 1]) as f32;
+                acc = float::fma_rn_f32(d * q0, x0, acc);
+                acc = float::fma_rn_f32(d * q1, x1, acc);
+                i += 2;
             }
             acc
         }
@@ -213,10 +259,14 @@ mod kernels {
             let mut acc = 0.0f32;
             let mut i = 0usize;
             while i < 32 {
-                let q = packed[off + 4 + i] as i8 as f32;
-                let xi = f16::from_bits(x[x_base + i]) as f32;
-                acc = float::fma_rn_f32(d * q, xi, acc);
-                i += 1;
+                let q = u16::from_le_bytes([packed[off + 4 + i], packed[off + 5 + i]]);
+                let q0 = (q & 0x00FF) as u8 as i8 as f32;
+                let q1 = (q >> 8) as u8 as i8 as f32;
+                let x0 = f16::from_bits(x[x_base + i]) as f32;
+                let x1 = f16::from_bits(x[x_base + i + 1]) as f32;
+                acc = float::fma_rn_f32(d * q0, x0, acc);
+                acc = float::fma_rn_f32(d * q1, x1, acc);
+                i += 2;
             }
             acc
         }
