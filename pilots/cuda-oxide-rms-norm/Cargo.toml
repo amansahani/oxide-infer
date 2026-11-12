@@ -1,0 +1,18 @@
+# Pilot: cuda-oxide ports of oxide-infer kernels.
+# Standalone workspace (not part of oxide-infer's), pinned to the cuda-oxide
+# toolchain via rust-toolchain.toml. Follows the same pattern as
+# cuda-oxide's examples/gemm_sol_final.
+[package]
+name = "pilot_rms_norm"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace]
+
+[dependencies]
+cuda-device = { path = "../../../cuda-oxide/cuda-oxide/crates/cuda-device" }
+cuda-host = { path = "../../../cuda-oxide/cuda-oxide/crates/cuda-host" }
+cuda-core = { path = "../../../cuda-oxide/cuda-core" }
+half = "2.4"
+ptx-parse = { path = "../../../cuda-oxide/cuda-oxide/crates/ptx-parse" }

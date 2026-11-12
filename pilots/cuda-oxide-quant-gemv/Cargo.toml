@@ -1,0 +1,17 @@
+# Pilot: quantized GEMV in cuda-oxide, monomorphized per quant variant.
+# Standalone workspace (not part of oxide-infer's), pinned to cuda-oxide's
+# toolchain via rust-toolchain.toml. Follows cuda-oxide's examples layout.
+[package]
+name = "pilot_quant_gemv"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace]
+
+[dependencies]
+cuda-device = { path = "../../../cuda-oxide/cuda-oxide/crates/cuda-device" }
+cuda-host = { path = "../../../cuda-oxide/cuda-oxide/crates/cuda-host" }
+cuda-core = { path = "../../../cuda-oxide/cuda-core" }
+half = "2.4"
+ptx-parse = { path = "../../../cuda-oxide/cuda-oxide/crates/ptx-parse" }

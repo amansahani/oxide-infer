@@ -1,0 +1,6 @@
+# build artifacts from cargo-oxide / cargo
+**/target/
+**/.oxide-artifacts/
+*.ptx
+*.ll
+Cargo.lock
