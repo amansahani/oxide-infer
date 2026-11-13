@@ -18,7 +18,7 @@ use cuda_device::cuda_module;
 
 #[cuda_module]
 mod kernels {
-    use cuda_device::{DisjointSlice, SharedArray, convert, float, kernel, thread, warp};
+    use cuda_device::{DisjointSlice, SharedArray, convert, dotprod, float, kernel, thread, warp};
 
     pub trait QuantVariant {
         const BLOCK_BYTES: usize;
@@ -1261,6 +1261,178 @@ mod kernels {
         val
     }
 
+    // =============================================================
+    // MMVQ int8 dp4a path.
+    //
+    // Activations are pre-quantized to ggml q8_1 blocks (36 bytes per
+    // 32 elements: f16 d, f16 s = raw f32 sum over the block, 32 * i8)
+    // by quantize_q8_1_f16. Weights stay packed ggml Q4_0 and are dotted
+    // against the q8_1 activations with dp4a.s32. This mirrors llama.cpp's
+    // GGML_CUDA_CC_GENERIC MMVQ configuration (4 warps per row, vdr = 2,
+    // one row per CTA) - the kernel llama.cpp actually launches for
+    // batch = 1 decode, not MMQ (which is for batch >= 8 / mma).
+    // =============================================================
+
+    /// Quantize f16 activations to ggml q8_1 blocks.
+    /// Launch: grid (n_elems / 32, B, 1), block (32, 1, 1).
+    /// n_elems must be a multiple of 32 (all LFM3 dims are).
+    #[kernel]
+    pub fn quantize_q8_1_f16(x: &[u16], mut y: DisjointSlice<u8>, n_elems: u32) {
+        let ib = thread::blockIdx_x() as usize;
+        let b = thread::blockIdx_y() as usize;
+        let lane = thread::threadIdx_x() as usize;
+        let nblocks = (n_elems / 32) as usize;
+        let i = b * n_elems as usize + ib * 32 + lane;
+        let xv = if i < x.len() {
+            f16::from_bits(unsafe { *x.get_unchecked(i) }) as f32
+        } else {
+            0.0f32
+        };
+        let mut amax = if xv < 0.0 { -xv } else { xv };
+        let mut sum = xv;
+        let mut m = 16u32;
+        while m > 0 {
+            let o = warp::shuffle_xor_f32_sync(0xffff_ffff, amax, m);
+            amax = if o > amax { o } else { amax };
+            sum += warp::shuffle_xor_f32_sync(0xffff_ffff, sum, m);
+            m >>= 1;
+        }
+        let d = amax / 127.0;
+        let qv = if amax == 0.0 { 0.0f32 } else { xv / d };
+        let t = if qv >= 0.0 { qv + 0.5 } else { qv - 0.5 };
+        let mut qi = t as i32;
+        if qi > 127 {
+            qi = 127;
+        } else if qi < -127 {
+            qi = -127;
+        }
+        let off = (b * nblocks + ib) * 36;
+        if lane == 0 {
+            let ds = convert::cvt_f16x2_f32(d, sum);
+            // q8_1 blocks are 36 bytes: advance by the block index in units of u32 (9 per block), not 1.
+            unsafe { ((y.as_mut_ptr() as *mut u32).add((b * nblocks + ib) * 9)).write(ds) };
+        }
+        unsafe { *y.get_unchecked_mut(off + 4 + lane) = qi as i8 as u8; }
+    }
+
+    /// dp4a dot for one (Q4_0 weight block, Q8_1 activation block) pair.
+    /// `kqs` is the thread's quant offset (0 or 2 for the MMVQ vdr = 2 layout).
+    /// Weight bytes: [d (2B) | qs (16B)]; activation bytes: [ds (4B) | qs (32B)].
+    #[inline(always)]
+    fn mmvq_vec_dot_q4_0(w: &[u8], yq: &[u8], row_off: usize, y_off: usize, kqs: usize) -> f32 {
+        let d4 = f16::from_bits(u16::from_le_bytes([
+            unsafe { *w.get_unchecked(row_off) },
+            unsafe { *w.get_unchecked(row_off + 1) },
+        ])) as f32;
+        let qs = unsafe { w.as_ptr().add(row_off + 2) } as *const u16;
+        let vi0 = unsafe { qs.add(2 * kqs).read() } as u32 | ((unsafe { qs.add(2 * kqs + 1).read() } as u32) << 16);
+        let vi1 = unsafe { qs.add(2 * kqs + 2).read() } as u32 | ((unsafe { qs.add(2 * kqs + 3).read() } as u32) << 16);
+
+        let yb = unsafe { yq.as_ptr().add(y_off) } as *const u32;
+        let ds = unsafe { yb.read() };
+        let (d8, s8) = convert::cvt_f32x2_f16x2(ds);
+        let qp = unsafe { yb.add(1) };
+        let u0 = unsafe { qp.add(kqs).read() };
+        let u1 = unsafe { qp.add(kqs + 1).read() };
+        let u2 = unsafe { qp.add(kqs + 4).read() };
+        let u3 = unsafe { qp.add(kqs + 5).read() };
+
+        let mut sumi: i32 = 0;
+        sumi = dotprod::dp4a_s32(vi0 & 0x0F0F_0F0F, u0, sumi);
+        sumi = dotprod::dp4a_s32((vi0 >> 4) & 0x0F0F_0F0F, u1, sumi);
+        sumi = dotprod::dp4a_s32(vi1 & 0x0F0F_0F0F, u2, sumi);
+        sumi = dotprod::dp4a_s32((vi1 >> 4) & 0x0F0F_0F0F, u3, sumi);
+        d4 * (sumi as f32 * d8 - 4.0 * s8)
+    }
+
+    /// MMVQ plain GEMV on packed Q4_0 weights against q8_1 activations.
+    /// Launch: grid (n_elems, B, 1), block (128, 1, 1). One CTA per row.
+    #[kernel]
+    pub fn mmvq_q4_0(w: &[u8], yq: &[u8], mut y: DisjointSlice<u16>, hidden: u32, n_elems: u32) {
+        static mut SCRATCH: SharedArray<f32, 96> = SharedArray::UNINIT;
+        let tid = thread::threadIdx_x() as usize;
+        let lane = tid & 31;
+        let warp_id = tid / 32;
+        let row = thread::blockIdx_x() as usize;
+        let b = thread::blockIdx_y() as usize;
+        if row >= n_elems as usize {
+            return;
+        }
+        let n_blocks = (hidden / 32) as usize;
+        let row_off = row * n_blocks * 18;
+        let kqs = 2 * (tid % 2);
+
+        let mut tmp = 0.0f32;
+        let mut kbx = tid / 2;
+        while kbx < n_blocks {
+            tmp += mmvq_vec_dot_q4_0(w, yq, row_off + kbx * 18, (b * n_blocks + kbx) * 36, kqs);
+            kbx += 64;
+        }
+
+        if warp_id > 0 {
+            unsafe { SCRATCH[(warp_id - 1) * 32 + lane] = tmp; }
+        }
+        thread::sync_threads();
+        if warp_id == 0 {
+            tmp += unsafe { SCRATCH[lane] } + unsafe { SCRATCH[32 + lane] } + unsafe { SCRATCH[64 + lane] };
+            tmp = warp_tree_sum(tmp);
+            if lane == 0 {
+                let packed32 = convert::cvt_f16x2_f32(tmp, 0.0);
+                unsafe { *y.get_unchecked_mut(b * n_elems as usize + row) = packed32 as u16; }
+            }
+        }
+    }
+
+    /// MMVQ fused dual GEMV (W1, W3) + SwiGLU on packed Q4_0 weights.
+    /// Launch: grid (n_elems, B, 1), block (128, 1, 1).
+    /// act[row] = f16(up * silu(gate)) with gate = W1 dot, up = W3 dot.
+    #[kernel]
+    pub fn mmvq_dual_swiglu_q4_0(w1: &[u8], w3: &[u8], yq: &[u8], mut act: DisjointSlice<u16>, hidden: u32, n_elems: u32) {
+        static mut SCRATCH1: SharedArray<f32, 96> = SharedArray::UNINIT;
+        static mut SCRATCH3: SharedArray<f32, 96> = SharedArray::UNINIT;
+        let tid = thread::threadIdx_x() as usize;
+        let lane = tid & 31;
+        let warp_id = tid / 32;
+        let row = thread::blockIdx_x() as usize;
+        let b = thread::blockIdx_y() as usize;
+        if row >= n_elems as usize {
+            return;
+        }
+        let n_blocks = (hidden / 32) as usize;
+        let row_off = row * n_blocks * 18;
+        let kqs = 2 * (tid % 2);
+
+        let mut acc1 = 0.0f32;
+        let mut acc3 = 0.0f32;
+        let mut kbx = tid / 2;
+        while kbx < n_blocks {
+            let y_off = (b * n_blocks + kbx) * 36;
+            acc1 += mmvq_vec_dot_q4_0(w1, yq, row_off + kbx * 18, y_off, kqs);
+            acc3 += mmvq_vec_dot_q4_0(w3, yq, row_off + kbx * 18, y_off, kqs);
+            kbx += 64;
+        }
+
+        if warp_id > 0 {
+            unsafe {
+                SCRATCH1[(warp_id - 1) * 32 + lane] = acc1;
+                SCRATCH3[(warp_id - 1) * 32 + lane] = acc3;
+            }
+        }
+        thread::sync_threads();
+        if warp_id == 0 {
+            acc1 += unsafe { SCRATCH1[lane] } + unsafe { SCRATCH1[32 + lane] } + unsafe { SCRATCH1[64 + lane] };
+            acc3 += unsafe { SCRATCH3[lane] } + unsafe { SCRATCH3[32 + lane] } + unsafe { SCRATCH3[64 + lane] };
+            acc1 = warp_tree_sum(acc1);
+            acc3 = warp_tree_sum(acc3);
+            if lane == 0 {
+                let ex = float::ex2_approx_f32(acc1 * -1.4426950208889634f32);
+                let value = acc3 * (acc1 / (1.0 + ex));
+                let packed32 = convert::cvt_f16x2_f32(value, 0.0);
+                unsafe { *act.get_unchecked_mut(b * n_elems as usize + row) = packed32 as u16; }
+            }
+        }
+    }
+
     /// Fused dual GEMV (W1, W3) + SwiGLU activation.
     /// One warp per row, 4 warps per CTA; grid (INTER / 4, B, 1).
     /// act[b*n + row] = f16(up(row) * silu(gate(row))).
@@ -1881,6 +2053,187 @@ macro_rules! case {
     }};
 }
 
+// ---- int8 MMVQ path: host-side reference + bench -------------------------------------
+fn q8_1_quantize_host(x_f16: &[u16]) -> Vec<u8> {
+    let nblocks = x_f16.len() / 32;
+    let mut out = vec![0u8; nblocks * 36];
+    for ib in 0..nblocks {
+        let xs: Vec<f32> = (0..32).map(|l| f16::from_bits(x_f16[ib * 32 + l]).to_f32()).collect();
+        // Mirror the kernel's butterfly (xor-shuffle) reduction exactly:
+        // lane l receives from lane l ^ m at each step m in 16, 8, 4, 2, 1.
+        let mut am = xs.iter().map(|v| v.abs()).collect::<Vec<f32>>();
+        let mut sm = xs.clone();
+        for m in [16usize, 8, 4, 2, 1] {
+            let am0 = am.clone();
+            let sm0 = sm.clone();
+            for l in 0..32 {
+                let o = am0[l ^ m];
+                am[l] = if o > am0[l] { o } else { am0[l] };
+                sm[l] = sm0[l] + sm0[l ^ m];
+            }
+        }
+        let amax = am[0];
+        let sum = sm[0];
+        let d = amax / 127.0;
+        let d_bits = f16::from_f32(d).to_bits();
+        let s_bits = f16::from_f32(sum).to_bits();
+        out[ib * 36..ib * 36 + 2].copy_from_slice(&d_bits.to_le_bytes());
+        out[ib * 36 + 2..ib * 36 + 4].copy_from_slice(&s_bits.to_le_bytes());
+        for l in 0..32 {
+            let t = if amax == 0.0 { 0.0 } else { xs[l] / d };
+            let q = if t >= 0.0 { t + 0.5 } else { t - 0.5 };
+            let qi = (q as i32).clamp(-127, 127) as i8;
+            out[ib * 36 + 4 + l] = qi as u8;
+        }
+    }
+    out
+}
+
+fn mmvq_q4_0_host(w_packed: &[u8], yq: &[u8], hidden: usize, row: usize) -> f64 {
+    let n_blocks = hidden / 32;
+    let row_off = row * n_blocks * 18;
+    let dp4a = |a: u32, b: &[i8]| -> i64 {
+        let mut s = 0i64;
+        for lane in 0..4 {
+            s += (((a >> (8 * lane)) & 0xFF) as i64) * (b[lane] as i64);
+        }
+        s
+    };
+    let mut acc = 0.0f64;
+    for kbx in 0..n_blocks {
+        let off = row_off + kbx * 18;
+        let d4 = f16::from_le_bytes([w_packed[off], w_packed[off + 1]]).to_f64();
+        let qs = &w_packed[off + 2..off + 18];
+        let yb = &yq[kbx * 36..kbx * 36 + 36];
+        let d8 = f16::from_le_bytes([yb[0], yb[1]]).to_f64();
+        let s8 = f16::from_le_bytes([yb[2], yb[3]]).to_f64();
+        let yqs: Vec<i8> = yb[4..36].iter().map(|&b| b as i8).collect();
+        for &kqs in &[0usize, 2] {
+            let vi0 = u32::from_le_bytes([qs[4 * kqs], qs[4 * kqs + 1], qs[4 * kqs + 2], qs[4 * kqs + 3]]);
+            let vi1 = u32::from_le_bytes([qs[4 * kqs + 4], qs[4 * kqs + 5], qs[4 * kqs + 6], qs[4 * kqs + 7]]);
+            let mut sumi: i64 = 0;
+            sumi += dp4a(vi0 & 0x0F0F_0F0F, &yqs[4 * kqs..4 * kqs + 4]);
+            sumi += dp4a((vi0 >> 4) & 0x0F0F_0F0F, &yqs[4 * (kqs + 1)..4 * (kqs + 1) + 4]);
+            sumi += dp4a(vi1 & 0x0F0F_0F0F, &yqs[4 * (kqs + 4)..4 * (kqs + 4) + 4]);
+            sumi += dp4a((vi1 >> 4) & 0x0F0F_0F0F, &yqs[4 * (kqs + 5)..4 * (kqs + 5) + 4]);
+            acc += d4 * (sumi as f64 * d8 - 4.0 * s8);
+        }
+    }
+    acc
+}
+
+fn mmvq_check(stream: &cuda_core::Stream, module: &kernels::LoadedModule) -> bool {
+    use oxide_infer_core::quant::*;
+    let mut rng = Rng(0x243f_6a88_85a3_08d3);
+    let w1: Vec<f32> = (0..INTER * HIDDEN).map(|_| rng.f32(-1.5, 1.5)).collect();
+    let w3: Vec<f32> = (0..INTER * HIDDEN).map(|_| rng.f32(-1.5, 1.5)).collect();
+    let w2: Vec<f32> = (0..HIDDEN * INTER).map(|_| rng.f32(-1.5, 1.5)).collect();
+    let w1p = quantize_q4_0(&w1);
+    let w3p = quantize_q4_0(&w3);
+    let w2p = quantize_q4_0(&w2);
+    let x1_f32: Vec<f32> = (0..B * HIDDEN).map(|i| (i as f32 * 0.317 + 0.5).sin()).collect();
+    let x1_host: Vec<u16> = x1_f32.iter().map(|&v| to_bits(v)).collect();
+    let z_f32: Vec<f32> = (0..B * INTER).map(|i| (i as f32 * 0.71 + 1.0).cos()).collect();
+    let z_host: Vec<u16> = z_f32.iter().map(|&v| to_bits(v)).collect();
+
+    let x1_q8 = q8_1_quantize_host(&x1_host);
+    let z_q8 = q8_1_quantize_host(&z_host);
+
+    let w1_dev = DeviceBuffer::from_host(stream, &w1p).unwrap();
+    let w3_dev = DeviceBuffer::from_host(stream, &w3p).unwrap();
+    let w2_dev = DeviceBuffer::from_host(stream, &w2p).unwrap();
+    let x1_dev = DeviceBuffer::from_host(stream, &x1_host).unwrap();
+    let z_dev = DeviceBuffer::from_host(stream, &z_host).unwrap();
+    let x1_q8_dev = DeviceBuffer::from_host(stream, &x1_q8).unwrap();
+    let z_q8_dev = DeviceBuffer::from_host(stream, &z_q8).unwrap();
+    let mut x_q8_dev = DeviceBuffer::<u8>::zeroed(stream, x1_q8.len()).unwrap();
+    let mut act_dev = DeviceBuffer::<u16>::zeroed(stream, B * INTER).unwrap();
+    let mut out_dev = DeviceBuffer::<u16>::zeroed(stream, B * HIDDEN).unwrap();
+
+    // 1) quantizer byte-exact vs host mirror
+    let cfg_q = LaunchConfig { grid_dim: (((HIDDEN / 32) as u32), B as u32, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+    unsafe {
+        module.quantize_q8_1_f16(stream, cfg_q, &x1_dev, &mut x_q8_dev, HIDDEN as u32).expect("quantize launch");
+    }
+    stream.synchronize().unwrap();
+    let x_q8_got = x_q8_dev.to_host_vec(stream).unwrap();
+    let q_match = x_q8_got == x1_q8;
+    if !q_match {
+        let n = x_q8_got.len().min(x1_q8.len());
+        let mut ds_diff = 0usize;
+        let mut q_diff = 0usize;
+        let mut first = Vec::new();
+        for i in 0..n {
+            if x_q8_got[i] != x1_q8[i] {
+                let within = i % 36;
+                if within < 4 { ds_diff += 1; } else { q_diff += 1; }
+                if first.len() < 12 { first.push(i); }
+            }
+        }
+        eprintln!("q8_1 byte diff: ds bytes={} q bytes={} first offsets={:?}", ds_diff, q_diff, first);
+        // dump block 1 details
+        let ib = 1usize;
+        let xs: Vec<f32> = (0..32).map(|l| f16::from_bits(x1_host[ib * 32 + l]).to_f32()).collect();
+        let mut am = xs.iter().map(|v| v.abs()).collect::<Vec<f32>>();
+        let mut sm = xs.clone();
+        for m in [16usize, 8, 4, 2, 1] {
+            let am0 = am.clone();
+            let sm0 = sm.clone();
+            for l in 0..32 {
+                let o = am0[l ^ m];
+                am[l] = if o > am0[l] { o } else { am0[l] };
+                sm[l] = sm0[l] + sm0[l ^ m];
+            }
+        }
+        let seq: f32 = xs.iter().sum();
+        eprintln!("block 1: butterfly amax={} sum={} | sequential sum={}", am[0], sm[0], seq);
+        eprintln!("block 1: host d={:?} s={:?}", f16::from_f32(am[0]/127.0).to_bits(), f16::from_f32(sm[0]).to_bits());
+        eprintln!("block 1: x8 got bytes {:?} want {:?}", &x_q8_got[36..40], &x1_q8[36..40]);
+    }
+
+    // 2) fused dual swiglu int8
+    let cfg_d = LaunchConfig { grid_dim: (INTER as u32, B as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+    unsafe {
+        module.mmvq_dual_swiglu_q4_0(stream, cfg_d, &w1_dev, &w3_dev, &x1_q8_dev, &mut act_dev, HIDDEN as u32, INTER as u32)
+            .expect("mmvq dual launch");
+    }
+    // 3) plain gemv int8 (down projection)
+    let cfg_g = LaunchConfig { grid_dim: (HIDDEN as u32, B as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+    unsafe {
+        module.mmvq_q4_0(stream, cfg_g, &w2_dev, &z_q8_dev, &mut out_dev, INTER as u32, HIDDEN as u32)
+            .expect("mmvq gemv launch");
+    }
+    stream.synchronize().unwrap();
+    let act = act_dev.to_host_vec(stream).unwrap();
+    let out = out_dev.to_host_vec(stream).unwrap();
+
+    let silu = |g: f64| g / (1.0 + (-g * 1.4426950208889634f64).exp2());
+    let mut worst_act_rel = 0.0f64;
+    let mut worst_out_rel = 0.0f64;
+    for b in 0..B {
+        let xq = &x1_q8[b * (HIDDEN / 32) * 36..(b + 1) * (HIDDEN / 32) * 36];
+        let zq = &z_q8[b * (INTER / 32) * 36..(b + 1) * (INTER / 32) * 36];
+        for r in 0..INTER {
+            let g = mmvq_q4_0_host(&w1p, xq, HIDDEN, r);
+            let u = mmvq_q4_0_host(&w3p, xq, HIDDEN, r);
+            let reference = silu(g) * u;
+            let got = f16_to_f64(act[b * INTER + r]);
+            worst_act_rel = worst_act_rel.max((got - reference).abs() / (1.0 + reference.abs()));
+        }
+        for r in 0..HIDDEN {
+            let reference = mmvq_q4_0_host(&w2p, zq, INTER, r);
+            let got = f16_to_f64(out[b * HIDDEN + r]);
+            worst_out_rel = worst_out_rel.max((got - reference).abs() / (1.0 + reference.abs()));
+        }
+    }
+    let ok = q_match && worst_act_rel < 1e-2 && worst_out_rel < 1e-2;
+    println!("mmvq q4_0: quantizer {} | swiglu rel = {:.6} | gemv rel = {:.6} {}",
+             if q_match { "byte-exact" } else { "MISMATCH" },
+             worst_act_rel, worst_out_rel,
+             if ok { "ok" } else { "FAIL" });
+    ok
+}
+
 fn main() {
     let ctx = CudaContext::new(0).expect("CUDA context");
     let stream = ctx.default_stream();
@@ -1908,8 +2261,13 @@ fn main() {
         bench();
         return;
     }
+    let mmvq_ok = mmvq_check(&stream, &module);
+    if !mmvq_ok {
+        worst += 1;
+        eprintln!("mmvq int8 path FAILED");
+    }
     if worst == 0 {
-        println!("all {checks} variant(s) pass: packed kernels match host f64 reference");
+        println!("all {checks} variant(s) pass plus mmvq int8 path: kernels match host f64 reference");
     } else {
         eprintln!("{worst} variant(s) FAILED");
         std::process::exit(1);
@@ -1976,4 +2334,72 @@ fn bench() {
     bench_case!(fused_dual_gemv_swiglu_q5_k, "q5_k", quantize_q5_k, 256, stream, module);
     bench_case!(fused_dual_gemv_swiglu_q6_k, "q6_k", quantize_q6_k, 256, stream, module);
     bench_case!(fused_dual_gemv_swiglu_q8_k, "q8_k", quantize_q8_k, 256, stream, module);
+
+    // ---- int8 MMVQ path (the kernel llama.cpp launches at batch=1) ----
+    {
+        use oxide_infer_core::quant::*;
+        let quantized = quantize_q4_0(&vec![0.01f32; INTER * HIDDEN]);
+        let w3 = quantize_q4_0(&vec![0.01f32; INTER * HIDDEN]);
+        let x_host: Vec<u16> = (0..HIDDEN).map(|i| f16::from_f32((i as f32 * 0.01).sin()).to_bits()).collect();
+        let x_q8 = q8_1_quantize_host(&x_host);
+        let w_dev = DeviceBuffer::from_host(&stream, &quantized).unwrap();
+        let w3_dev = DeviceBuffer::from_host(&stream, &w3).unwrap();
+        let x_q8_dev = DeviceBuffer::from_host(&stream, &x_q8).unwrap();
+        let mut act_dev = DeviceBuffer::<u16>::zeroed(&stream, INTER).unwrap();
+
+        let cfg_q = LaunchConfig { grid_dim: ((HIDDEN / 32) as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+        let cfg_d = LaunchConfig { grid_dim: (INTER as u32, 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+        let cfg_g = LaunchConfig { grid_dim: (HIDDEN as u32, 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+        let x_dev2 = DeviceBuffer::from_host(&stream, &x_host).unwrap();
+        let mut x_q8_out_dev = DeviceBuffer::<u8>::zeroed(&stream, x_q8.len()).unwrap();
+        unsafe {
+            module.quantize_q8_1_f16(&stream, cfg_q, &x_dev2, &mut x_q8_out_dev, HIDDEN as u32).expect("q launch");
+        }
+        unsafe {
+            module.mmvq_dual_swiglu_q4_0(&stream, cfg_d, &w_dev, &w3_dev, &x_q8_dev, &mut act_dev, HIDDEN as u32, INTER as u32).expect("d launch");
+        }
+        stream.synchronize().unwrap();
+
+        let t0 = std::time::Instant::now();
+        let iters = 100;
+        for _ in 0..iters {
+            unsafe {
+                module.mmvq_dual_swiglu_q4_0(&stream, cfg_d, &w_dev, &w3_dev, &x_q8_dev, &mut act_dev, HIDDEN as u32, INTER as u32).expect("d launch");
+            }
+        }
+        stream.synchronize().unwrap();
+        let dt = t0.elapsed().as_secs_f64() / iters as f64;
+        let bytes = 2.0 * quantized.len() as f64 + x_q8.len() as f64;
+        println!("mmvq_dual_swiglu q4_0: {:.3} ms/launch | {:.1} GB/s", dt * 1e3, bytes / dt / 1e9);
+
+        let mut out_dev = DeviceBuffer::<u16>::zeroed(&stream, HIDDEN).unwrap();
+        let z_host: Vec<u16> = (0..INTER).map(|i| f16::from_f32((i as f32 * 0.02).sin()).to_bits()).collect();
+        let z_q8 = q8_1_quantize_host(&z_host);
+        let z_q8_dev = DeviceBuffer::from_host(&stream, &z_q8).unwrap();
+        let w2 = quantize_q4_0(&vec![0.01f32; HIDDEN * INTER]);
+        let w2_dev = DeviceBuffer::from_host(&stream, &w2).unwrap();
+        unsafe {
+            module.mmvq_q4_0(&stream, cfg_g, &w2_dev, &z_q8_dev, &mut out_dev, INTER as u32, HIDDEN as u32).expect("g launch");
+        }
+        stream.synchronize().unwrap();
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            unsafe {
+                module.mmvq_q4_0(&stream, cfg_g, &w2_dev, &z_q8_dev, &mut out_dev, INTER as u32, HIDDEN as u32).expect("g launch");
+            }
+        }
+        stream.synchronize().unwrap();
+        let dt = t0.elapsed().as_secs_f64() / iters as f64;
+        let bytes = w2.len() as f64 + z_q8.len() as f64;
+        println!("mmvq_gemv        q4_0: {:.3} ms/launch | {:.1} GB/s", dt * 1e3, bytes / dt / 1e9);
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            unsafe {
+                module.quantize_q8_1_f16(&stream, cfg_q, &x_dev2, &mut x_q8_out_dev, HIDDEN as u32).expect("q launch");
+            }
+        }
+        stream.synchronize().unwrap();
+        println!("quantize_q8_1    f16 : {:.4} ms/launch", t0.elapsed().as_secs_f64() / iters as f64 * 1e3);
+    }
 }
