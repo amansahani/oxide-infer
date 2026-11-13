@@ -1,4 +1,5 @@
 use anyhow::Result;
+use oxide_infer_kernels::quant_gemv::{QuantGemv, supported as quant_gemv_supported};
 use oxide_infer_core::{DeviceBuffer, GpuContext, SafeTensorsLoader};
 use oxide_infer_kernels::PtxModule;
 use oxide_infer_kernels::conv::CAUSAL_CONV1D_FP16_PTX;
@@ -168,6 +169,11 @@ pub struct CausalConvLayer {
     pub in_proj: DeviceBuffer<half::f16>,
     pub conv_weight: DeviceBuffer<half::f16>,
     pub out_proj: DeviceBuffer<half::f16>,
+    /// Packed ggml bytes (additive)
+    pub in_packed: Option<DeviceBuffer<u8>>,
+    pub out_packed: Option<DeviceBuffer<u8>>,
+    pub quant_type: Option<oxide_infer_core::quant::QuantType>,
+    quant_gemv: Option<QuantGemv>,
     pub state_cache: DeviceBuffer<half::f16>,
     pub bcx_buffer: DeviceBuffer<half::f16>,
     pub bx_buffer: DeviceBuffer<half::f16>,
@@ -204,6 +210,16 @@ impl CausalConvLayer {
         let conv_weight = convert_bf16_to_f16(&conv_bf16)?;
         let out_proj = convert_bf16_to_f16(&out_proj_bf16)?;
 
+        let quant_type = loader.quant_type();
+        let (in_packed, out_packed, quant_gemv) = match quant_type {
+            Some(qt) if quant_gemv_supported(qt) => (
+                Some(loader.load_tensor_packed_gpu(gpu, &format!("{}.in_proj.weight", prefix))?),
+                Some(loader.load_tensor_packed_gpu(gpu, &format!("{}.out_proj.weight", prefix))?),
+                Some(QuantGemv::new(gpu)?),
+            ),
+            _ => (None, None, None),
+        };
+
         let state_cache = DeviceBuffer::zeroed(gpu, hidden_size * k_len)?;
         let bcx_buffer = DeviceBuffer::zeroed(gpu, 3 * hidden_size)?;
         let bx_buffer = DeviceBuffer::zeroed(gpu, hidden_size)?;
@@ -217,6 +233,10 @@ impl CausalConvLayer {
             in_proj,
             conv_weight,
             out_proj,
+            in_packed,
+            out_packed,
+            quant_type,
+            quant_gemv,
             state_cache,
             bcx_buffer,
             bx_buffer,

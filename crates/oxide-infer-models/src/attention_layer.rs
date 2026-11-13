@@ -1,4 +1,5 @@
 use anyhow::Result;
+use oxide_infer_kernels::quant_gemv::{QuantGemv, supported as quant_gemv_supported};
 use oxide_infer_core::{DeviceBuffer, GpuContext, SafeTensorsLoader};
 use oxide_infer_kernels::PtxModule;
 use oxide_infer_kernels::norm::RMS_NORM_FP16_PTX;
@@ -200,6 +201,15 @@ pub struct Lfm3AttentionLayer {
     pub v_proj: DeviceBuffer<half::f16>,
     pub o_proj: DeviceBuffer<half::f16>,
     pub gate_proj: DeviceBuffer<half::f16>,
+    /// Packed ggml bytes (additive); present iff the checkpoint is quantized
+    /// and the variant has a packed kernel.
+    pub q_packed: Option<DeviceBuffer<u8>>,
+    pub k_packed: Option<DeviceBuffer<u8>>,
+    pub v_packed: Option<DeviceBuffer<u8>>,
+    pub o_packed: Option<DeviceBuffer<u8>>,
+    pub gate_packed: Option<DeviceBuffer<u8>>,
+    pub quant_type: Option<oxide_infer_core::quant::QuantType>,
+    quant_gemv: Option<QuantGemv>,
     pub q_norm: DeviceBuffer<half::f16>,
     pub k_norm: DeviceBuffer<half::f16>,
     pub k_cache: DeviceBuffer<half::f16>,
@@ -252,6 +262,19 @@ impl Lfm3AttentionLayer {
         let q_norm = convert_bf16_to_f16(&q_norm_bf16)?;
         let k_norm = convert_bf16_to_f16(&k_norm_bf16)?;
 
+        let quant_type = loader.quant_type();
+        let (q_packed, k_packed, v_packed, o_packed, gate_packed, quant_gemv) = match quant_type {
+            Some(qt) if quant_gemv_supported(qt) => (
+                Some(loader.load_tensor_packed_gpu(gpu, &format!("{}.q_proj.weight", prefix))?),
+                Some(loader.load_tensor_packed_gpu(gpu, &format!("{}.k_proj.weight", prefix))?),
+                Some(loader.load_tensor_packed_gpu(gpu, &format!("{}.v_proj.weight", prefix))?),
+                Some(loader.load_tensor_packed_gpu(gpu, &format!("{}.o_proj.weight", prefix))?),
+                Some(loader.load_tensor_packed_gpu(gpu, &format!("{}.gate_proj.weight", prefix))?),
+                Some(QuantGemv::new(gpu)?),
+            ),
+            _ => (None, None, None, None, None, None),
+        };
+
         // Cache capacity: 512 tokens
         let k_cache = DeviceBuffer::zeroed(gpu, 512 * num_kv_heads * head_dim)?;
         let v_cache = DeviceBuffer::zeroed(gpu, 512 * num_kv_heads * head_dim)?;
@@ -268,6 +291,13 @@ impl Lfm3AttentionLayer {
             v_proj,
             o_proj,
             gate_proj,
+            q_packed,
+            k_packed,
+            v_packed,
+            o_packed,
+            gate_packed,
+            quant_type,
+            quant_gemv,
             q_norm,
             k_norm,
             k_cache,

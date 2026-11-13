@@ -834,10 +834,29 @@ impl BatchEngine {
                     return Err(anyhow!("layer {l_idx} expected conv"));
                 };
                 // in_proj: [6144, 2048] x [2048, B]
-                let d_w = conv.in_proj.inner().cu_deviceptr();
                 let d_x = self.scratch.norm.inner().cu_deviceptr();
-                let d_y = self.scratch.bcx.inner_mut().cu_deviceptr();
-                self.lt.gemm(stream, 3 * HIDDEN, HIDDEN, b, d_w, d_x, d_y)?;
+                let x_len = b_u32 as u64 * HIDDEN as u64;
+                let packed_on = std::env::var("OXIDE_DISABLE_PACKED").is_err();
+                if packed_on && conv.in_packed.is_some() && conv.quant_type.is_some() {
+                    let (ip, qt) = (conv.in_packed.as_ref().unwrap(), conv.quant_type.unwrap());
+                    static PRINTED: std::sync::Once = std::sync::Once::new();
+                    PRINTED.call_once(|| eprintln!("[quant-gemv] packed conv in_proj active"));
+                    let y_len = b_u32 as u64 * 3 * HIDDEN as u64;
+                    self.quant_gemv.gemv(
+                        stream,
+                        qt,
+                        (ip.inner().cu_deviceptr(), ip.inner().len() as u64),
+                        (d_x, x_len),
+                        (self.scratch.bcx.inner_mut().cu_deviceptr(), y_len),
+                        HIDDEN as u32,
+                        (3 * HIDDEN) as u32,
+                        b_u32,
+                    )?;
+                } else {
+                    let d_w = conv.in_proj.inner().cu_deviceptr();
+                    let d_y = self.scratch.bcx.inner_mut().cu_deviceptr();
+                    self.lt.gemm(stream, 3 * HIDDEN, HIDDEN, b, d_w, d_x, d_y)?;
+                }
                 phase!();
 
                 let mut d_y = fptr_mut(&mut self.scratch.conv_y);
@@ -903,10 +922,29 @@ impl BatchEngine {
                 phase!();
 
                 // out_proj: [2048, 2048] x [2048, B]
-                let d_w = conv.out_proj.inner().cu_deviceptr();
                 let d_x = self.scratch.conv_y.inner().cu_deviceptr();
-                let d_y = self.scratch.layer.inner_mut().cu_deviceptr();
-                self.lt.gemm(stream, HIDDEN, HIDDEN, b, d_w, d_x, d_y)?;
+                let x_len = b_u32 as u64 * HIDDEN as u64;
+                let packed_on = std::env::var("OXIDE_DISABLE_PACKED").is_err();
+                if packed_on && conv.out_packed.is_some() && conv.quant_type.is_some() {
+                    let (op, qt) = (conv.out_packed.as_ref().unwrap(), conv.quant_type.unwrap());
+                    static PRINTED2: std::sync::Once = std::sync::Once::new();
+                    PRINTED2.call_once(|| eprintln!("[quant-gemv] packed conv out_proj active"));
+                    let y_len = b_u32 as u64 * HIDDEN as u64;
+                    self.quant_gemv.gemv(
+                        stream,
+                        qt,
+                        (op.inner().cu_deviceptr(), op.inner().len() as u64),
+                        (d_x, x_len),
+                        (self.scratch.layer.inner_mut().cu_deviceptr(), y_len),
+                        HIDDEN as u32,
+                        HIDDEN as u32,
+                        b_u32,
+                    )?;
+                } else {
+                    let d_w = conv.out_proj.inner().cu_deviceptr();
+                    let d_y = self.scratch.layer.inner_mut().cu_deviceptr();
+                    self.lt.gemm(stream, HIDDEN, HIDDEN, b, d_w, d_x, d_y)?;
+                }
                 phase!();
             } else {
                 let LayerType::Attention(attn) = &layer.inner_layer else {
@@ -915,18 +953,79 @@ impl BatchEngine {
 
                 // Q/K/V/gate projections.
                 let d_x = self.scratch.norm.inner().cu_deviceptr();
-                let d_qw = attn.q_proj.inner().cu_deviceptr();
+                let x_len = b_u32 as u64 * HIDDEN as u64;
                 let d_q = self.scratch.q.inner_mut().cu_deviceptr();
-                self.lt.gemm(stream, HIDDEN, HIDDEN, b, d_qw, d_x, d_q)?;
-                let d_kw = attn.k_proj.inner().cu_deviceptr();
                 let d_k = self.scratch.k.inner_mut().cu_deviceptr();
-                self.lt.gemm(stream, KV_DIM, HIDDEN, b, d_kw, d_x, d_k)?;
-                let d_vw = attn.v_proj.inner().cu_deviceptr();
                 let d_v = self.scratch.v.inner_mut().cu_deviceptr();
-                self.lt.gemm(stream, KV_DIM, HIDDEN, b, d_vw, d_x, d_v)?;
-                let d_gw = attn.gate_proj.inner().cu_deviceptr();
                 let d_g = self.scratch.gate.inner_mut().cu_deviceptr();
-                self.lt.gemm(stream, NUM_Q_HEADS, HIDDEN, b, d_gw, d_x, d_g)?;
+                let packed_on = std::env::var("OXIDE_DISABLE_PACKED").is_err();
+                if packed_on
+                    && attn.q_packed.is_some()
+                    && attn.k_packed.is_some()
+                    && attn.v_packed.is_some()
+                    && attn.gate_packed.is_some()
+                    && attn.quant_type.is_some()
+                {
+                    let qp = attn.q_packed.as_ref().unwrap();
+                    let kp = attn.k_packed.as_ref().unwrap();
+                    let vp = attn.v_packed.as_ref().unwrap();
+                    let gp = attn.gate_packed.as_ref().unwrap();
+                    let qt = attn.quant_type.unwrap();
+                    static PRINTED3: std::sync::Once = std::sync::Once::new();
+                    PRINTED3.call_once(|| eprintln!("[quant-gemv] packed attention projections active"));
+                    let q_len = b_u32 as u64 * HIDDEN as u64;
+                    self.quant_gemv.gemv(
+                        stream,
+                        qt,
+                        (qp.inner().cu_deviceptr(), qp.inner().len() as u64),
+                        (d_x, x_len),
+                        (d_q, q_len),
+                        HIDDEN as u32,
+                        HIDDEN as u32,
+                        b_u32,
+                    )?;
+                    let kv_len = b_u32 as u64 * KV_DIM as u64;
+                    self.quant_gemv.gemv(
+                        stream,
+                        qt,
+                        (kp.inner().cu_deviceptr(), kp.inner().len() as u64),
+                        (d_x, x_len),
+                        (d_k, kv_len),
+                        HIDDEN as u32,
+                        KV_DIM as u32,
+                        b_u32,
+                    )?;
+                    self.quant_gemv.gemv(
+                        stream,
+                        qt,
+                        (vp.inner().cu_deviceptr(), vp.inner().len() as u64),
+                        (d_x, x_len),
+                        (d_v, kv_len),
+                        HIDDEN as u32,
+                        KV_DIM as u32,
+                        b_u32,
+                    )?;
+                    let gate_len = b_u32 as u64 * NUM_Q_HEADS as u64;
+                    self.quant_gemv.gemv(
+                        stream,
+                        qt,
+                        (gp.inner().cu_deviceptr(), gp.inner().len() as u64),
+                        (d_x, x_len),
+                        (d_g, gate_len),
+                        HIDDEN as u32,
+                        NUM_Q_HEADS as u32,
+                        b_u32,
+                    )?;
+                } else {
+                    let d_qw = attn.q_proj.inner().cu_deviceptr();
+                    self.lt.gemm(stream, HIDDEN, HIDDEN, b, d_qw, d_x, d_q)?;
+                    let d_kw = attn.k_proj.inner().cu_deviceptr();
+                    self.lt.gemm(stream, KV_DIM, HIDDEN, b, d_kw, d_x, d_k)?;
+                    let d_vw = attn.v_proj.inner().cu_deviceptr();
+                    self.lt.gemm(stream, KV_DIM, HIDDEN, b, d_vw, d_x, d_v)?;
+                    let d_gw = attn.gate_proj.inner().cu_deviceptr();
+                    self.lt.gemm(stream, NUM_Q_HEADS, HIDDEN, b, d_gw, d_x, d_g)?;
+                }
                 phase!();
 
                 let mut eps = 1e-5f32;
@@ -1242,10 +1341,29 @@ impl BatchEngine {
                 }
 
                 // o_proj: [2048, 2048] x [2048, B]
-                let d_w = attn.o_proj.inner().cu_deviceptr();
                 let d_x = self.scratch.ctx.inner().cu_deviceptr();
-                let d_y = self.scratch.layer.inner_mut().cu_deviceptr();
-                self.lt.gemm(stream, HIDDEN, HIDDEN, b, d_w, d_x, d_y)?;
+                let x_len = b_u32 as u64 * HIDDEN as u64;
+                let packed_on = std::env::var("OXIDE_DISABLE_PACKED").is_err();
+                if packed_on && attn.o_packed.is_some() && attn.quant_type.is_some() {
+                    let (op, qt) = (attn.o_packed.as_ref().unwrap(), attn.quant_type.unwrap());
+                    static PRINTED4: std::sync::Once = std::sync::Once::new();
+                    PRINTED4.call_once(|| eprintln!("[quant-gemv] packed o_proj active"));
+                    let y_len = b_u32 as u64 * HIDDEN as u64;
+                    self.quant_gemv.gemv(
+                        stream,
+                        qt,
+                        (op.inner().cu_deviceptr(), op.inner().len() as u64),
+                        (d_x, x_len),
+                        (self.scratch.layer.inner_mut().cu_deviceptr(), y_len),
+                        HIDDEN as u32,
+                        HIDDEN as u32,
+                        b_u32,
+                    )?;
+                } else {
+                    let d_w = attn.o_proj.inner().cu_deviceptr();
+                    let d_y = self.scratch.layer.inner_mut().cu_deviceptr();
+                    self.lt.gemm(stream, HIDDEN, HIDDEN, b, d_w, d_x, d_y)?;
+                }
                 phase!();
             }
 
