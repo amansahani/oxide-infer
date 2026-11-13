@@ -184,6 +184,12 @@ pub struct BatchEngine {
     lt: LtGemm,
     rms_norm: Function,
     residual_add: Function,
+    fused_post_norm_res_add: Function,
+    /// Env-gated (OXIDE_GLUE_FUSED=1): fused post-norm + residual glue.
+    /// Measured: 0.07-0.08 ms/token saved, but numerics diverge ~150 tokens
+    /// earlier than the two-kernel path (fma-based f32 path vs separate f16
+    /// roundings). Default off to keep the verified numerics baseline.
+    glue_fused: std::sync::OnceLock<bool>,
     swiglu: Function,
     conv: Function,
     qk_norm: Function,
@@ -430,6 +436,8 @@ impl BatchEngine {
             lt,
             rms_norm: norm_ptx.get_function("batched_rms_norm_vec8_fp16")?,
             residual_add: norm_ptx.get_function("batched_residual_add_fp16")?,
+            fused_post_norm_res_add: norm_ptx.get_function("fused_post_norm_residual_add_vec8_fp16_b")?,
+            glue_fused: std::sync::OnceLock::new(),
             swiglu: norm_ptx.get_function("batched_swiglu_separate_fp16")?,
             conv: conv_ptx.get_function("batched_fused_causal_conv1d_gating_ptr_fp16")?,
             qk_norm: attn_ptx.get_function("batched_qk_rmsnorm_fp16")?,
@@ -694,6 +702,16 @@ impl BatchEngine {
         }
         let b_u32 = b as u32;
         let stream = gpu.compute_stream();
+        // Optional whole-step timing: GPU busy vs wall (includes launch overhead).
+        let prof_step = std::env::var("OXIDE_PROFILE_STEP").is_ok();
+        let step_ev0 = if prof_step {
+            let e = gpu.context().new_event().map_err(|e| anyhow!("event: {e}"))?;
+            e.record(stream)?;
+            Some(e)
+        } else {
+            None
+        };
+        let step_wall0 = prof_step.then(std::time::Instant::now);
 
         // Optional per-phase device timing. Seven event pairs per layer:
         // operator norm, qkv/in_proj gemm, attention setup / conv prep,
@@ -1412,16 +1430,31 @@ impl BatchEngine {
                 phase!();
             }
 
-            // Post-operator norm (in place), then residual add.
-            launch_rms(
-                &self.rms_norm,
-                fptr_mut(&mut self.scratch.layer),
-                fptr(&self.scratch.layer),
-                fptr(&layer.post_operator_norm),
-                b_u32,
-                stream,
-            )?;
-            self.residual_add(&self.scratch.hidden, &self.scratch.layer, b_u32, stream)?;
+            // Post-operator norm + residual add
+            let d_layer = self.scratch.layer.inner_mut().cu_deviceptr();
+            let d_hid = self.scratch.hidden.inner_mut().cu_deviceptr();
+            let glue_fused = *self.glue_fused.get_or_init(|| {
+                std::env::var("OXIDE_GLUE_FUSED").map(|v| v == "1").unwrap_or(false)
+            });
+            if glue_fused {
+                self.fused_post_norm_res_add_b(
+                    d_hid,
+                    d_layer,
+                    fptr(&layer.post_operator_norm),
+                    b_u32,
+                    stream,
+                )?;
+            } else {
+                launch_rms(
+                    &self.rms_norm,
+                    d_layer,
+                    d_layer,
+                    fptr(&layer.post_operator_norm),
+                    b_u32,
+                    stream,
+                )?;
+                self.residual_add(&self.scratch.hidden, &self.scratch.layer, b_u32, stream)?;
+            }
 
             // FFN norm.
             launch_rms(
@@ -1564,16 +1597,31 @@ impl BatchEngine {
             }
             phase!();
 
-            // Post-FFN norm (in place) + residual add.
-            launch_rms(
-                &self.rms_norm,
-                fptr_mut(&mut self.scratch.ffn_out),
-                fptr(&self.scratch.ffn_out),
-                fptr(&layer.post_ffn_norm),
-                b_u32,
-                stream,
-            )?;
-            self.residual_add(&self.scratch.hidden, &self.scratch.ffn_out, b_u32, stream)?;
+            // Post-FFN norm + residual add
+            let d_ffn_out = self.scratch.ffn_out.inner_mut().cu_deviceptr();
+            let d_hid = self.scratch.hidden.inner_mut().cu_deviceptr();
+            let glue_fused = *self.glue_fused.get_or_init(|| {
+                std::env::var("OXIDE_GLUE_FUSED").map(|v| v == "1").unwrap_or(false)
+            });
+            if glue_fused {
+                self.fused_post_norm_res_add_b(
+                    d_hid,
+                    d_ffn_out,
+                    fptr(&layer.post_ffn_norm),
+                    b_u32,
+                    stream,
+                )?;
+            } else {
+                launch_rms(
+                    &self.rms_norm,
+                    d_ffn_out,
+                    d_ffn_out,
+                    fptr(&layer.post_ffn_norm),
+                    b_u32,
+                    stream,
+                )?;
+                self.residual_add(&self.scratch.hidden, &self.scratch.ffn_out, b_u32, stream)?;
+            }
             phase!();
         }
         debug_assert!(!prof || mark == 1 + layers.len() * 7);
@@ -1602,6 +1650,14 @@ impl BatchEngine {
 
         if prof {
             report_phases(&prof_ev[..mark], layers.len(), b, is_conv);
+        }
+        if let Some(e0) = &step_ev0 {
+            let e1 = gpu.context().new_event().map_err(|e| anyhow!("event: {e}"))?;
+            e1.record(stream)?;
+            stream.synchronize()?;
+            let gpu_ms = e0.elapsed_time(&e1)? as f64;
+            let wall_ms = step_wall0.map(|t| t.elapsed().as_secs_f64() * 1e3).unwrap_or(0.0);
+            eprintln!("[step] gpu {:.3} ms | wall {:.3} ms | gap {:.3} ms", gpu_ms, wall_ms, wall_ms - gpu_ms);
         }
         out.truncate(b);
         Ok(out)
@@ -1686,6 +1742,38 @@ impl BatchEngine {
         let mut out = self.sample_tail(gpu, b_u32, embed_table, emb_norm, stream)?;
         out.truncate(b);
         Ok(out)
+    }
+
+    /// Fused post-op norm + residual add:
+    ///   hidden += rms_norm(update) * weight, in one kernel.
+    /// Numerics differ from the two-kernel path at f32-rounding scale
+    /// (fma-based normalize instead of separate mul/add, single f16 rounding).
+    fn fused_post_norm_res_add_b(
+        &self,
+        residual_ptr: u64,
+        update_ptr: u64,
+        weight_ptr: u64,
+        b: u32,
+        stream: &cuda_core::Stream,
+    ) -> Result<()> {
+        let mut d_res = residual_ptr;
+        let mut d_upd = update_ptr;
+        let mut d_w = weight_ptr;
+        let mut eps = 1e-5f32;
+        let mut h = HIDDEN as u32;
+        let mut bs = b;
+        let mut args: [*mut c_void; 6] = [
+            &mut d_res as *mut _ as *mut c_void,
+            &mut d_upd as *mut _ as *mut c_void,
+            &mut d_w as *mut _ as *mut c_void,
+            &mut eps as *mut _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(&self.fused_post_norm_res_add, (1, b, 1), (256, 1, 1), 0, stream, &mut args)?;
+        }
+        Ok(())
     }
 
     fn residual_add(
