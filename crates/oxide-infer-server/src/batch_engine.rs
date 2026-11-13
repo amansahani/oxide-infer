@@ -287,12 +287,14 @@ fn fptr_mut(buf: &mut DeviceBuffer<f16>) -> u64 {
 }
 
 impl BatchEngine {
-    /// Packed projection GEMV dispatch. At batch = 1 with the int8 MMVQ path
-    /// enabled, activations are quantized to q8_1 (36B per 32 elements) and the
-    /// weights are consumed by a dp4a matvec kernel - the same kernel
-    /// llama.cpp launches for batch = 1 on sm_86. Otherwise the f32 packed
-    /// kernels are used. The q8_1 scratch is reused across calls in a wave
-    /// (stream-ordered).
+    /// Packed projection GEMV dispatch. With the int8 MMVQ path enabled
+    /// (default), activations are quantized to q8_1 (36B per 32 elements) and
+    /// the weights are consumed by a dp4a matvec kernel - the kernel
+    /// llama.cpp launches at batch = 1 on sm_86. The int8 kernels are
+    /// per-row independent (grid.y = batch, CTA per (row, batch), fixed
+    /// per-CTA reduction trees), so numerics are batch-shape invariant.
+    /// Otherwise the f32 packed kernels are used. The q8_1 scratch is reused
+    /// across calls in a wave (stream-ordered).
     #[allow(clippy::too_many_arguments)]
     fn gemv_dispatch(
         &self,
@@ -307,7 +309,7 @@ impl BatchEngine {
     ) -> anyhow::Result<()> {
         use oxide_infer_kernels::quant_gemv::{int8_mmvq_enabled, int8_mmvq_supported};
         let proj_int8 = std::env::var("OXIDE_MMVQ_INT8_PROJ").map(|v| v != "0").unwrap_or(true);
-        if int8_mmvq_enabled() && proj_int8 && int8_mmvq_supported(qt) && b == 1 {
+        if int8_mmvq_enabled() && proj_int8 && int8_mmvq_supported(qt) {
             let (x_ptr, x_len) = x_ptr_and_len;
             let q8_ptr = self.scratch.q8_1_hidden.inner().cu_deviceptr();
             let q8_len = (hidden as u64 / 32) * 36;
@@ -1479,7 +1481,6 @@ impl BatchEngine {
             let ffn_int8 = std::env::var("OXIDE_MMVQ_INT8_FFN").map(|v| v != "0").unwrap_or(true);
             let int8_ready = packed_ready
                 && ffn_int8
-                && b_u32 == 1
                 && oxide_infer_kernels::quant_gemv::int8_mmvq_enabled()
                 && oxide_infer_kernels::quant_gemv::int8_mmvq_supported(layer.ffn.quant_type.unwrap());
             if int8_ready {
