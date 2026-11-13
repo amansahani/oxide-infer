@@ -24,6 +24,26 @@ use oxide_infer_core::quant::QuantType;
 /// cuda-oxide-generated packed-weight GEMV kernels (committed artifact).
 pub const QUANT_GEMV_PTX: &str = include_str!("../../../kernels/quant-gemv/gemv.ptx");
 
+/// Which quant types the int8 MMVQ (dp4a) path supports.
+///
+/// llama.cpp launches the GENERIC MMVQ configuration for sm_86 at batch=1
+/// (4 warps per row, vdr=2, dp4a against q8_1-quantized activations), not
+/// MMQ (which targets batch >= 8 / mma). This port mirrors that exactly;
+/// Measured: 2x the f32 packed kernels at batch=1 (0.055 vs 0.114 ms for
+/// the FFN gate/up pair), ~323 GB/s (~90% of RTX 3060 DRAM peak).
+///
+/// Extend by porting the matching vec_dot for more types (same q8_1
+/// activations, different nibble layout per type).
+pub fn int8_mmvq_supported(qt: QuantType) -> bool {
+    matches!(qt, QuantType::Q4_0)
+}
+
+/// Whether the int8 MMVQ path is enabled. Escape hatch:
+/// `OXIDE_DISABLE_INT8_MMVQ=1` -> fall back to the f32 packed path.
+pub fn int8_mmvq_enabled() -> bool {
+    std::env::var("OXIDE_DISABLE_INT8_MMVQ").is_err()
+}
+
 /// Which GGML quantized types have packed kernels available.
 /// Whether this quant type has a packed kernel that beats HGEMM on the
 /// GPUs we actually target. Measured on RTX 3060 at batch=1:
@@ -129,6 +149,9 @@ pub struct QuantGemv {
     module: PtxModule,
     dual: HashMap<u8, Function>,
     plain: HashMap<u8, Function>,
+    quantize_q8_1: Function,
+    mmvq_dual: HashMap<u8, Function>,
+    mmvq_plain: HashMap<u8, Function>,
 }
 
 impl QuantGemv {
@@ -155,7 +178,14 @@ impl QuantGemv {
             dual.insert(qt as u8, module.get_function(dual_name(qt))?);
             plain.insert(qt as u8, module.get_function(gemv_name(qt))?);
         }
-        Ok(Self { module, dual, plain })
+        let mut mmvq_dual = HashMap::new();
+        let mut mmvq_plain = HashMap::new();
+        for &qt in &[QuantType::Q4_0] {
+            mmvq_dual.insert(qt as u8, module.get_function("mmvq_dual_swiglu_q4_0")?);
+            mmvq_plain.insert(qt as u8, module.get_function("mmvq_q4_0")?);
+        }
+        let quantize_q8_1 = module.get_function("quantize_q8_1_f16")?;
+        Ok(Self { module, dual, plain, quantize_q8_1, mmvq_dual, mmvq_plain })
     }
 
     /// Packed dual GEMV (W1, W3) + SwiGLU -> activated_buf.
@@ -250,6 +280,134 @@ impl QuantGemv {
             &mut y_len as *mut _ as *mut c_void,
             &mut hidden as *mut _ as *mut c_void,
             &mut n_blocks as *mut _ as *mut c_void,
+            &mut n_elems as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(
+                func,
+                (n_elems, b, 1),
+                (128, 1, 1),
+                0,
+                stream,
+                &mut args,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Quantize f16 activations to ggml q8_1 blocks.
+    /// `y_ptr_and_len` is a u8 scratch of at least `b * hidden/32 * 36` bytes.
+    pub fn quantize_q8_1(
+        &self,
+        stream: &Stream,
+        x_ptr_and_len: (u64, u64),
+        y_ptr_and_len: (u64, u64),
+        hidden: u32,
+        b: u32,
+    ) -> Result<()> {
+        let func = &self.quantize_q8_1;
+        let (mut x_ptr, mut x_len) = x_ptr_and_len;
+        let (mut y_ptr, mut y_len) = y_ptr_and_len;
+        let mut hidden = hidden;
+        let mut args: [*mut c_void; 5] = [
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut x_len as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut y_len as *mut _ as *mut c_void,
+            &mut hidden as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(
+                func,
+                (hidden / 32, b, 1),
+                (32, 1, 1),
+                0,
+                stream,
+                &mut args,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Int8 MMVQ fused dual GEMV (W1, W3) + SwiGLU on packed Q4_0 weights.
+    /// `yq_ptr_and_len` is the q8_1 scratch from `quantize_q8_1` (k = hidden).
+    /// `act` layout must match `dual_swiglu` (f16 [b * n_elems]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mmvq_dual_swiglu_q4_0(
+        &self,
+        stream: &Stream,
+        w1_ptr_and_len: (u64, u64),
+        w3_ptr_and_len: (u64, u64),
+        yq_ptr_and_len: (u64, u64),
+        act_ptr_and_len: (u64, u64),
+        hidden: u32,
+        n_elems: u32,
+        b: u32,
+    ) -> Result<()> {
+        let Some(func) = self.mmvq_dual.get(&(QuantType::Q4_0 as u8)) else {
+            bail!("mmvq_dual_swiglu kernel not available");
+        };
+        let (mut w1_ptr, mut w1_len) = w1_ptr_and_len;
+        let (mut w3_ptr, mut w3_len) = w3_ptr_and_len;
+        let (mut yq_ptr, mut yq_len) = yq_ptr_and_len;
+        let (mut act_ptr, mut act_len) = act_ptr_and_len;
+        let mut hidden = hidden;
+        let mut n_elems = n_elems;
+        let mut args: [*mut c_void; 10] = [
+            &mut w1_ptr as *mut _ as *mut c_void,
+            &mut w1_len as *mut _ as *mut c_void,
+            &mut w3_ptr as *mut _ as *mut c_void,
+            &mut w3_len as *mut _ as *mut c_void,
+            &mut yq_ptr as *mut _ as *mut c_void,
+            &mut yq_len as *mut _ as *mut c_void,
+            &mut act_ptr as *mut _ as *mut c_void,
+            &mut act_len as *mut _ as *mut c_void,
+            &mut hidden as *mut _ as *mut c_void,
+            &mut n_elems as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(
+                func,
+                (n_elems, b, 1),
+                (128, 1, 1),
+                0,
+                stream,
+                &mut args,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Int8 MMVQ plain GEMV on packed Q4_0 weights (used for W2 down projection).
+    /// `yq_ptr_and_len` is the q8_1 scratch from `quantize_q8_1` (k = hidden).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mmvq_gemv_q4_0(
+        &self,
+        stream: &Stream,
+        w_ptr_and_len: (u64, u64),
+        yq_ptr_and_len: (u64, u64),
+        y_ptr_and_len: (u64, u64),
+        hidden: u32,
+        n_elems: u32,
+        b: u32,
+    ) -> Result<()> {
+        let Some(func) = self.mmvq_plain.get(&(QuantType::Q4_0 as u8)) else {
+            bail!("mmvq_q4_0 kernel not available");
+        };
+        let (mut w_ptr, mut w_len) = w_ptr_and_len;
+        let (mut yq_ptr, mut yq_len) = yq_ptr_and_len;
+        let (mut y_ptr, mut y_len) = y_ptr_and_len;
+        let mut hidden = hidden;
+        let mut n_elems = n_elems;
+        // Slice params lower to (ptr, len) words; scalars to single words.
+        let mut args: [*mut c_void; 8] = [
+            &mut w_ptr as *mut _ as *mut c_void,
+            &mut w_len as *mut _ as *mut c_void,
+            &mut yq_ptr as *mut _ as *mut c_void,
+            &mut yq_len as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut y_len as *mut _ as *mut c_void,
+            &mut hidden as *mut _ as *mut c_void,
             &mut n_elems as *mut _ as *mut c_void,
         ];
         unsafe {

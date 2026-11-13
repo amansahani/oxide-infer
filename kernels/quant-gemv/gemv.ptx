@@ -1053,8 +1053,8 @@ $L__BB4_3:                              // %bb7
 	cvt.f32.f16 	%r23, %rs6;
 	add.s64 	%rd24, %rd38, %rd10;
 	ld.global.nc.b32 	%r24, [%rd24+-20];
-	ld.global.nc.b32 	%r25, [%rd24+-16];
-	ld.global.nc.b32 	%r26, [%rd24+-4];
+	ld.global.nc.b32 	%r25, [%rd24+-4];
+	ld.global.nc.b32 	%r26, [%rd24+-16];
 	ld.global.nc.b32 	%r27, [%rd24];
 	and.b32 	%r28, %r16, 252645135;
 	mov.b32 	%r29, 0;
@@ -6688,8 +6688,8 @@ $L__BB28_3:                             // %bb7
 	cvt.f32.f16 	%r18, %rs6;
 	add.s64 	%rd24, %rd31, %rd12;
 	ld.global.nc.b32 	%r19, [%rd24+-16];
-	ld.global.nc.b32 	%r20, [%rd24+-12];
-	ld.global.nc.b32 	%r21, [%rd24];
+	ld.global.nc.b32 	%r20, [%rd24];
+	ld.global.nc.b32 	%r21, [%rd24+-12];
 	ld.global.nc.b32 	%r22, [%rd24+4];
 	and.b32 	%r23, %r11, 252645135;
 	mov.b32 	%r24, 0;

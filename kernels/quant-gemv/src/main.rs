@@ -1332,10 +1332,10 @@ mod kernels {
         let ds = unsafe { yb.read() };
         let (d8, s8) = convert::cvt_f32x2_f16x2(ds);
         let qp = unsafe { yb.add(1) };
-        let u0 = unsafe { qp.add(kqs).read() };
-        let u1 = unsafe { qp.add(kqs + 1).read() };
-        let u2 = unsafe { qp.add(kqs + 4).read() };
-        let u3 = unsafe { qp.add(kqs + 5).read() };
+        let u0 = unsafe { qp.add(kqs).read() };     // activations 0..3 of this thread's span
+        let u1 = unsafe { qp.add(kqs + 4).read() }; // activations 16..19
+        let u2 = unsafe { qp.add(kqs + 1).read() }; // activations 4..7
+        let u3 = unsafe { qp.add(kqs + 5).read() }; // activations 20..23
 
         let mut sumi: i32 = 0;
         sumi = dotprod::dp4a_s32(vi0 & 0x0F0F_0F0F, u0, sumi);
@@ -2113,8 +2113,8 @@ fn mmvq_q4_0_host(w_packed: &[u8], yq: &[u8], hidden: usize, row: usize) -> f64 
             let vi1 = u32::from_le_bytes([qs[4 * kqs + 4], qs[4 * kqs + 5], qs[4 * kqs + 6], qs[4 * kqs + 7]]);
             let mut sumi: i64 = 0;
             sumi += dp4a(vi0 & 0x0F0F_0F0F, &yqs[4 * kqs..4 * kqs + 4]);
-            sumi += dp4a((vi0 >> 4) & 0x0F0F_0F0F, &yqs[4 * (kqs + 1)..4 * (kqs + 1) + 4]);
-            sumi += dp4a(vi1 & 0x0F0F_0F0F, &yqs[4 * (kqs + 4)..4 * (kqs + 4) + 4]);
+            sumi += dp4a((vi0 >> 4) & 0x0F0F_0F0F, &yqs[4 * (kqs + 4)..4 * (kqs + 4) + 4]);
+            sumi += dp4a(vi1 & 0x0F0F_0F0F, &yqs[4 * (kqs + 1)..4 * (kqs + 1) + 4]);
             sumi += dp4a((vi1 >> 4) & 0x0F0F_0F0F, &yqs[4 * (kqs + 5)..4 * (kqs + 5) + 4]);
             acc += d4 * (sumi as f64 * d8 - 4.0 * s8);
         }
@@ -2226,6 +2226,76 @@ fn mmvq_check(stream: &cuda_core::Stream, module: &kernels::LoadedModule) -> boo
             worst_out_rel = worst_out_rel.max((got - reference).abs() / (1.0 + reference.abs()));
         }
     }
+    // Cross-check: int8 MMVQ kernels vs the f32 packed kernels on the SAME
+    // weights and activations (absolute comparison, not self-consistent).
+    let mut act_f32_dev = DeviceBuffer::<u16>::zeroed(stream, B * INTER).unwrap();
+    let mut out_f32_dev = DeviceBuffer::<u16>::zeroed(stream, B * HIDDEN).unwrap();
+    let cfg_f32_dual = LaunchConfig { grid_dim: ((INTER as u32).div_ceil(4), B as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+    unsafe {
+        module.fused_dual_gemv_swiglu_q4_0(stream, cfg_f32_dual, &w1_dev, &w3_dev, &x1_dev, &mut act_f32_dev,
+            HIDDEN as u32, (HIDDEN / 32) as u32, INTER as u32).expect("f32 dual launch");
+    }
+    let cfg_f32_gemv = LaunchConfig { grid_dim: ((HIDDEN as u32).div_ceil(4), B as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+    unsafe {
+        module.gemv_q4_0(stream, cfg_f32_gemv, &w2_dev, &z_dev, &mut out_f32_dev,
+            INTER as u32, (INTER / 32) as u32, HIDDEN as u32).expect("f32 gemv launch");
+    }
+    stream.synchronize().unwrap();
+    let act_f32 = act_f32_dev.to_host_vec(stream).unwrap();
+    let out_f32 = out_f32_dev.to_host_vec(stream).unwrap();
+    let mut worst_i8_f32_act = 0.0f64;
+    let mut worst_i8_f32_out = 0.0f64;
+    for b in 0..B {
+        for r in 0..INTER {
+            let a = f16_to_f64(act[b * INTER + r]);
+            let c = f16_to_f64(act_f32[b * INTER + r]);
+            worst_i8_f32_act = worst_i8_f32_act.max((a - c).abs() / (1.0 + c.abs()));
+        }
+        for r in 0..HIDDEN {
+            let a = f16_to_f64(out[b * HIDDEN + r]);
+            let c = f16_to_f64(out_f32[b * HIDDEN + r]);
+            worst_i8_f32_out = worst_i8_f32_out.max((a - c).abs() / (1.0 + c.abs()));
+        }
+    }
+    eprintln!("int8 vs f32 packed: swiglu rel = {:.6} | gemv rel = {:.6}", worst_i8_f32_act, worst_i8_f32_out);
+
+    // Quantify PURE int8 activation noise: exact dots with q8_1-dequantized
+    // activations vs exact dots with f16 activations (host f64).
+    {
+        let dequant = |yq: &[u8], off: usize, l: usize| -> f64 {
+            let yb = &yq[off..off + 36];
+            let d8 = f16::from_le_bytes([yb[0], yb[1]]).to_f64();
+            let s8 = f16::from_le_bytes([yb[2], yb[3]]).to_f64();
+            let _ = s8;
+            d8 * (yb[4 + l] as i8 as f64)
+        };
+        let mut worst = 0.0f64;
+        let mut max_rel = 0.0f64;
+        for b in 0..B {
+            let xqf: Vec<f64> = (0..INTER).map(|i| (i as f64 * 0.317 + 0.5).sin()).collect();
+            let xq8: Vec<f64> = (0..HIDDEN).map(|i| {
+                let ib = i / 32;
+                dequant(&x1_q8, b * HIDDEN / 32 * 36 + ib * 36, i % 32)
+            }).collect();
+            let xf16: Vec<f64> = (0..HIDDEN).map(|i| f16::from_f32((i as f32 * 0.317 + 0.5).sin()).to_f64()).collect();
+            let w1d = deq_q4_0(&w1p);
+            for r in (0..INTER).step_by(37) {
+                let mut d_f16 = 0.0f64;
+                let mut d_q8 = 0.0f64;
+                for k in 0..HIDDEN {
+                    let w = w1d[r * HIDDEN + k];
+                    d_f16 += w * xf16[k];
+                    d_q8 += w * xq8[k];
+                }
+                let rel = (d_q8 - d_f16).abs() / (1.0 + d_f16.abs());
+                worst = worst.max(rel);
+                max_rel = max_rel.max(rel);
+            }
+        }
+        let _ = max_rel;
+        eprintln!("pure int8 activation noise (row sample): rel = {:.6}", worst);
+    }
+
     let ok = q_match && worst_act_rel < 1e-2 && worst_out_rel < 1e-2;
     println!("mmvq q4_0: quantizer {} | swiglu rel = {:.6} | gemv rel = {:.6} {}",
              if q_match { "byte-exact" } else { "MISMATCH" },

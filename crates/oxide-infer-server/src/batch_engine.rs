@@ -115,6 +115,11 @@ struct BatchScratch {
     ffn_up: DeviceBuffer<f16>,
     ffn_act: DeviceBuffer<f16>,
     ffn_out: DeviceBuffer<f16>,
+    /// Scratch for the int8 MMVQ path: q8_1-quantized activations.
+    /// `q8_1_hidden` covers HIDDEN-dim k, `q8_1_inter` covers INTER-dim k.
+    /// Each block is 36 bytes (f16 d, f16 s, 32 x i8).
+    q8_1_hidden: DeviceBuffer<u8>,
+    q8_1_inter: DeviceBuffer<u8>,
     bcx: DeviceBuffer<f16>,
     conv_y: DeviceBuffer<f16>,
     logits: DeviceBuffer<f16>,
@@ -276,6 +281,38 @@ fn fptr_mut(buf: &mut DeviceBuffer<f16>) -> u64 {
 }
 
 impl BatchEngine {
+    /// Packed projection GEMV dispatch. At batch = 1 with the int8 MMVQ path
+    /// enabled, activations are quantized to q8_1 (36B per 32 elements) and the
+    /// weights are consumed by a dp4a matvec kernel - the same kernel
+    /// llama.cpp launches for batch = 1 on sm_86. Otherwise the f32 packed
+    /// kernels are used. The q8_1 scratch is reused across calls in a wave
+    /// (stream-ordered).
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_dispatch(
+        &self,
+        stream: &CuStream,
+        qt: oxide_infer_core::quant::QuantType,
+        w_ptr_and_len: (u64, u64),
+        x_ptr_and_len: (u64, u64),
+        y_ptr_and_len: (u64, u64),
+        hidden: u32,
+        n_elems: u32,
+        b: u32,
+    ) -> anyhow::Result<()> {
+        use oxide_infer_kernels::quant_gemv::{int8_mmvq_enabled, int8_mmvq_supported};
+        let proj_int8 = std::env::var("OXIDE_MMVQ_INT8_PROJ").map(|v| v != "0").unwrap_or(true);
+        if int8_mmvq_enabled() && proj_int8 && int8_mmvq_supported(qt) && b == 1 {
+            let (x_ptr, x_len) = x_ptr_and_len;
+            let q8_ptr = self.scratch.q8_1_hidden.inner().cu_deviceptr();
+            let q8_len = (hidden as u64 / 32) * 36;
+            self.quant_gemv.quantize_q8_1(stream, (x_ptr, x_len), (q8_ptr, q8_len), hidden, b)?;
+            return self
+                .quant_gemv
+                .mmvq_gemv_q4_0(stream, w_ptr_and_len, (q8_ptr, q8_len), y_ptr_and_len, hidden, n_elems, b);
+        }
+        self.quant_gemv.gemv(stream, qt, w_ptr_and_len, x_ptr_and_len, y_ptr_and_len, hidden, n_elems, b)
+    }
+
     pub fn new(gpu: &GpuContext, max_batch: usize, prefill_rows: usize) -> Result<Self> {
         let rows = prefill_rows.max(max_batch);
         let max_attn_keys = max_attn_keys();
@@ -286,6 +323,9 @@ impl BatchEngine {
         let b = rows;
         let alloc_f16 = |n: usize| -> Result<DeviceBuffer<f16>> {
             DeviceBuffer::<f16>::zeroed(gpu, n).map_err(|e| anyhow!("alloc: {e}"))
+        };
+        let alloc_u8 = |n: usize| -> Result<DeviceBuffer<u8>> {
+            DeviceBuffer::<u8>::zeroed(gpu, n).map_err(|e| anyhow!("alloc: {e}"))
         };
 
         let norm_ptx = PtxModule::load_from_ptx(gpu, oxide_infer_models::RESIDUAL_ADD_PTX)
@@ -332,6 +372,8 @@ impl BatchEngine {
             ffn_up: alloc_f16(b * INTER)?,
             ffn_act: alloc_f16(b * INTER)?,
             ffn_out: alloc_f16(b * HIDDEN)?,
+            q8_1_hidden: alloc_u8(b * HIDDEN / 32 * 36)?,
+            q8_1_inter: alloc_u8(b * INTER / 32 * 36)?,
             bcx: alloc_f16(b * 3 * HIDDEN)?,
             conv_y: alloc_f16(b * HIDDEN)?,
             logits: alloc_f16(max_batch * VOCAB)?,
@@ -842,12 +884,13 @@ impl BatchEngine {
                     static PRINTED: std::sync::Once = std::sync::Once::new();
                     PRINTED.call_once(|| eprintln!("[quant-gemv] packed conv in_proj active"));
                     let y_len = b_u32 as u64 * 3 * HIDDEN as u64;
-                    self.quant_gemv.gemv(
+                    let d_bcx = self.scratch.bcx.inner_mut().cu_deviceptr();
+                    self.gemv_dispatch(
                         stream,
                         qt,
                         (ip.inner().cu_deviceptr(), ip.inner().len() as u64),
                         (d_x, x_len),
-                        (self.scratch.bcx.inner_mut().cu_deviceptr(), y_len),
+                        (d_bcx, y_len),
                         HIDDEN as u32,
                         (3 * HIDDEN) as u32,
                         b_u32,
@@ -930,12 +973,13 @@ impl BatchEngine {
                     static PRINTED2: std::sync::Once = std::sync::Once::new();
                     PRINTED2.call_once(|| eprintln!("[quant-gemv] packed conv out_proj active"));
                     let y_len = b_u32 as u64 * HIDDEN as u64;
-                    self.quant_gemv.gemv(
+                    let d_layer = self.scratch.layer.inner_mut().cu_deviceptr();
+                    self.gemv_dispatch(
                         stream,
                         qt,
                         (op.inner().cu_deviceptr(), op.inner().len() as u64),
                         (d_x, x_len),
-                        (self.scratch.layer.inner_mut().cu_deviceptr(), y_len),
+                        (d_layer, y_len),
                         HIDDEN as u32,
                         HIDDEN as u32,
                         b_u32,
@@ -974,7 +1018,7 @@ impl BatchEngine {
                     static PRINTED3: std::sync::Once = std::sync::Once::new();
                     PRINTED3.call_once(|| eprintln!("[quant-gemv] packed attention projections active"));
                     let q_len = b_u32 as u64 * HIDDEN as u64;
-                    self.quant_gemv.gemv(
+                    self.gemv_dispatch(
                         stream,
                         qt,
                         (qp.inner().cu_deviceptr(), qp.inner().len() as u64),
@@ -985,7 +1029,7 @@ impl BatchEngine {
                         b_u32,
                     )?;
                     let kv_len = b_u32 as u64 * KV_DIM as u64;
-                    self.quant_gemv.gemv(
+                    self.gemv_dispatch(
                         stream,
                         qt,
                         (kp.inner().cu_deviceptr(), kp.inner().len() as u64),
@@ -995,7 +1039,7 @@ impl BatchEngine {
                         KV_DIM as u32,
                         b_u32,
                     )?;
-                    self.quant_gemv.gemv(
+                    self.gemv_dispatch(
                         stream,
                         qt,
                         (vp.inner().cu_deviceptr(), vp.inner().len() as u64),
@@ -1006,7 +1050,7 @@ impl BatchEngine {
                         b_u32,
                     )?;
                     let gate_len = b_u32 as u64 * NUM_Q_HEADS as u64;
-                    self.quant_gemv.gemv(
+                    self.gemv_dispatch(
                         stream,
                         qt,
                         (gp.inner().cu_deviceptr(), gp.inner().len() as u64),
@@ -1349,12 +1393,13 @@ impl BatchEngine {
                     static PRINTED4: std::sync::Once = std::sync::Once::new();
                     PRINTED4.call_once(|| eprintln!("[quant-gemv] packed o_proj active"));
                     let y_len = b_u32 as u64 * HIDDEN as u64;
-                    self.quant_gemv.gemv(
+                    let d_layer = self.scratch.layer.inner_mut().cu_deviceptr();
+                    self.gemv_dispatch(
                         stream,
                         qt,
                         (op.inner().cu_deviceptr(), op.inner().len() as u64),
                         (d_x, x_len),
-                        (self.scratch.layer.inner_mut().cu_deviceptr(), y_len),
+                        (d_layer, y_len),
                         HIDDEN as u32,
                         HIDDEN as u32,
                         b_u32,
@@ -1398,7 +1443,65 @@ impl BatchEngine {
                 && layer.ffn.w3_packed.is_some()
                 && layer.ffn.w2_packed.is_some()
                 && layer.ffn.quant_type.is_some();
-            if packed_ready {
+            let ffn_int8 = std::env::var("OXIDE_MMVQ_INT8_FFN").map(|v| v != "0").unwrap_or(true);
+            let int8_ready = packed_ready
+                && ffn_int8
+                && b_u32 == 1
+                && oxide_infer_kernels::quant_gemv::int8_mmvq_enabled()
+                && oxide_infer_kernels::quant_gemv::int8_mmvq_supported(layer.ffn.quant_type.unwrap());
+            if int8_ready {
+                let qt = layer.ffn.quant_type.unwrap();
+                static PRINTED_I8: std::sync::Once = std::sync::Once::new();
+                PRINTED_I8.call_once(|| eprintln!("[quant-gemv] int8 MMVQ FFN path active (type {:?})", qt));
+                // Int8 MMVQ path: activations are quantized to q8_1 once per
+                // stage (k = HIDDEN for the gate/up GEMM, k = INTER for the
+                // down GEMM), then consumed by dp4a matvec kernels - the same
+                // kernel llama.cpp launches at batch = 1 on sm_86.
+                let act_ptr = self.scratch.ffn_act.inner_mut().cu_deviceptr();
+                let act_len = b_u32 as u64 * INTER as u64;
+                let q8h_ptr = self.scratch.q8_1_hidden.inner_mut().cu_deviceptr();
+                let q8h_len = b_u32 as u64 * HIDDEN as u64 / 32 * 36;
+                self.quant_gemv.quantize_q8_1(
+                    stream,
+                    (d_x, x_len),
+                    (q8h_ptr, q8h_len),
+                    HIDDEN as u32,
+                    b_u32,
+                )?;
+                self.quant_gemv.mmvq_dual_swiglu_q4_0(
+                    stream,
+                    (layer.ffn.w1_packed.as_ref().unwrap().inner().cu_deviceptr(),
+                     layer.ffn.w1_packed.as_ref().unwrap().inner().len() as u64),
+                    (layer.ffn.w3_packed.as_ref().unwrap().inner().cu_deviceptr(),
+                     layer.ffn.w3_packed.as_ref().unwrap().inner().len() as u64),
+                    (q8h_ptr, q8h_len),
+                    (act_ptr, act_len),
+                    HIDDEN as u32,
+                    INTER as u32,
+                    b_u32,
+                )?;
+                let q8i_ptr = self.scratch.q8_1_inter.inner_mut().cu_deviceptr();
+                let q8i_len = b_u32 as u64 * INTER as u64 / 32 * 36;
+                self.quant_gemv.quantize_q8_1(
+                    stream,
+                    (act_ptr, act_len),
+                    (q8i_ptr, q8i_len),
+                    INTER as u32,
+                    b_u32,
+                )?;
+                let out_ptr = self.scratch.ffn_out.inner_mut().cu_deviceptr();
+                let out_len = b_u32 as u64 * HIDDEN as u64;
+                self.quant_gemv.mmvq_gemv_q4_0(
+                    stream,
+                    (layer.ffn.w2_packed.as_ref().unwrap().inner().cu_deviceptr(),
+                     layer.ffn.w2_packed.as_ref().unwrap().inner().len() as u64),
+                    (q8i_ptr, q8i_len),
+                    (out_ptr, out_len),
+                    INTER as u32,
+                    HIDDEN as u32,
+                    b_u32,
+                )?;
+            } else if packed_ready {
                 let qt = layer.ffn.quant_type.unwrap();
                 static PRINTED: std::sync::Once = std::sync::Once::new();
                 PRINTED.call_once(|| eprintln!("[quant-gemv] packed FFN path active (type {:?})", qt));
@@ -1421,7 +1524,7 @@ impl BatchEngine {
                 )?;
                 let out_ptr = self.scratch.ffn_out.inner_mut().cu_deviceptr();
                 let out_len = b_u32 as u64 * HIDDEN as u64;
-                self.quant_gemv.gemv(
+                self.gemv_dispatch(
                     stream,
                     qt,
                     (layer.ffn.w2_packed.as_ref().unwrap().inner().cu_deviceptr(),
