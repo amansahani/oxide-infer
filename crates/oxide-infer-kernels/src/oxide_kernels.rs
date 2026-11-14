@@ -117,6 +117,119 @@ impl OxideKernels {
         Ok(())
     }
 
+    /// Raw-pointer launch of `batched_rope_fp16`.
+    /// Params lower as (ptr, len) per slice; grid (grid_heads, B, 1), block (dim, 1, 1).
+    #[allow(clippy::too_many_arguments)]
+    pub fn batched_rope(
+        &self,
+        stream: &Stream,
+        x_ptr: u64, x_len: u64,
+        cos_ptr: u64, cos_len: u64,
+        sin_ptr: u64, sin_len: u64,
+        pos_ptr: u64, pos_len: u64,
+        num_heads: u32, head_dim: u32, b_size: u32, grid_heads: u32,
+    ) -> Result<()> {
+        let func = self.module().get_function("batched_rope_fp16")?;
+        let mut x_ptr = x_ptr;
+        let mut x_len = x_len;
+        let mut cos_ptr = cos_ptr;
+        let mut cos_len = cos_len;
+        let mut sin_ptr = sin_ptr;
+        let mut sin_len = sin_len;
+        let mut pos_ptr = pos_ptr;
+        let mut pos_len = pos_len;
+        let mut num_heads = num_heads;
+        let mut head_dim = head_dim;
+        let mut b_size = b_size;
+        let mut args: [*mut c_void; 11] = [
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut x_len as *mut _ as *mut c_void,
+            &mut cos_ptr as *mut _ as *mut c_void,
+            &mut cos_len as *mut _ as *mut c_void,
+            &mut sin_ptr as *mut _ as *mut c_void,
+            &mut sin_len as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut pos_len as *mut _ as *mut c_void,
+            &mut num_heads as *mut _ as *mut c_void,
+            &mut head_dim as *mut _ as *mut c_void,
+            &mut b_size as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(&func, (grid_heads, b_size, 1), (head_dim, 1, 1), 0, stream, &mut args)?;
+        }
+        Ok(())
+    }
+
+    /// Raw-pointer launch of `batched_swiglu_separate_fp16`.
+    /// out[i] = up[i] * silu(gate[i]); grid (ceil(n/256), 1, 1), block (256, 1, 1).
+    #[allow(clippy::too_many_arguments)]
+    pub fn batched_swiglu_separate(
+        &self,
+        stream: &Stream,
+        act_ptr: u64, act_len: u64,
+        gate_ptr: u64, gate_len: u64,
+        up_ptr: u64, up_len: u64,
+        n: u32,
+    ) -> Result<()> {
+        let func = self.module().get_function("batched_swiglu_separate_fp16")?;
+        let mut act_ptr = act_ptr;
+        let mut act_len = act_len;
+        let mut gate_ptr = gate_ptr;
+        let mut gate_len = gate_len;
+        let mut up_ptr = up_ptr;
+        let mut up_len = up_len;
+        let mut n = n;
+        let mut args: [*mut c_void; 7] = [
+            &mut act_ptr as *mut _ as *mut c_void,
+            &mut act_len as *mut _ as *mut c_void,
+            &mut gate_ptr as *mut _ as *mut c_void,
+            &mut gate_len as *mut _ as *mut c_void,
+            &mut up_ptr as *mut _ as *mut c_void,
+            &mut up_len as *mut _ as *mut c_void,
+            &mut n as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(&func, (n.div_ceil(256), 1, 1), (256, 1, 1), 0, stream, &mut args)?;
+        }
+        Ok(())
+    }
+
+    /// Raw-pointer launch of `embedding_lookup_fp16`.
+    /// out[b*dim + i] = f16(table[tokens[b]*dim + i]); grid (B, 1, 1), block (256, 1, 1).
+    #[allow(clippy::too_many_arguments)]
+    pub fn embedding_lookup(
+        &self,
+        stream: &Stream,
+        out_ptr: u64, out_len: u64,
+        table_ptr: u64, table_len: u64,
+        tokens_ptr: u64, tokens_len: u64,
+        dim: u32, b_size: u32,
+    ) -> Result<()> {
+        let func = self.module().get_function("embedding_lookup_fp16")?;
+        let mut out_ptr = out_ptr;
+        let mut out_len = out_len;
+        let mut table_ptr = table_ptr;
+        let mut table_len = table_len;
+        let mut tokens_ptr = tokens_ptr;
+        let mut tokens_len = tokens_len;
+        let mut dim = dim;
+        let mut b_size = b_size;
+        let mut args: [*mut c_void; 8] = [
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut out_len as *mut _ as *mut c_void,
+            &mut table_ptr as *mut _ as *mut c_void,
+            &mut table_len as *mut _ as *mut c_void,
+            &mut tokens_ptr as *mut _ as *mut c_void,
+            &mut tokens_len as *mut _ as *mut c_void,
+            &mut dim as *mut _ as *mut c_void,
+            &mut b_size as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(&func, (b_size, 1, 1), (256, 1, 1), 0, stream, &mut args)?;
+        }
+        Ok(())
+    }
+
     /// Raw-pointer launch of `residual_add_fp16`: hidden += ffn_out (f32 add, f16 out).
     #[allow(clippy::too_many_arguments)]
     pub fn residual_add(

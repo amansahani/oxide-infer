@@ -858,21 +858,11 @@ impl BatchEngine {
                 cuMemcpyDtoDAsync_v2(dst, src, b * HIDDEN * 2, stream.cu_stream() as *mut c_void);
             }
         } else {
-            let mut d_hidden = fptr(&self.scratch.hidden);
-            let mut d_tbl = embed_table.inner().cu_deviceptr();
-            let mut d_tok_in = self.scratch.tokens_in.inner().cu_deviceptr();
-            let mut h_arg = h_u32;
-            let mut b_tmp = b_arg;
-            let mut args_embed: [*mut c_void; 5] = [
-                &mut d_hidden as *mut _ as *mut c_void,
-                &mut d_tbl as *mut _ as *mut c_void,
-                &mut d_tok_in as *mut _ as *mut c_void,
-                &mut h_arg as *mut _ as *mut c_void,
-                &mut b_tmp as *mut _ as *mut c_void,
-            ];
-            unsafe {
-                launch_kernel_on_stream(&self.embed, (b_u32, 1, 1), (256, 1, 1), 0, stream, &mut args_embed)?;
-            }
+            let d_hidden = fptr(&self.scratch.hidden);
+            let d_tbl = embed_table.inner().cu_deviceptr();
+            let d_tok_in = self.scratch.tokens_in.inner().cu_deviceptr();
+            let table_len = embed_table.inner().len() as u64;
+            self.launch_embed_auto(stream, d_hidden, d_tbl, table_len, d_tok_in, b_u32)?;
         }
 
         // GEMM prefill attention: score each request chunk with tensor cores.
@@ -1162,28 +1152,9 @@ impl BatchEngine {
                 let mut d_cos = rope.cos_table.inner().cu_deviceptr();
                 let mut d_sin = rope.sin_table.inner().cu_deviceptr();
                 let mut d_pos = self.scratch.pos_ids.inner().cu_deviceptr();
-                let mut args_qr: [*mut c_void; 7] = [
-                    &mut d_q as *mut _ as *mut c_void,
-                    &mut d_cos as *mut _ as *mut c_void,
-                    &mut d_sin as *mut _ as *mut c_void,
-                    &mut d_pos as *mut _ as *mut c_void,
-                    &mut nq as *mut _ as *mut c_void,
-                    &mut hd as *mut _ as *mut c_void,
-                    &mut b_arg as *mut _ as *mut c_void,
-                ];
-                let mut args_kr: [*mut c_void; 7] = [
-                    &mut d_k as *mut _ as *mut c_void,
-                    &mut d_cos as *mut _ as *mut c_void,
-                    &mut d_sin as *mut _ as *mut c_void,
-                    &mut d_pos as *mut _ as *mut c_void,
-                    &mut nkv as *mut _ as *mut c_void,
-                    &mut hd as *mut _ as *mut c_void,
-                    &mut b_arg as *mut _ as *mut c_void,
-                ];
-                unsafe {
-                    launch_kernel_on_stream(&self.rope, (nq, b_u32, 1), (hd, 1, 1), 0, stream, &mut args_qr)?;
-                    launch_kernel_on_stream(&self.rope, (nkv, b_u32, 1), (hd, 1, 1), 0, stream, &mut args_kr)?;
-                }
+                let cos_len = rope.cos_table.inner().len() as u64;
+                self.launch_rope_auto(stream, d_q, d_cos, d_sin, d_pos, cos_len, nq, hd, b_u32)?;
+                self.launch_rope_auto(stream, d_k, d_cos, d_sin, d_pos, cos_len, nkv, hd, b_u32)?;
 
                 // KV cache writes.
                 let mut d_kp = self.scratch.k_ptrs.inner_mut().cu_deviceptr()
@@ -1611,16 +1582,7 @@ impl BatchEngine {
                 let mut d_fg = fptr(&self.scratch.ffn_gate);
                 let mut d_fu = fptr(&self.scratch.ffn_up);
                 let mut inter = INTER as u32;
-                let mut args_sw: [*mut c_void; 5] = [
-                    &mut d_act as *mut _ as *mut c_void,
-                    &mut d_fg as *mut _ as *mut c_void,
-                    &mut d_fu as *mut _ as *mut c_void,
-                    &mut inter as *mut _ as *mut c_void,
-                    &mut b_arg as *mut _ as *mut c_void,
-                ];
-                unsafe {
-                    launch_kernel_on_stream(&self.swiglu, (30, b_u32, 1), (256, 1, 1), 0, stream, &mut args_sw)?;
-                }
+                self.launch_swiglu_auto(stream, d_act as u64, d_fg as u64, d_fu as u64, INTER as u32, b_u32)?;
                 let d_w2 = layer.ffn.w2_down.inner().cu_deviceptr();
                 let d_act = self.scratch.ffn_act.inner().cu_deviceptr();
                 let d_out = self.scratch.ffn_out.inner_mut().cu_deviceptr();
@@ -1802,6 +1764,130 @@ impl BatchEngine {
         ];
         unsafe {
             launch_kernel_on_stream(&self.fused_post_norm_res_add, (1, b, 1), (256, 1, 1), 0, stream, &mut args)?;
+        }
+        Ok(())
+    }
+
+    /// RoPE dispatch: cuda-oxide multi-arch when OXIDE_PURE_RUST=1.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_rope_auto(
+        &self,
+        stream: &cuda_core::Stream,
+        x_ptr: u64,
+        cos_ptr: u64,
+        sin_ptr: u64,
+        pos_ptr: u64,
+        cos_len: u64,
+        grid_heads: u32,
+        head_dim: u32,
+        b: u32,
+    ) -> Result<()> {
+        if let Some(ok) = &self.oxide_kernels {
+            let total = b as u64 * grid_heads as u64 * head_dim as u64;
+            ok.batched_rope(
+                stream,
+                x_ptr, total,
+                cos_ptr, cos_len,
+                sin_ptr, cos_len,
+                pos_ptr, b as u64,
+                grid_heads, head_dim, b, grid_heads,
+            )?;
+            return Ok(());
+        }
+        let mut x_p = x_ptr;
+        let mut cos_p = cos_ptr;
+        let mut sin_p = sin_ptr;
+        let mut pos_p = pos_ptr;
+        let mut nq = grid_heads;
+        let mut hd = head_dim;
+        let mut b_arg = b;
+        let mut args: [*mut c_void; 7] = [
+            &mut x_p as *mut _ as *mut c_void,
+            &mut cos_p as *mut _ as *mut c_void,
+            &mut sin_p as *mut _ as *mut c_void,
+            &mut pos_p as *mut _ as *mut c_void,
+            &mut nq as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut b_arg as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(&self.rope, (grid_heads, b, 1), (head_dim, 1, 1), 0, stream, &mut args)?;
+        }
+        Ok(())
+    }
+
+    /// SwiGLU dispatch: cuda-oxide multi-arch when OXIDE_PURE_RUST=1.
+    fn launch_swiglu_auto(
+        &self,
+        stream: &cuda_core::Stream,
+        act_ptr: u64,
+        gate_ptr: u64,
+        up_ptr: u64,
+        inter: u32,
+        b: u32,
+    ) -> Result<()> {
+        if let Some(ok) = &self.oxide_kernels {
+            let total = b as u64 * inter as u64;
+            return ok.batched_swiglu_separate(
+                stream,
+                act_ptr, total,
+                gate_ptr, total,
+                up_ptr, total,
+                total as u32,
+            );
+        }
+        let mut d_act = act_ptr;
+        let mut d_gate = gate_ptr;
+        let mut d_up = up_ptr;
+        let mut inter_v = inter;
+        let mut b_arg = b;
+        let mut args: [*mut c_void; 5] = [
+            &mut d_act as *mut _ as *mut c_void,
+            &mut d_gate as *mut _ as *mut c_void,
+            &mut d_up as *mut _ as *mut c_void,
+            &mut inter_v as *mut _ as *mut c_void,
+            &mut b_arg as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(&self.swiglu, (inter.div_ceil(256), b, 1), (256, 1, 1), 0, stream, &mut args)?;
+        }
+        Ok(())
+    }
+
+    /// Embedding-lookup dispatch: cuda-oxide multi-arch when OXIDE_PURE_RUST=1.
+    fn launch_embed_auto(
+        &self,
+        stream: &cuda_core::Stream,
+        out_ptr: u64,
+        table_ptr: u64,
+        table_len: u64,
+        tokens_ptr: u64,
+        b: u32,
+    ) -> Result<()> {
+        if let Some(ok) = &self.oxide_kernels {
+            return ok.embedding_lookup(
+                stream,
+                out_ptr, b as u64 * HIDDEN as u64,
+                table_ptr, table_len,
+                tokens_ptr, b as u64,
+                HIDDEN as u32, b,
+            );
+        }
+        let h_arg = HIDDEN as u32;
+        let mut d_out = out_ptr;
+        let mut d_tbl = table_ptr;
+        let mut d_tok = tokens_ptr;
+        let mut h_v = h_arg;
+        let mut b_tmp = b;
+        let mut args: [*mut c_void; 5] = [
+            &mut d_out as *mut _ as *mut c_void,
+            &mut d_tbl as *mut _ as *mut c_void,
+            &mut d_tok as *mut _ as *mut c_void,
+            &mut h_v as *mut _ as *mut c_void,
+            &mut b_tmp as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(&self.embed, (b, 1, 1), (256, 1, 1), 0, stream, &mut args)?;
         }
         Ok(())
     }
