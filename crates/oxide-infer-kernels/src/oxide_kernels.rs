@@ -117,6 +117,327 @@ impl OxideKernels {
         Ok(())
     }
 
+    /// Raw-pointer launch of `batched_qk_rmsnorm_fp16`.
+    /// grid (heads, B, 1), block (32, 1, 1).
+    #[allow(clippy::too_many_arguments)]
+    pub fn batched_qk_rmsnorm(
+        &self,
+        stream: &Stream,
+        x_ptr: u64, x_len: u64,
+        w_ptr: u64, w_len: u64,
+        eps: f32, num_heads: u32, head_dim: u32, batch_size: u32,
+    ) -> Result<()> {
+        let func = self.module().get_function("batched_qk_rmsnorm_fp16")?;
+        let mut x_ptr = x_ptr;
+        let mut x_len = x_len;
+        let mut w_ptr = w_ptr;
+        let mut w_len = w_len;
+        let mut eps = eps;
+        let mut num_heads = num_heads;
+        let mut head_dim = head_dim;
+        let mut batch_size = batch_size;
+        let mut args: [*mut c_void; 8] = [
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut x_len as *mut _ as *mut c_void,
+            &mut w_ptr as *mut _ as *mut c_void,
+            &mut w_len as *mut _ as *mut c_void,
+            &mut eps as *mut _ as *mut c_void,
+            &mut num_heads as *mut _ as *mut c_void,
+            &mut head_dim as *mut _ as *mut c_void,
+            &mut batch_size as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(&func, (num_heads as u32, batch_size, 1), (32, 1, 1), 0, stream, &mut args)?;
+        }
+        Ok(())
+    }
+
+    /// Raw-pointer launch of `batched_sigmoid_gate_fp16`.
+    /// grid (heads, B, 1), block (head_dim, 1, 1).
+    #[allow(clippy::too_many_arguments)]
+    pub fn batched_sigmoid_gate(
+        &self,
+        stream: &Stream,
+        ctx_ptr: u64, ctx_len: u64,
+        gate_ptr: u64, gate_len: u64,
+        num_heads: u32, head_dim: u32, batch_size: u32,
+    ) -> Result<()> {
+        let func = self.module().get_function("batched_sigmoid_gate_fp16")?;
+        let mut ctx_ptr = ctx_ptr;
+        let mut ctx_len = ctx_len;
+        let mut gate_ptr = gate_ptr;
+        let mut gate_len = gate_len;
+        let mut num_heads = num_heads;
+        let mut head_dim = head_dim;
+        let mut batch_size = batch_size;
+        let mut args: [*mut c_void; 7] = [
+            &mut ctx_ptr as *mut _ as *mut c_void,
+            &mut ctx_len as *mut _ as *mut c_void,
+            &mut gate_ptr as *mut _ as *mut c_void,
+            &mut gate_len as *mut _ as *mut c_void,
+            &mut num_heads as *mut _ as *mut c_void,
+            &mut head_dim as *mut _ as *mut c_void,
+            &mut batch_size as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(&func, (num_heads as u32, batch_size, 1), (head_dim, 1, 1), 0, stream, &mut args)?;
+        }
+        Ok(())
+    }
+
+    /// Raw-pointer launch of `batched_kv_copy_fp16`.
+    /// grid (B, 1, 1), block (64, 1, 1).
+    #[allow(clippy::too_many_arguments)]
+    pub fn batched_kv_copy(
+        &self,
+        stream: &Stream,
+        dst_ptrs_ptr: u64, dst_ptrs_len: u64,
+        src_ptr: u64, src_len: u64,
+        pos_ids_ptr: u64, pos_ids_len: u64,
+        kv_dim: u32, batch_size: u32,
+    ) -> Result<()> {
+        let func = self.module().get_function("batched_kv_copy_fp16")?;
+        let mut dst_ptrs_ptr = dst_ptrs_ptr;
+        let mut dst_ptrs_len = dst_ptrs_len;
+        let mut src_ptr = src_ptr;
+        let mut src_len = src_len;
+        let mut pos_ids_ptr = pos_ids_ptr;
+        let mut pos_ids_len = pos_ids_len;
+        let mut kv_dim = kv_dim;
+        let mut batch_size = batch_size;
+        let mut args: [*mut c_void; 8] = [
+            &mut dst_ptrs_ptr as *mut _ as *mut c_void,
+            &mut dst_ptrs_len as *mut _ as *mut c_void,
+            &mut src_ptr as *mut _ as *mut c_void,
+            &mut src_len as *mut _ as *mut c_void,
+            &mut pos_ids_ptr as *mut _ as *mut c_void,
+            &mut pos_ids_len as *mut _ as *mut c_void,
+            &mut kv_dim as *mut _ as *mut c_void,
+            &mut batch_size as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(&func, (batch_size, 1, 1), (64, 1, 1), 0, stream, &mut args)?;
+        }
+        Ok(())
+    }
+
+    /// Raw-pointer launch of `batched_gqa_attention_online_fp16`.
+    /// grid (kv_heads, B, 1), block (128, 1, 1).
+    #[allow(clippy::too_many_arguments)]
+    pub fn batched_gqa_attention_online(
+        &self,
+        stream: &Stream,
+        ctx_ptr: u64, ctx_len: u64,
+        q_ptr: u64, q_len: u64,
+        k_ptrs_ptr: u64, k_ptrs_len: u64,
+        v_ptrs_ptr: u64, v_ptrs_len: u64,
+        seq_lens_ptr: u64, seq_lens_len: u64,
+        num_q_heads: u32, num_kv_heads: u32, head_dim: u32,
+        batch_size: u32, window: u32,
+    ) -> Result<()> {
+        let func = self.module().get_function("batched_gqa_attention_online_fp16")?;
+        let mut ctx_ptr = ctx_ptr;
+        let mut ctx_len = ctx_len;
+        let mut q_ptr = q_ptr;
+        let mut q_len = q_len;
+        let mut k_ptrs_ptr = k_ptrs_ptr;
+        let mut k_ptrs_len = k_ptrs_len;
+        let mut v_ptrs_ptr = v_ptrs_ptr;
+        let mut v_ptrs_len = v_ptrs_len;
+        let mut seq_lens_ptr = seq_lens_ptr;
+        let mut seq_lens_len = seq_lens_len;
+        let mut num_q_heads = num_q_heads;
+        let mut num_kv_heads = num_kv_heads;
+        let mut head_dim = head_dim;
+        let mut batch_size = batch_size;
+        let mut window = window;
+        let mut args: [*mut c_void; 15] = [
+            &mut ctx_ptr as *mut _ as *mut c_void,
+            &mut ctx_len as *mut _ as *mut c_void,
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut q_len as *mut _ as *mut c_void,
+            &mut k_ptrs_ptr as *mut _ as *mut c_void,
+            &mut k_ptrs_len as *mut _ as *mut c_void,
+            &mut v_ptrs_ptr as *mut _ as *mut c_void,
+            &mut v_ptrs_len as *mut _ as *mut c_void,
+            &mut seq_lens_ptr as *mut _ as *mut c_void,
+            &mut seq_lens_len as *mut _ as *mut c_void,
+            &mut num_q_heads as *mut _ as *mut c_void,
+            &mut num_kv_heads as *mut _ as *mut c_void,
+            &mut head_dim as *mut _ as *mut c_void,
+            &mut batch_size as *mut _ as *mut c_void,
+            &mut window as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(&func, (num_kv_heads as u32, batch_size, 1), (128, 1, 1), 0, stream, &mut args)?;
+        }
+        Ok(())
+    }
+
+    /// Raw-pointer launch of `batched_gqa_attention_split4_fp16`.
+    /// grid (kv_heads, B, nchunks), block (128, 1, 1).
+    #[allow(clippy::too_many_arguments)]
+    pub fn batched_gqa_attention_split4(
+        &self,
+        stream: &Stream,
+        q_ptr: u64, q_len: u64,
+        k_ptrs_ptr: u64, k_ptrs_len: u64,
+        v_ptrs_ptr: u64, v_ptrs_len: u64,
+        seq_lens_ptr: u64, seq_lens_len: u64,
+        acc_ptr: u64, acc_len: u64,
+        stats_ptr: u64, stats_len: u64,
+        num_q_heads: u32, num_kv_heads: u32, head_dim: u32,
+        batch_size: u32, window: u32, chunk_keys: u32, nchunks: u32,
+    ) -> Result<()> {
+        let func = self.module().get_function("batched_gqa_attention_split4_fp16")?;
+        let mut q_ptr = q_ptr;
+        let mut q_len = q_len;
+        let mut k_ptrs_ptr = k_ptrs_ptr;
+        let mut k_ptrs_len = k_ptrs_len;
+        let mut v_ptrs_ptr = v_ptrs_ptr;
+        let mut v_ptrs_len = v_ptrs_len;
+        let mut seq_lens_ptr = seq_lens_ptr;
+        let mut seq_lens_len = seq_lens_len;
+        let mut acc_ptr = acc_ptr;
+        let mut acc_len = acc_len;
+        let mut stats_ptr = stats_ptr;
+        let mut stats_len = stats_len;
+        let mut num_q_heads = num_q_heads;
+        let mut num_kv_heads = num_kv_heads;
+        let mut head_dim = head_dim;
+        let mut batch_size = batch_size;
+        let mut window = window;
+        let mut chunk_keys = chunk_keys;
+        let mut nchunks = nchunks;
+        let mut args: [*mut c_void; 19] = [
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut q_len as *mut _ as *mut c_void,
+            &mut k_ptrs_ptr as *mut _ as *mut c_void,
+            &mut k_ptrs_len as *mut _ as *mut c_void,
+            &mut v_ptrs_ptr as *mut _ as *mut c_void,
+            &mut v_ptrs_len as *mut _ as *mut c_void,
+            &mut seq_lens_ptr as *mut _ as *mut c_void,
+            &mut seq_lens_len as *mut _ as *mut c_void,
+            &mut acc_ptr as *mut _ as *mut c_void,
+            &mut acc_len as *mut _ as *mut c_void,
+            &mut stats_ptr as *mut _ as *mut c_void,
+            &mut stats_len as *mut _ as *mut c_void,
+            &mut num_q_heads as *mut _ as *mut c_void,
+            &mut num_kv_heads as *mut _ as *mut c_void,
+            &mut head_dim as *mut _ as *mut c_void,
+            &mut batch_size as *mut _ as *mut c_void,
+            &mut window as *mut _ as *mut c_void,
+            &mut chunk_keys as *mut _ as *mut c_void,
+            &mut nchunks as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(&func, (num_kv_heads as u32, batch_size, nchunks), (128, 1, 1), 0, stream, &mut args)?;
+        }
+        Ok(())
+    }
+
+    /// Raw-pointer launch of `batched_gqa_attention_split_fp16`.
+    /// grid (kv_heads, B, nchunks), block (128, 1, 1).
+    #[allow(clippy::too_many_arguments)]
+    pub fn batched_gqa_attention_split(
+        &self,
+        stream: &Stream,
+        q_ptr: u64, q_len: u64,
+        k_ptrs_ptr: u64, k_ptrs_len: u64,
+        v_ptrs_ptr: u64, v_ptrs_len: u64,
+        seq_lens_ptr: u64, seq_lens_len: u64,
+        acc_ptr: u64, acc_len: u64,
+        stats_ptr: u64, stats_len: u64,
+        num_q_heads: u32, num_kv_heads: u32, head_dim: u32,
+        batch_size: u32, window: u32, chunk_keys: u32, nchunks: u32,
+    ) -> Result<()> {
+        let func = self.module().get_function("batched_gqa_attention_split_fp16")?;
+        let mut q_ptr = q_ptr;
+        let mut q_len = q_len;
+        let mut k_ptrs_ptr = k_ptrs_ptr;
+        let mut k_ptrs_len = k_ptrs_len;
+        let mut v_ptrs_ptr = v_ptrs_ptr;
+        let mut v_ptrs_len = v_ptrs_len;
+        let mut seq_lens_ptr = seq_lens_ptr;
+        let mut seq_lens_len = seq_lens_len;
+        let mut acc_ptr = acc_ptr;
+        let mut acc_len = acc_len;
+        let mut stats_ptr = stats_ptr;
+        let mut stats_len = stats_len;
+        let mut num_q_heads = num_q_heads;
+        let mut num_kv_heads = num_kv_heads;
+        let mut head_dim = head_dim;
+        let mut batch_size = batch_size;
+        let mut window = window;
+        let mut chunk_keys = chunk_keys;
+        let mut nchunks = nchunks;
+        let mut args: [*mut c_void; 19] = [
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut q_len as *mut _ as *mut c_void,
+            &mut k_ptrs_ptr as *mut _ as *mut c_void,
+            &mut k_ptrs_len as *mut _ as *mut c_void,
+            &mut v_ptrs_ptr as *mut _ as *mut c_void,
+            &mut v_ptrs_len as *mut _ as *mut c_void,
+            &mut seq_lens_ptr as *mut _ as *mut c_void,
+            &mut seq_lens_len as *mut _ as *mut c_void,
+            &mut acc_ptr as *mut _ as *mut c_void,
+            &mut acc_len as *mut _ as *mut c_void,
+            &mut stats_ptr as *mut _ as *mut c_void,
+            &mut stats_len as *mut _ as *mut c_void,
+            &mut num_q_heads as *mut _ as *mut c_void,
+            &mut num_kv_heads as *mut _ as *mut c_void,
+            &mut head_dim as *mut _ as *mut c_void,
+            &mut batch_size as *mut _ as *mut c_void,
+            &mut window as *mut _ as *mut c_void,
+            &mut chunk_keys as *mut _ as *mut c_void,
+            &mut nchunks as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(&func, (num_kv_heads as u32, batch_size, nchunks), (128, 1, 1), 0, stream, &mut args)?;
+        }
+        Ok(())
+    }
+
+    /// Raw-pointer launch of `batched_gqa_attn_combine_fp16`.
+    /// grid (nq, B, 1), block (32, 1, 1).
+    #[allow(clippy::too_many_arguments)]
+    pub fn batched_gqa_attn_combine(
+        &self,
+        stream: &Stream,
+        ctx_ptr: u64, ctx_len: u64,
+        acc_ptr: u64, acc_len: u64,
+        stats_ptr: u64, stats_len: u64,
+        num_q_heads: u32, head_dim: u32, batch_size: u32, nchunks: u32,
+    ) -> Result<()> {
+        let func = self.module().get_function("batched_gqa_attn_combine_fp16")?;
+        let mut ctx_ptr = ctx_ptr;
+        let mut ctx_len = ctx_len;
+        let mut acc_ptr = acc_ptr;
+        let mut acc_len = acc_len;
+        let mut stats_ptr = stats_ptr;
+        let mut stats_len = stats_len;
+        let mut num_q_heads = num_q_heads;
+        let mut head_dim = head_dim;
+        let mut batch_size = batch_size;
+        let mut nchunks = nchunks;
+        let mut args: [*mut c_void; 10] = [
+            &mut ctx_ptr as *mut _ as *mut c_void,
+            &mut ctx_len as *mut _ as *mut c_void,
+            &mut acc_ptr as *mut _ as *mut c_void,
+            &mut acc_len as *mut _ as *mut c_void,
+            &mut stats_ptr as *mut _ as *mut c_void,
+            &mut stats_len as *mut _ as *mut c_void,
+            &mut num_q_heads as *mut _ as *mut c_void,
+            &mut head_dim as *mut _ as *mut c_void,
+            &mut batch_size as *mut _ as *mut c_void,
+            &mut nchunks as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(&func, (num_q_heads as u32, batch_size, 1), (32, 1, 1), 0, stream, &mut args)?;
+        }
+        Ok(())
+    }
+
     /// Raw-pointer launch of `batched_rope_fp16`.
     /// Params lower as (ptr, len) per slice; grid (grid_heads, B, 1), block (dim, 1, 1).
     #[allow(clippy::too_many_arguments)]

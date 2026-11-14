@@ -1126,26 +1126,10 @@ impl BatchEngine {
                 let mut d_kw = attn.k_norm.inner().cu_deviceptr();
 
                 // Per-head Q/K RMSNorm.
-                let mut args_qn: [*mut c_void; 6] = [
-                    &mut d_q as *mut _ as *mut c_void,
-                    &mut d_qw as *mut _ as *mut c_void,
-                    &mut eps as *mut _ as *mut c_void,
-                    &mut nq as *mut _ as *mut c_void,
-                    &mut hd as *mut _ as *mut c_void,
-                    &mut b_arg as *mut _ as *mut c_void,
-                ];
-                let mut args_kn: [*mut c_void; 6] = [
-                    &mut d_k as *mut _ as *mut c_void,
-                    &mut d_kw as *mut _ as *mut c_void,
-                    &mut eps as *mut _ as *mut c_void,
-                    &mut nkv as *mut _ as *mut c_void,
-                    &mut hd as *mut _ as *mut c_void,
-                    &mut b_arg as *mut _ as *mut c_void,
-                ];
-                unsafe {
-                    launch_kernel_on_stream(&self.qk_norm, (nq, b_u32, 1), (32, 1, 1), 0, stream, &mut args_qn)?;
-                    launch_kernel_on_stream(&self.qk_norm, (nkv, b_u32, 1), (32, 1, 1), 0, stream, &mut args_kn)?;
-                }
+                let wq_len = attn.q_norm.inner().len() as u64;
+                let wk_len = attn.k_norm.inner().len() as u64;
+                self.launch_qk_rmsnorm_auto(stream, d_q, d_qw, wq_len, nq, b_u32)?;
+                self.launch_qk_rmsnorm_auto(stream, d_k, d_kw, wk_len, nkv, b_u32)?;
 
                 // RoPE with per-sequence positions.
                 let rope = layer.rope.as_ref().ok_or_else(|| anyhow!("missing rope"))?;
@@ -1162,24 +1146,8 @@ impl BatchEngine {
                 let mut d_vp = self.scratch.v_ptrs.inner_mut().cu_deviceptr()
                     + (l_idx * b * 8) as u64;
                 let mut kv_dim = KV_DIM as u32;
-                let mut args_kc: [*mut c_void; 5] = [
-                    &mut d_kp as *mut _ as *mut c_void,
-                    &mut d_k as *mut _ as *mut c_void,
-                    &mut d_pos as *mut _ as *mut c_void,
-                    &mut kv_dim as *mut _ as *mut c_void,
-                    &mut b_arg as *mut _ as *mut c_void,
-                ];
-                let mut args_vc: [*mut c_void; 5] = [
-                    &mut d_vp as *mut _ as *mut c_void,
-                    &mut d_v as *mut _ as *mut c_void,
-                    &mut d_pos as *mut _ as *mut c_void,
-                    &mut kv_dim as *mut _ as *mut c_void,
-                    &mut b_arg as *mut _ as *mut c_void,
-                ];
-                unsafe {
-                    launch_kernel_on_stream(&self.kv_copy, (b_u32, 1, 1), (64, 1, 1), 0, stream, &mut args_kc)?;
-                    launch_kernel_on_stream(&self.kv_copy, (b_u32, 1, 1), (64, 1, 1), 0, stream, &mut args_vc)?;
-                }
+                self.launch_kv_copy_auto(stream, d_kp, d_k, d_pos, kv_dim, b_u32)?;
+                self.launch_kv_copy_auto(stream, d_vp, d_v, d_pos, kv_dim, b_u32)?;
                 phase!();
 
                 // GQA attention. Sliding layers carry their 256-token window
@@ -1342,23 +1310,50 @@ impl BatchEngine {
                             &mut chunk_keys as *mut _ as *mut c_void,
                             &mut nch as *mut _ as *mut c_void,
                         ];
-                        let split_fn = if std::env::var("OXIDE_ATTN_SPLIT4")
+                        let split4 = std::env::var("OXIDE_ATTN_SPLIT4")
                             .map(|v| v != "0")
-                            .unwrap_or(true)
-                        {
+                            .unwrap_or(true);
+                        let split_fn = if split4 {
                             &self.gqa_split4
                         } else {
                             &self.gqa_split
                         };
                         unsafe {
-                            launch_kernel_on_stream(
-                                split_fn,
-                                (nkv, b_u32, nchunks),
-                                (hd, 1, 1),
-                                0,
-                                stream,
-                                &mut args_split,
-                            )?;
+                            if let Some(ok) = &self.oxide_kernels {
+                                let q_len = b_u32 as u64 * nq as u64 * hd as u64;
+                                if split4 {
+                                    ok.batched_gqa_attention_split4(
+                                        stream,
+                                        d_q, q_len,
+                                        d_kp, b_u32 as u64,
+                                        d_vp, b_u32 as u64,
+                                        d_sl, b_u32 as u64,
+                                        d_acc, b_u32 as u64 * nchunks as u64 * nq as u64 * 128,
+                                        d_stats, b_u32 as u64 * nchunks as u64 * nq as u64 * 2,
+                                        nq, nkv, hd, b_u32, window_u32, chunk_keys, nchunks,
+                                    )?;
+                                } else {
+                                    ok.batched_gqa_attention_split(
+                                        stream,
+                                        d_q, q_len,
+                                        d_kp, b_u32 as u64,
+                                        d_vp, b_u32 as u64,
+                                        d_sl, b_u32 as u64,
+                                        d_acc, b_u32 as u64 * nchunks as u64 * nq as u64 * 128,
+                                        d_stats, b_u32 as u64 * nchunks as u64 * nq as u64 * 2,
+                                        nq, nkv, hd, b_u32, window_u32, chunk_keys, nchunks,
+                                    )?;
+                                }
+                            } else {
+                                launch_kernel_on_stream(
+                                    split_fn,
+                                    (nkv, b_u32, nchunks),
+                                    (hd, 1, 1),
+                                    0,
+                                    stream,
+                                    &mut args_split,
+                                )?;
+                            }
                             let mut d_ctxc = d_ctx;
                             let mut n_heads = nq;
                             let mut args_comb: [*mut c_void; 7] = [
@@ -1370,21 +1365,45 @@ impl BatchEngine {
                                 &mut b_arg as *mut _ as *mut c_void,
                                 &mut nch as *mut _ as *mut c_void,
                             ];
-                            launch_kernel_on_stream(
-                                &self.gqa_combine,
-                                (nq, b_u32, 1),
-                                (32, 1, 1),
-                                0,
-                                stream,
-                                &mut args_comb,
-                            )?;
+                            if let Some(ok) = &self.oxide_kernels {
+                                let q_len = b_u32 as u64 * nq as u64 * hd as u64;
+                                ok.batched_gqa_attn_combine(
+                                    stream,
+                                    d_ctxc, q_len,
+                                    d_acc, b_u32 as u64 * nchunks as u64 * nq as u64 * 128,
+                                    d_stats, b_u32 as u64 * nchunks as u64 * nq as u64 * 2,
+                                    nq, hd, b_u32, nchunks,
+                                )?;
+                            } else {
+                                launch_kernel_on_stream(
+                                    &self.gqa_combine,
+                                    (nq, b_u32, 1),
+                                    (32, 1, 1),
+                                    0,
+                                    stream,
+                                    &mut args_comb,
+                                )?;
+                            }
                         }
                     } else {
                         unsafe {
                             // One block per (KV head, row); its four warps cover the
                             // four query heads that share that KV head.
                             let nkv = NUM_KV_HEADS as u32;
-                            launch_kernel_on_stream(&self.gqa, (nkv, b_u32, 1), (hd, 1, 1), 0, stream, &mut args_gqa)?;
+                            if let Some(ok) = &self.oxide_kernels {
+                                let q_len = b_u32 as u64 * nq as u64 * hd as u64;
+                                ok.batched_gqa_attention_online(
+                                    stream,
+                                    d_ctx, q_len,
+                                    d_q, q_len,
+                                    d_kp, b_u32 as u64,
+                                    d_vp, b_u32 as u64,
+                                    d_sl, b_u32 as u64,
+                                    nq, nkv, hd, b_u32, window_u32,
+                                )?;
+                            } else {
+                                launch_kernel_on_stream(&self.gqa, (nkv, b_u32, 1), (hd, 1, 1), 0, stream, &mut args_gqa)?;
+                            }
                         }
                     }
                 }
@@ -1402,7 +1421,7 @@ impl BatchEngine {
                         &mut b_arg as *mut _ as *mut c_void,
                     ];
                     unsafe {
-                        launch_kernel_on_stream(&self.sigmoid_gate, (nq, b_u32, 1), (hd, 1, 1), 0, stream, &mut args_gate)?;
+                        self.launch_sigmoid_gate_auto(stream, d_ctx, d_gate, nq, b_u32)?;
                     }
                 }
 
@@ -1773,6 +1792,116 @@ impl BatchEngine {
         ];
         unsafe {
             launch_kernel_on_stream(&self.fused_post_norm_res_add, (1, b, 1), (256, 1, 1), 0, stream, &mut args)?;
+        }
+        Ok(())
+    }
+
+    /// Per-head Q/K RMSNorm dispatch.
+    fn launch_qk_rmsnorm_auto(
+        &self,
+        stream: &cuda_core::Stream,
+        x_ptr: u64,
+        weight_ptr: u64,
+        weight_len: u64,
+        num_heads: u32,
+        b: u32,
+    ) -> Result<()> {
+        if let Some(ok) = &self.oxide_kernels {
+            return ok.batched_qk_rmsnorm(
+                stream,
+                x_ptr, b as u64 * num_heads as u64 * HEAD_DIM as u64,
+                weight_ptr, weight_len,
+                1e-5f32, num_heads, HEAD_DIM as u32, b,
+            );
+        }
+        let mut x = x_ptr;
+        let mut w = weight_ptr;
+        let mut eps = 1e-5f32;
+        let mut nh = num_heads;
+        let mut hd = HEAD_DIM as u32;
+        let mut bs = b;
+        let mut args: [*mut c_void; 6] = [
+            &mut x as *mut _ as *mut c_void,
+            &mut w as *mut _ as *mut c_void,
+            &mut eps as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(&self.qk_norm, (num_heads, b, 1), (32, 1, 1), 0, stream, &mut args)?;
+        }
+        Ok(())
+    }
+
+    /// Sigmoid gate dispatch.
+    fn launch_sigmoid_gate_auto(
+        &self,
+        stream: &cuda_core::Stream,
+        ctx_ptr: u64,
+        gate_ptr: u64,
+        num_heads: u32,
+        b: u32,
+    ) -> Result<()> {
+        if let Some(ok) = &self.oxide_kernels {
+            return ok.batched_sigmoid_gate(
+                stream,
+                ctx_ptr, b as u64 * num_heads as u64 * HEAD_DIM as u64,
+                gate_ptr, b as u64 * num_heads as u64,
+                num_heads, HEAD_DIM as u32, b,
+            );
+        }
+        let mut ctx = ctx_ptr;
+        let mut gate = gate_ptr;
+        let mut nh = num_heads;
+        let mut hd = HEAD_DIM as u32;
+        let mut bs = b;
+        let mut args: [*mut c_void; 5] = [
+            &mut ctx as *mut _ as *mut c_void,
+            &mut gate as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(&self.sigmoid_gate, (num_heads, b, 1), (HEAD_DIM as u32, 1, 1), 0, stream, &mut args)?;
+        }
+        Ok(())
+    }
+
+    /// KV cache copy dispatch.
+    fn launch_kv_copy_auto(
+        &self,
+        stream: &cuda_core::Stream,
+        dst_ptrs_ptr: u64,
+        src_ptr: u64,
+        pos_ids_ptr: u64,
+        kv_dim_v: u32,
+        b: u32,
+    ) -> Result<()> {
+        if let Some(ok) = &self.oxide_kernels {
+            return ok.batched_kv_copy(
+                stream,
+                dst_ptrs_ptr, b as u64,
+                src_ptr, b as u64 * kv_dim_v as u64,
+                pos_ids_ptr, b as u64,
+                kv_dim_v, b,
+            );
+        }
+        let mut dst = dst_ptrs_ptr;
+        let mut src = src_ptr;
+        let mut pos = pos_ids_ptr;
+        let mut kv_dim = kv_dim_v;
+        let mut bs = b;
+        let mut args: [*mut c_void; 5] = [
+            &mut dst as *mut _ as *mut c_void,
+            &mut src as *mut _ as *mut c_void,
+            &mut pos as *mut _ as *mut c_void,
+            &mut kv_dim as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(&self.kv_copy, (b, 1, 1), (64, 1, 1), 0, stream, &mut args)?;
         }
         Ok(())
     }
