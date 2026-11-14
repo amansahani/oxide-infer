@@ -8,6 +8,7 @@
 use anyhow::{anyhow, Result};
 use half::f16;
 use oxide_infer_core::{DeviceBuffer, GpuContext};
+use oxide_infer_kernels::oxide_kernels::OxideKernels;
 use oxide_infer_kernels::batched_attn::{
     BATCHED_ARGMAX_DIRECT_PTX, BATCHED_ATTN_GATE_SCATTER_PTX, BATCHED_ATTN_PACK_Q_PTX,
     BATCHED_ATTN_SOFTMAX_MASK_PTX, BATCHED_CONV_PTR_PTX, BATCHED_EMBED_LOOKUP_PTX,
@@ -185,6 +186,7 @@ pub struct BatchEngine {
     rms_norm: Function,
     residual_add: Function,
     fused_post_norm_res_add: Function,
+    oxide_kernels: Option<OxideKernels>,
     /// Env-gated (OXIDE_GLUE_FUSED=1): fused post-norm + residual glue.
     /// Measured: 0.07-0.08 ms/token saved, but numerics diverge ~150 tokens
     /// earlier than the two-kernel path (fma-based f32 path vs separate f16
@@ -336,6 +338,26 @@ impl BatchEngine {
             DeviceBuffer::<u8>::zeroed(gpu, n).map_err(|e| anyhow!("alloc: {e}"))
         };
 
+        // Pure-Rust (cuda-oxide) multi-arch kernels. Opt-in while the migration
+        // is being validated: OXIDE_PURE_RUST=1 swaps the norm/residual PTX
+        // embedded kernels for the cuda-oxide-generated ones, loading the
+        // artifact for the detected device arch (sm_80..sm_121), sm_80 as
+        // JIT fallback for unknown silicon.
+        let pure_rust = std::env::var("OXIDE_PURE_RUST").is_ok();
+        let oxide_kernels = if pure_rust {
+            let ok = OxideKernels::new(gpu).map_err(|e| anyhow!("OxideKernels: {e}"))?;
+            eprintln!("[oxide-kernels] cuda-oxide PTX loaded for arch {}", ok.arch());
+            Some(ok)
+        } else {
+            None
+        };
+        let rms_src_func = |name: &str| -> Result<Function> {
+            if let Some(ok) = &oxide_kernels {
+                return ok.module().get_function(name);
+            }
+            Err(anyhow!("pure-rust path not enabled"))
+        };
+
         let norm_ptx = PtxModule::load_from_ptx(gpu, oxide_infer_models::RESIDUAL_ADD_PTX)
             .map_err(|e| anyhow!("norm PTX: {e}"))?;
         let attn_ptx = PtxModule::load_from_ptx(gpu, BATCHED_QK_RMSNORM_PTX)
@@ -436,9 +458,18 @@ impl BatchEngine {
             max_attn_keys,
             max_attn_chunks,
             lt,
-            rms_norm: norm_ptx.get_function("batched_rms_norm_vec8_fp16")?,
-            residual_add: norm_ptx.get_function("batched_residual_add_fp16")?,
+            rms_norm: if pure_rust {
+                rms_src_func("batched_rms_norm_vec8_fp16")?
+            } else {
+                norm_ptx.get_function("batched_rms_norm_vec8_fp16")?
+            },
+            residual_add: if pure_rust {
+                rms_src_func("residual_add_fp16")?
+            } else {
+                norm_ptx.get_function("batched_residual_add_fp16")?
+            },
             fused_post_norm_res_add: norm_ptx.get_function("fused_post_norm_residual_add_vec8_fp16_b")?,
+            oxide_kernels,
             glue_fused: std::sync::OnceLock::new(),
             swiglu: norm_ptx.get_function("batched_swiglu_separate_fp16")?,
             conv: conv_ptx.get_function("batched_fused_causal_conv1d_gating_ptr_fp16")?,
@@ -881,13 +912,13 @@ impl BatchEngine {
 
         for (l_idx, layer) in layers.iter_mut().enumerate() {
             // Operator RMSNorm: hidden -> norm
-            launch_rms(
-                &self.rms_norm,
-                fptr_mut(&mut self.scratch.norm),
+            let d_norm = fptr_mut(&mut self.scratch.norm);
+            self.launch_rms_auto(
+                stream,
+                d_norm,
                 fptr(&self.scratch.hidden),
                 fptr(&layer.operator_norm),
                 b_u32,
-                stream,
             )?;
             phase!();
 
@@ -1447,25 +1478,24 @@ impl BatchEngine {
                     stream,
                 )?;
             } else {
-                launch_rms(
-                    &self.rms_norm,
+                self.launch_rms_auto(
+                    stream,
                     d_layer,
                     d_layer,
                     fptr(&layer.post_operator_norm),
                     b_u32,
-                    stream,
                 )?;
-                self.residual_add(&self.scratch.hidden, &self.scratch.layer, b_u32, stream)?;
+                self.launch_residual_auto(&self.scratch.hidden, &self.scratch.layer, b_u32, stream)?;
             }
 
             // FFN norm.
-            launch_rms(
-                &self.rms_norm,
-                fptr_mut(&mut self.scratch.norm),
+            let d_ffn_norm = fptr_mut(&mut self.scratch.norm);
+            self.launch_rms_auto(
+                stream,
+                d_ffn_norm,
                 fptr(&self.scratch.hidden),
                 fptr(&layer.ffn_norm),
                 b_u32,
-                stream,
             )?;
 
             // FFN: W1/W3 -> SwiGLU -> W2.
@@ -1613,15 +1643,14 @@ impl BatchEngine {
                     stream,
                 )?;
             } else {
-                launch_rms(
-                    &self.rms_norm,
+                self.launch_rms_auto(
+                    stream,
                     d_ffn_out,
                     d_ffn_out,
                     fptr(&layer.post_ffn_norm),
                     b_u32,
-                    stream,
                 )?;
-                self.residual_add(&self.scratch.hidden, &self.scratch.ffn_out, b_u32, stream)?;
+                self.launch_residual_auto(&self.scratch.hidden, &self.scratch.ffn_out, b_u32, stream)?;
             }
             phase!();
         }
@@ -1676,13 +1705,13 @@ impl BatchEngine {
         emb_norm: &DeviceBuffer<f16>,
         stream: &CuStream,
     ) -> Result<Vec<u32>> {
-        launch_rms(
-            &self.rms_norm,
-            fptr_mut(&mut self.scratch.norm),
+        let d_emb_norm = fptr_mut(&mut self.scratch.norm);
+        self.launch_rms_auto(
+            stream,
+            d_emb_norm,
             fptr(&self.scratch.hidden),
             emb_norm.inner().cu_deviceptr(),
             b_u32,
-            stream,
         )?;
 
         let d_tbl = embed_table.inner().cu_deviceptr();
@@ -1775,6 +1804,49 @@ impl BatchEngine {
             launch_kernel_on_stream(&self.fused_post_norm_res_add, (1, b, 1), (256, 1, 1), 0, stream, &mut args)?;
         }
         Ok(())
+    }
+
+    /// RMSNorm dispatch: pure-Rust (cuda-oxide, multi-arch) when
+    /// OXIDE_PURE_RUST=1 at startup, else the embedded PTX kernel.
+    fn launch_rms_auto(
+        &self,
+        stream: &cuda_core::Stream,
+        out_ptr: u64,
+        input_ptr: u64,
+        weight_ptr: u64,
+        b: u32,
+    ) -> Result<()> {
+        if let Some(ok) = &self.oxide_kernels {
+            let total = b as u64 * HIDDEN as u64;
+            ok.batched_rms_norm(
+                stream,
+                out_ptr, total,
+                input_ptr, total,
+                weight_ptr, HIDDEN as u64,
+                1e-5f32, HIDDEN as u32, b,
+            )?;
+            return Ok(());
+        }
+        launch_rms(&self.rms_norm, out_ptr, input_ptr, weight_ptr, b, stream)
+    }
+
+    fn launch_residual_auto(
+        &self,
+        residual: &DeviceBuffer<f16>,
+        update: &DeviceBuffer<f16>,
+        b: u32,
+        stream: &cuda_core::Stream,
+    ) -> Result<()> {
+        if let Some(ok) = &self.oxide_kernels {
+            let total = b as u64 * HIDDEN as u64;
+            return ok.residual_add(
+                stream,
+                residual.inner().cu_deviceptr(), total,
+                update.inner().cu_deviceptr(), total,
+                HIDDEN as u32, b,
+            );
+        }
+        self.residual_add(residual, update, b, stream)
     }
 
     fn residual_add(
