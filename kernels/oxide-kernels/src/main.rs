@@ -182,6 +182,76 @@ mod kernels {
         unsafe { *x_io.get_unchecked_mut(x_off) = (packed & 0xffff) as u16; }
     }
 
+    /// Argmax over the vocab dimension, one block per batch element.
+    /// 256 threads per block iterate vocab in strides of 256, warp-tree
+    /// reduce, then a single 8-lane reduce across warps. Deterministic:
+    /// on ties, the lower index wins (matches the PTX `>` semantics).
+    #[kernel]
+    pub fn batched_argmax_direct_f16(
+        mut tokens_out: DisjointSlice<u32>,
+        logits_in: &[u16],
+        vocab_size: u32,
+    ) {
+        static mut S_WARP_MAX: SharedArray<f32, 8> = SharedArray::UNINIT;
+        static mut S_WARP_IDX: SharedArray<u32, 8> = SharedArray::UNINIT;
+
+        let b = thread::blockIdx_x() as usize;
+        let tid = thread::threadIdx_x() as usize;
+        let v = vocab_size as usize;
+        let base = b * v;
+
+        let mut max_val = -1.0e30f32;
+        let mut best_idx = 0u32;
+        let mut idx = tid;
+        while idx < v {
+            let f = f16::from_bits(unsafe { *logits_in.as_ptr().add(base + idx) }) as f32;
+            if f > max_val {
+                max_val = f;
+                best_idx = idx as u32;
+            }
+            idx += 256;
+        }
+
+        let mut off = 16u32;
+        while off > 0 {
+            let ov = warp::shuffle_down_f32_sync(0xffffffff, max_val, off);
+            let oi = warp::shuffle_down_sync(0xffffffff, best_idx, off);
+            if ov > max_val || (ov == max_val && oi < best_idx) {
+                max_val = ov;
+                best_idx = oi;
+            }
+            off >>= 1;
+        }
+
+        let lane = tid & 31;
+        let warp_id = tid >> 5;
+        if lane == 0 {
+            unsafe {
+                S_WARP_MAX[warp_id] = max_val;
+                S_WARP_IDX[warp_id] = best_idx;
+            }
+        }
+        thread::sync_threads();
+
+        if tid < 8 {
+            let mut m = unsafe { S_WARP_MAX[tid] };
+            let mut bi = unsafe { S_WARP_IDX[tid] };
+            let mut off = 4u32;
+            while off > 0 {
+                let ov = warp::shuffle_down_f32_sync(0xffffffff, m, off);
+                let oi = warp::shuffle_down_sync(0xffffffff, bi, off);
+                if ov > m || (ov == m && oi < bi) {
+                    m = ov;
+                    bi = oi;
+                }
+                off >>= 1;
+            }
+            if tid == 0 {
+                unsafe { *tokens_out.get_unchecked_mut(b) = bi; }
+            }
+        }
+    }
+
     /// Embedding lookup: out[b*dim + i] = f16(table[tokens[b]*dim + i])
     /// Launch: grid (B, 1, 1), block (256, 1, 1). dim % 8 == 0.
     #[kernel]
@@ -425,6 +495,39 @@ fn main() {
         }
     }
     println!("embedding max err = {max_emb:.6} {}", if max_emb < 2e-3 { "ok" } else { "FAIL" });
+
+    // ---- smoke test argmax ----
+    const VOC: usize = 2000;
+    let logits: Vec<f32> = (0..VOC).map(|i| (i as f32 * 0.13 + 0.5).sin() * 100.0).collect();
+    let logits_host: Vec<u16> = logits.iter().map(|&v| f16::from_f32(v).to_bits()).collect();
+    let logits_dev = DeviceBuffer::from_host(&stream, &logits_host).unwrap();
+    let mut tok_dev = DeviceBuffer::<u32>::zeroed(&stream, 1).unwrap();
+    let cfg5 = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+    // batch 0: row = logits, batch 1: row = logits with last element spiked
+    let logits2: Vec<u16> = {
+        let mut v = logits.clone();
+        v[VOC - 1] = 10_000.0;
+        v.iter().map(|&x| f16::from_f32(x).to_bits()).collect()
+    };
+    let logits2_dev = DeviceBuffer::from_host(&stream, &logits2).unwrap();
+    let mut tok2_dev = DeviceBuffer::<u32>::zeroed(&stream, 1).unwrap();
+    unsafe {
+        module.batched_argmax_direct_f16(&stream, cfg5, &mut tok_dev, &logits_dev, VOC as u32)
+            .expect("argmax launch");
+    }
+    unsafe {
+        module.batched_argmax_direct_f16(&stream, cfg5, &mut tok2_dev, &logits2_dev, VOC as u32)
+            .expect("argmax2 launch");
+    }
+    stream.synchronize().unwrap();
+    let tok = tok_dev.to_host_vec(&stream).unwrap();
+    let tok2 = tok2_dev.to_host_vec(&stream).unwrap();
+    let mut want0 = 0usize;
+    for i in 1..VOC {
+        if logits[i] > logits[want0] { want0 = i; }
+    }
+    let ok = tok[0] as usize == want0 && tok2[0] as usize == VOC - 1;
+    println!("argmax batch0 want={want0} got={} | batch1 spiked got={} {}", tok[0], tok2[0], if ok { "ok" } else { "FAIL" });
 }
 
 struct Rng(u64);

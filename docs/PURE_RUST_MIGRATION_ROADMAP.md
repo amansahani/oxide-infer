@@ -118,11 +118,24 @@ Loader/dispatch changes additionally need:
 
 ## 4. Phases
 
+### Status (2026-11-14)
+- **Phase 0 DONE** - `kernels/oxide-kernels/` crate + multi-arch committed
+  PTX (sm_80/90/100/103/110/120/121) + `OxideKernels` loader (device SM
+  detection, committed per-arch artifact, sm_80 as JIT fallback for
+  unknown silicon incl. Rubin) + `OXIDE_PURE_RUST=1` engine gate.
+- **Phase 1 DONE** - 6/6 utility kernels ported and byte-identical:
+  rms_norm, residual_add, swiglu, rope, embedding, argmax. Engine
+  dispatches through the cuda-oxide path when OXIDE_PURE_RUST=1; PTX
+  fallback unchanged. Full fidelity battery 14/14 byte-identical,
+  phases parity, France=Paris.
+- **Phase 2 NOT STARTED** - GEMV/GEMM for 14 quant types.
+- **Phase 3+ NOT STARTED** - attention (18 kernels), vision (14).
+
 - **Phase 0 — multi-arch build + loader matrix** (unblocks everything):
   `kernels/oxide-kernels` skeleton, arch matrix build script, `oxide-infer-kernels`
   loader change, baseline benchmarks for all arch PTXs (JIT on this GPU).
-- **Phase 1 — utility kernels** (template + proof): rms_norm, rope, silu,
-  argmax, embedding, gqa_attention. ~4 files, ~40 KB PTX → 0.
+- **Phase 1 — utility kernels** (template + proof): rms_norm, residual_add,
+  silu/swiglu, rope, embedding, argmax. ~4 files, ~40 KB PTX → 0.
 - **Phase 2 — GEMV/GEMM**: lm_head, strided GEMM helpers, packed GEMV for all
   14 quant types (dispatch only, kernels already exist).
 - **Phase 3 — attention**: batched_attn (18 kernels) + gqa_engine,

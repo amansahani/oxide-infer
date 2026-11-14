@@ -194,6 +194,35 @@ impl OxideKernels {
         Ok(())
     }
 
+    /// Raw-pointer launch of `batched_argmax_direct_f16`.
+    /// grid (B, 1, 1), block (256, 1, 1).
+    #[allow(clippy::too_many_arguments)]
+    pub fn batched_argmax(
+        &self,
+        stream: &Stream,
+        out_ptr: u64, out_len: u64,
+        logits_ptr: u64, logits_len: u64,
+        vocab_size: u32, b_size: u32,
+    ) -> Result<()> {
+        let func = self.module().get_function("batched_argmax_direct_f16")?;
+        let mut out_ptr = out_ptr;
+        let mut out_len = out_len;
+        let mut logits_ptr = logits_ptr;
+        let mut logits_len = logits_len;
+        let mut vocab_size = vocab_size;
+        let mut args: [*mut c_void; 5] = [
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut out_len as *mut _ as *mut c_void,
+            &mut logits_ptr as *mut _ as *mut c_void,
+            &mut logits_len as *mut _ as *mut c_void,
+            &mut vocab_size as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            launch_kernel_on_stream(&func, (b_size, 1, 1), (256, 1, 1), 0, stream, &mut args)?;
+        }
+        Ok(())
+    }
+
     /// Raw-pointer launch of `embedding_lookup_fp16`.
     /// out[b*dim + i] = f16(table[tokens[b]*dim + i]); grid (B, 1, 1), block (256, 1, 1).
     #[allow(clippy::too_many_arguments)]

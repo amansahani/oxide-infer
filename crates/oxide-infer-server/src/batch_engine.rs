@@ -1681,16 +1681,25 @@ impl BatchEngine {
         let d_logits = self.scratch.logits.inner_mut().cu_deviceptr();
         self.lt.gemm(stream, VOCAB, HIDDEN, b_u32 as usize, d_tbl, d_x, d_logits)?;
 
-        let mut d_out = self.scratch.tokens_out.inner_mut().cu_deviceptr();
-        let mut d_logits = self.scratch.logits.inner().cu_deviceptr();
-        let mut vocab = VOCAB as u32;
-        let mut args_am: [*mut c_void; 3] = [
-            &mut d_out as *mut _ as *mut c_void,
-            &mut d_logits as *mut _ as *mut c_void,
-            &mut vocab as *mut _ as *mut c_void,
-        ];
-        unsafe {
-            launch_kernel_on_stream(&self.argmax, (b_u32, 1, 1), (256, 1, 1), 0, stream, &mut args_am)?;
+        let d_out = self.scratch.tokens_out.inner().cu_deviceptr();
+        let d_logits = self.scratch.logits.inner().cu_deviceptr();
+        if let Some(ok) = &self.oxide_kernels {
+            ok.batched_argmax(
+                stream,
+                d_out, b_u32 as u64,
+                d_logits, b_u32 as u64 * VOCAB as u64,
+                VOCAB as u32, b_u32,
+            )?;
+        } else {
+            let mut vocab = VOCAB as u32;
+            let mut args_am: [*mut c_void; 3] = [
+                &mut { d_out } as *mut _ as *mut c_void,
+                &mut { d_logits } as *mut _ as *mut c_void,
+                &mut vocab as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                launch_kernel_on_stream(&self.argmax, (b_u32, 1, 1), (256, 1, 1), 0, stream, &mut args_am)?;
+            }
         }
 
         let mut out = self

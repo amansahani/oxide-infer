@@ -9,6 +9,8 @@
 	// .globl	residual_add_fp16       // -- Begin function residual_add_fp16
 .visible .shared .align 4 .b8 __shared_mem_6d3be7c3ad876b57_591801c16b3bc447[4];
 .visible .shared .align 4 .b8 __shared_mem_6d3be7c3ad876b57_b14e55c14ec5d68c[32];
+.visible .shared .align 4 .b8 __shared_mem_6d3be7c3ad876b57_e23db0dfd829732b[32];
+.visible .shared .align 4 .b8 __shared_mem_6d3be7c3ad876b57_bdef16dfc320c3da[32];
                                         // @residual_add_fp16
 .visible .entry residual_add_fp16(
 	.param .u64 .ptr .align 1 residual_add_fp16_param_0,
@@ -384,6 +386,244 @@ $L__BB3_10:                             // %bb28
 	trap; exit;
                                         // -- End function
 }
+	// .globl	batched_argmax_direct_f16 // -- Begin function batched_argmax_direct_f16
+.visible .entry batched_argmax_direct_f16(
+	.param .u64 .ptr .align 1 batched_argmax_direct_f16_param_0,
+	.param .u64 batched_argmax_direct_f16_param_1,
+	.param .u64 .ptr .align 2 batched_argmax_direct_f16_param_2,
+	.param .u64 batched_argmax_direct_f16_param_3,
+	.param .u32 batched_argmax_direct_f16_param_4
+)                                       // @batched_argmax_direct_f16
+{
+	.reg .pred 	%p<31>;
+	.reg .b16 	%rs<2>;
+	.reg .b32 	%r<53>;
+	.reg .b64 	%rd<17>;
+
+// %bb.0:                               // %entry
+	ld.param.b64 	%rd7, [batched_argmax_direct_f16_param_0];
+	ld.param.b64 	%rd8, [batched_argmax_direct_f16_param_2];
+	cvta.to.global.u64 	%rd1, %rd8;
+	cvta.to.global.u64 	%rd2, %rd7;
+	mov.u32 	%r20, %ctaid.x;
+	cvt.u64.u32 	%rd3, %r20;
+	ld.param.b32 	%r21, [batched_argmax_direct_f16_param_4];
+	mov.u32 	%r22, %tid.x;
+	cvt.u64.u32 	%rd4, %r22;
+	setp.ge.u32 	%p1, %r22, %r21;
+	mov.b32 	%r36, 0;
+	mov.b32 	%r37, 0fF149F2CA;
+	@%p1 bra 	$L__BB4_2;
+	bra.uni 	$L__BB4_1;
+$L__BB4_1:                              // %bb4.lr.ph
+	cvt.u64.u32 	%rd5, %r21;
+	mul.lo.s64 	%rd9, %rd3, %rd5;
+	shl.b64 	%rd10, %rd9, 1;
+	shl.b64 	%rd11, %rd4, 1;
+	add.s64 	%rd12, %rd10, %rd11;
+	add.s64 	%rd15, %rd1, %rd12;
+	mov.b32 	%r37, 0fF149F2CA;
+	mov.b32 	%r36, 0;
+	mov.b64 	%rd16, %rd4;
+	bra.uni 	$L__BB4_3;
+$L__BB4_2:                              // %bb9.preheader
+	shfl.sync.down.b32 	%r1, %r37, 16, 31, -1;
+	shfl.sync.down.b32 	%r2, %r36, 16, 31, -1;
+	setp.leu.f32 	%p4, %r1, %r37;
+	mov.b32 	%r38, %r1;
+	mov.b32 	%r39, %r2;
+	@%p4 bra 	$L__BB4_4;
+	bra.uni 	$L__BB4_6;
+$L__BB4_3:                              // %bb4
+                                        // =>This Inner Loop Header: Depth=1
+	ld.global.nc.b16 	%rs1, [%rd15];
+	cvt.f32.f16 	%r23, %rs1;
+	setp.geu.f32 	%p2, %r37, %r23;
+	selp.f32 	%r37, %r37, %r23, %p2;
+	cvt.u32.u64 	%r24, %rd16;
+	selp.b32 	%r36, %r36, %r24, %p2;
+	add.s64 	%rd16, %rd16, 256;
+	add.s64 	%rd15, %rd15, 512;
+	setp.lt.u64 	%p3, %rd16, %rd5;
+	@%p3 bra 	$L__BB4_3;
+	bra.uni 	$L__BB4_2;
+$L__BB4_4:                              // %bb14
+	setp.neu.f32 	%p5, %r1, %r37;
+	mov.b32 	%r38, %r37;
+	mov.b32 	%r39, %r36;
+	@%p5 bra 	$L__BB4_6;
+	bra.uni 	$L__BB4_5;
+$L__BB4_5:                              // %bb15
+	min.u32 	%r39, %r2, %r36;
+	setp.lt.u32 	%p6, %r2, %r36;
+	selp.f32 	%r38, %r1, %r37, %p6;
+$L__BB4_6:                              // %bb20
+	shfl.sync.down.b32 	%r3, %r38, 8, 31, -1;
+	shfl.sync.down.b32 	%r4, %r39, 8, 31, -1;
+	setp.gt.f32 	%p7, %r3, %r38;
+	mov.b32 	%r40, %r3;
+	mov.b32 	%r41, %r4;
+	@%p7 bra 	$L__BB4_9;
+	bra.uni 	$L__BB4_7;
+$L__BB4_7:                              // %bb14.1
+	setp.neu.f32 	%p8, %r3, %r38;
+	mov.b32 	%r40, %r38;
+	mov.b32 	%r41, %r39;
+	@%p8 bra 	$L__BB4_9;
+	bra.uni 	$L__BB4_8;
+$L__BB4_8:                              // %bb15.1
+	min.u32 	%r41, %r4, %r39;
+	setp.lt.u32 	%p9, %r4, %r39;
+	selp.f32 	%r40, %r3, %r38, %p9;
+$L__BB4_9:                              // %bb20.1
+	shfl.sync.down.b32 	%r5, %r40, 4, 31, -1;
+	shfl.sync.down.b32 	%r6, %r41, 4, 31, -1;
+	setp.gt.f32 	%p10, %r5, %r40;
+	mov.b32 	%r42, %r5;
+	mov.b32 	%r43, %r6;
+	@%p10 bra 	$L__BB4_12;
+	bra.uni 	$L__BB4_10;
+$L__BB4_10:                             // %bb14.2
+	setp.neu.f32 	%p11, %r5, %r40;
+	mov.b32 	%r42, %r40;
+	mov.b32 	%r43, %r41;
+	@%p11 bra 	$L__BB4_12;
+	bra.uni 	$L__BB4_11;
+$L__BB4_11:                             // %bb15.2
+	min.u32 	%r43, %r6, %r41;
+	setp.lt.u32 	%p12, %r6, %r41;
+	selp.f32 	%r42, %r5, %r40, %p12;
+$L__BB4_12:                             // %bb20.2
+	shfl.sync.down.b32 	%r7, %r42, 2, 31, -1;
+	shfl.sync.down.b32 	%r8, %r43, 2, 31, -1;
+	setp.gt.f32 	%p13, %r7, %r42;
+	mov.b32 	%r44, %r7;
+	mov.b32 	%r45, %r8;
+	@%p13 bra 	$L__BB4_15;
+	bra.uni 	$L__BB4_13;
+$L__BB4_13:                             // %bb14.3
+	setp.neu.f32 	%p14, %r7, %r42;
+	mov.b32 	%r44, %r42;
+	mov.b32 	%r45, %r43;
+	@%p14 bra 	$L__BB4_15;
+	bra.uni 	$L__BB4_14;
+$L__BB4_14:                             // %bb15.3
+	min.u32 	%r45, %r8, %r43;
+	setp.lt.u32 	%p15, %r8, %r43;
+	selp.f32 	%r44, %r7, %r42, %p15;
+$L__BB4_15:                             // %bb20.3
+	shfl.sync.down.b32 	%r9, %r44, 1, 31, -1;
+	shfl.sync.down.b32 	%r10, %r45, 1, 31, -1;
+	setp.gt.f32 	%p16, %r9, %r44;
+	mov.b32 	%r46, %r9;
+	mov.b32 	%r47, %r10;
+	@%p16 bra 	$L__BB4_18;
+	bra.uni 	$L__BB4_16;
+$L__BB4_16:                             // %bb14.4
+	setp.neu.f32 	%p17, %r9, %r44;
+	mov.b32 	%r46, %r44;
+	mov.b32 	%r47, %r45;
+	@%p17 bra 	$L__BB4_18;
+	bra.uni 	$L__BB4_17;
+$L__BB4_17:                             // %bb15.4
+	min.u32 	%r47, %r10, %r45;
+	setp.lt.u32 	%p18, %r10, %r45;
+	selp.f32 	%r46, %r9, %r44, %p18;
+$L__BB4_18:                             // %bb20.4
+	cvt.u32.u64 	%r25, %rd4;
+	and.b64 	%rd13, %rd4, 31;
+	setp.ne.b64 	%p19, %rd13, 0;
+	@%p19 bra 	$L__BB4_21;
+	bra.uni 	$L__BB4_19;
+$L__BB4_19:                             // %bb22
+	setp.gt.u32 	%p20, %r25, 255;
+	@%p20 bra 	$L__BB4_34;
+	bra.uni 	$L__BB4_20;
+$L__BB4_20:                             // %bb23
+	shr.u32 	%r11, %r25, 5;
+	shl.b32 	%r26, %r11, 2;
+	mov.b32 	%r27, __shared_mem_6d3be7c3ad876b57_bdef16dfc320c3da;
+	add.s32 	%r28, %r27, %r26;
+	st.shared.b32 	[%r28], %r46;
+	mov.b32 	%r29, __shared_mem_6d3be7c3ad876b57_e23db0dfd829732b;
+	add.s32 	%r30, %r29, %r26;
+	st.shared.b32 	[%r30], %r47;
+$L__BB4_21:                             // %bb27
+	bar.sync 	0;
+	setp.gt.u32 	%p21, %r25, 7;
+	@%p21 bra 	$L__BB4_33;
+	bra.uni 	$L__BB4_22;
+$L__BB4_22:                             // %bb30
+	shl.b32 	%r31, %r25, 2;
+	mov.b32 	%r32, __shared_mem_6d3be7c3ad876b57_bdef16dfc320c3da;
+	add.s32 	%r33, %r32, %r31;
+	ld.shared.b32 	%r12, [%r33];
+	mov.b32 	%r34, __shared_mem_6d3be7c3ad876b57_e23db0dfd829732b;
+	add.s32 	%r35, %r34, %r31;
+	ld.shared.b32 	%r13, [%r35];
+	shfl.sync.down.b32 	%r14, %r12, 4, 31, -1;
+	shfl.sync.down.b32 	%r15, %r13, 4, 31, -1;
+	setp.gt.f32 	%p22, %r14, %r12;
+	mov.b32 	%r48, %r14;
+	mov.b32 	%r49, %r15;
+	@%p22 bra 	$L__BB4_25;
+	bra.uni 	$L__BB4_23;
+$L__BB4_23:                             // %bb39
+	setp.neu.f32 	%p23, %r14, %r12;
+	mov.b32 	%r48, %r12;
+	mov.b32 	%r49, %r13;
+	@%p23 bra 	$L__BB4_25;
+	bra.uni 	$L__BB4_24;
+$L__BB4_24:                             // %bb40
+	min.u32 	%r49, %r15, %r13;
+	setp.lt.u32 	%p24, %r15, %r13;
+	selp.f32 	%r48, %r14, %r12, %p24;
+$L__BB4_25:                             // %bb45
+	shfl.sync.down.b32 	%r16, %r48, 2, 31, -1;
+	shfl.sync.down.b32 	%r17, %r49, 2, 31, -1;
+	setp.gt.f32 	%p25, %r16, %r48;
+	mov.b32 	%r50, %r16;
+	mov.b32 	%r51, %r17;
+	@%p25 bra 	$L__BB4_28;
+	bra.uni 	$L__BB4_26;
+$L__BB4_26:                             // %bb39.1
+	setp.neu.f32 	%p26, %r16, %r48;
+	mov.b32 	%r50, %r48;
+	mov.b32 	%r51, %r49;
+	@%p26 bra 	$L__BB4_28;
+	bra.uni 	$L__BB4_27;
+$L__BB4_27:                             // %bb40.1
+	min.u32 	%r51, %r17, %r49;
+	setp.lt.u32 	%p27, %r17, %r49;
+	selp.f32 	%r50, %r16, %r48, %p27;
+$L__BB4_28:                             // %bb45.1
+	shfl.sync.down.b32 	%r18, %r50, 1, 31, -1;
+	shfl.sync.down.b32 	%r19, %r51, 1, 31, -1;
+	setp.gt.f32 	%p28, %r18, %r50;
+	mov.b32 	%r52, %r19;
+	@%p28 bra 	$L__BB4_31;
+	bra.uni 	$L__BB4_29;
+$L__BB4_29:                             // %bb39.2
+	setp.neu.f32 	%p29, %r18, %r50;
+	mov.b32 	%r52, %r51;
+	@%p29 bra 	$L__BB4_31;
+	bra.uni 	$L__BB4_30;
+$L__BB4_30:                             // %bb40.2
+	min.u32 	%r52, %r19, %r51;
+$L__BB4_31:                             // %bb45.2
+	setp.ne.b32 	%p30, %r25, 0;
+	@%p30 bra 	$L__BB4_33;
+	bra.uni 	$L__BB4_32;
+$L__BB4_32:                             // %bb47
+	shl.b64 	%rd14, %rd3, 2;
+	add.s64 	%rd6, %rd2, %rd14;
+	st.global.b32 	[%rd6], %r52;
+$L__BB4_33:                             // %bb49
+	ret;
+$L__BB4_34:                             // %bb50
+	trap; exit;
+                                        // -- End function
+}
 	// .globl	batched_rms_norm_vec8_fp16 // -- Begin function batched_rms_norm_vec8_fp16
 .visible .entry batched_rms_norm_vec8_fp16(
 	.param .u64 .ptr .align 1 batched_rms_norm_vec8_fp16_param_0,
@@ -412,9 +652,9 @@ $L__BB3_10:                             // %bb28
 	mov.u32 	%r1, %ctaid.y;
 	ld.param.b32 	%r7, [batched_rms_norm_vec8_fp16_param_8];
 	setp.ge.u32 	%p1, %r1, %r7;
-	@%p1 bra 	$L__BB4_15;
-	bra.uni 	$L__BB4_1;
-$L__BB4_1:                              // %bb3
+	@%p1 bra 	$L__BB5_15;
+	bra.uni 	$L__BB5_1;
+$L__BB5_1:                              // %bb3
 	ld.param.b32 	%r6, [batched_rms_norm_vec8_fp16_param_7];
 	cvt.u64.u32 	%rd4, %r1;
 	mov.u32 	%r8, %tid.x;
@@ -424,9 +664,9 @@ $L__BB4_1:                              // %bb3
 	mul.wide.u32 	%rd28, %r8, 8;
 	setp.ge.u64 	%p2, %rd28, %rd8;
 	mov.b32 	%r99, 0f00000000;
-	@%p2 bra 	$L__BB4_4;
-	bra.uni 	$L__BB4_2;
-$L__BB4_2:                              // %bb6.lr.ph
+	@%p2 bra 	$L__BB5_4;
+	bra.uni 	$L__BB5_2;
+$L__BB5_2:                              // %bb6.lr.ph
 	mul.lo.s64 	%rd12, %rd4, %rd8;
 	shl.b64 	%rd13, %rd12, 1;
 	shl.b64 	%rd14, %rd5, 4;
@@ -435,7 +675,7 @@ $L__BB4_2:                              // %bb6.lr.ph
 	add.s64 	%rd23, %rd16, 8;
 	mov.b32 	%r99, 0f00000000;
 	mov.b64 	%rd24, %rd28;
-$L__BB4_3:                              // %bb6
+$L__BB5_3:                              // %bb6
                                         // =>This Inner Loop Header: Depth=1
 	ld.global.b32 	%r9, [%rd23+-8];
 	cvt.u16.u32 	%rs1, %r9;
@@ -468,9 +708,9 @@ $L__BB4_3:                              // %bb6
 	add.s64 	%rd24, %rd24, 2048;
 	add.s64 	%rd23, %rd23, 4096;
 	setp.lt.u64 	%p3, %rd24, %rd8;
-	@%p3 bra 	$L__BB4_3;
-	bra.uni 	$L__BB4_4;
-$L__BB4_4:                              // %bb12
+	@%p3 bra 	$L__BB5_3;
+	bra.uni 	$L__BB5_4;
+$L__BB5_4:                              // %bb12
 	shr.u64 	%rd7, %rd5, 5;
 	shfl.sync.down.b32 	%r28, %r99, 16, 31, -1;
 	add.f32 	%r29, %r99, %r28;
@@ -482,46 +722,46 @@ $L__BB4_4:                              // %bb12
 	add.f32 	%r35, %r33, %r34;
 	shfl.sync.down.b32 	%r36, %r35, 1, 31, -1;
 	setp.ne.b64 	%p4, %rd6, 0;
-	@%p4 bra 	$L__BB4_7;
-	bra.uni 	$L__BB4_5;
-$L__BB4_5:                              // %bb14
+	@%p4 bra 	$L__BB5_7;
+	bra.uni 	$L__BB5_5;
+$L__BB5_5:                              // %bb14
 	cvt.u32.u64 	%r37, %rd5;
 	setp.gt.u32 	%p5, %r37, 255;
-	@%p5 bra 	$L__BB4_16;
-	bra.uni 	$L__BB4_6;
-$L__BB4_6:                              // %bb15
+	@%p5 bra 	$L__BB5_16;
+	bra.uni 	$L__BB5_6;
+$L__BB5_6:                              // %bb15
 	add.f32 	%r2, %r35, %r36;
 	cvt.u32.u64 	%r38, %rd7;
 	shl.b32 	%r39, %r38, 2;
 	mov.b32 	%r40, __shared_mem_6d3be7c3ad876b57_b14e55c14ec5d68c;
 	add.s32 	%r41, %r40, %r39;
 	st.shared.b32 	[%r41], %r2;
-$L__BB4_7:                              // %bb17
+$L__BB5_7:                              // %bb17
 	bar.sync 	0;
 	setp.ne.b64 	%p6, %rd7, 0;
-	@%p6 bra 	$L__BB4_12;
-	bra.uni 	$L__BB4_8;
-$L__BB4_8:                              // %bb19
+	@%p6 bra 	$L__BB5_12;
+	bra.uni 	$L__BB5_8;
+$L__BB5_8:                              // %bb19
 	cvt.u32.u64 	%r42, %rd5;
 	setp.gt.u32 	%p7, %r42, 7;
 	mov.b32 	%r100, 0f00000000;
-	@%p7 bra 	$L__BB4_10;
-	bra.uni 	$L__BB4_9;
-$L__BB4_9:                              // %bb21
+	@%p7 bra 	$L__BB5_10;
+	bra.uni 	$L__BB5_9;
+$L__BB5_9:                              // %bb21
 	shl.b32 	%r43, %r42, 2;
 	mov.b32 	%r44, __shared_mem_6d3be7c3ad876b57_b14e55c14ec5d68c;
 	add.s32 	%r3, %r44, %r43;
 	ld.shared.b32 	%r100, [%r3];
-$L__BB4_10:                             // %bb24
+$L__BB5_10:                             // %bb24
 	shfl.sync.down.b32 	%r45, %r100, 4, 31, -1;
 	add.f32 	%r46, %r100, %r45;
 	shfl.sync.down.b32 	%r47, %r46, 2, 31, -1;
 	add.f32 	%r48, %r46, %r47;
 	shfl.sync.down.b32 	%r49, %r48, 1, 31, -1;
 	setp.ne.b32 	%p8, %r42, 0;
-	@%p8 bra 	$L__BB4_12;
-	bra.uni 	$L__BB4_11;
-$L__BB4_11:                             // %bb28
+	@%p8 bra 	$L__BB5_12;
+	bra.uni 	$L__BB5_11;
+$L__BB5_11:                             // %bb28
 	ld.param.b32 	%r5, [batched_rms_norm_vec8_fp16_param_6];
 	add.f32 	%r50, %r48, %r49;
 	cvt.rn.f32.u32 	%r51, %r6;
@@ -531,11 +771,11 @@ $L__BB4_11:                             // %bb28
 	rsqrt.approx.f32 %r53, %r54;
 	// end inline asm
 	st.shared.b32 	[__shared_mem_6d3be7c3ad876b57_591801c16b3bc447], %r53;
-$L__BB4_12:                             // %bb33
+$L__BB5_12:                             // %bb33
 	bar.sync 	0;
-	@%p2 bra 	$L__BB4_15;
-	bra.uni 	$L__BB4_13;
-$L__BB4_13:                             // %bb38.preheader
+	@%p2 bra 	$L__BB5_15;
+	bra.uni 	$L__BB5_13;
+$L__BB5_13:                             // %bb38.preheader
 	ld.shared.b32 	%r4, [__shared_mem_6d3be7c3ad876b57_591801c16b3bc447];
 	mul.lo.s64 	%rd17, %rd4, %rd8;
 	shl.b64 	%rd18, %rd17, 1;
@@ -546,7 +786,7 @@ $L__BB4_13:                             // %bb38.preheader
 	add.s64 	%rd26, %rd1, %rd21;
 	add.s64 	%rd22, %rd19, %rd2;
 	add.s64 	%rd25, %rd22, 8;
-$L__BB4_14:                             // %bb38
+$L__BB5_14:                             // %bb38
                                         // =>This Inner Loop Header: Depth=1
 	ld.global.b32 	%r67, [%rd26+-8];
 	cvt.u16.u32 	%rs9, %r67;
@@ -625,11 +865,11 @@ $L__BB4_14:                             // %bb38
 	add.s64 	%rd26, %rd26, 4096;
 	add.s64 	%rd25, %rd25, 4096;
 	setp.lt.u64 	%p9, %rd28, %rd8;
-	@%p9 bra 	$L__BB4_14;
-	bra.uni 	$L__BB4_15;
-$L__BB4_15:                             // %bb44
+	@%p9 bra 	$L__BB5_14;
+	bra.uni 	$L__BB5_15;
+$L__BB5_15:                             // %bb44
 	ret;
-$L__BB4_16:                             // %bb49
+$L__BB5_16:                             // %bb49
 	trap; exit;
                                         // -- End function
 }
