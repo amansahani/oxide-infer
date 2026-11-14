@@ -692,6 +692,72 @@ mod kernels {
         unsafe { out_ptr.add(3).write((p1 >> 16) as u16) };
     }
 
+    /// Fused causal 1D conv + gating for LFM3 shortconv layers.
+    /// state_ptrs: [B] device array of per-sequence state pointers, each
+    /// [hidden_size x (k_len-1)] f16. y = (conv1d(fin, w) * gate) where
+    /// fin = bcx[idx] * bcx[2*h+idx]; out = sum * bcx[h + idx].
+    /// Grid (hsize / block, B, 1), block (256, 1, 1).
+    #[kernel]
+    pub fn batched_fused_causal_conv1d_gating_ptr_fp16(
+        mut y_out: DisjointSlice<u16>,
+        state_ptrs: &[u64],
+        bcx_in: &[u16],
+        conv_weight: &[u16],
+        hidden_size: u32,
+        k_len: u32,
+        batch_size: u32,
+    ) {
+        let b = thread::blockIdx_y() as usize;
+        if b >= batch_size as usize {
+            return;
+        }
+        let idx = thread::blockIdx_x() as usize * 256 + thread::threadIdx_x() as usize;
+        let h = hidden_size as usize;
+        if idx >= h {
+            return;
+        }
+        let klen = k_len as usize;
+        let k_minus_1 = klen - 1;
+
+        let base = b * 3 * h;
+        let b_block0 = unsafe { *bcx_in.as_ptr().add(base + idx) };
+        let b_block2 = unsafe { *bcx_in.as_ptr().add(base + 2 * h + idx) };
+        let fb = f16::from_bits(b_block0) as f32;
+        let fx = f16::from_bits(b_block2) as f32;
+        let fin = fb * fx;
+
+        let cache_ptr = unsafe { *state_ptrs.get_unchecked(b) } as *mut u16;
+
+        let weight_off = idx * klen;
+        let state_off = idx * k_minus_1;
+
+        let mut fsum = 0.0f32;
+        let mut k = 0usize;
+        while k < k_minus_1 {
+            let s = f16::from_bits(unsafe { *cache_ptr.add(state_off + k) }) as f32;
+            let w = f16::from_bits(unsafe { *conv_weight.as_ptr().add(weight_off + k) }) as f32;
+            fsum = float::fma_rn_f32(s, w, fsum);
+            k += 1;
+        }
+        let last_w = f16::from_bits(unsafe { *conv_weight.as_ptr().add(weight_off + k_minus_1) }) as f32;
+        fsum = float::fma_rn_f32(fin, last_w, fsum);
+
+        // shift state window
+        for k in 1..k_minus_1 {
+            unsafe { *cache_ptr.add(state_off + k - 1) = *cache_ptr.add(state_off + k) };
+        }
+        let pfin = convert::cvt_f16x2_f32(fin, fin);
+        unsafe { *cache_ptr.add(state_off + k_minus_1 - 1) = (pfin & 0xffff) as u16; }
+
+        // gate multiply
+        let hb = unsafe { *bcx_in.as_ptr().add(base + h + idx) };
+        let fc = f16::from_bits(hb) as f32;
+        let out = fsum * fc;
+        let packed = convert::cvt_f16x2_f32(out, out);
+        let out_off = b * h + idx;
+        unsafe { *y_out.get_unchecked_mut(out_off) = (packed & 0xffff) as u16; }
+    }
+
     /// GQA attention with online softmax for decode (head_dim, 128).
     /// Grid (num_kv_heads, B, 1), block (128, 1, 1); warp w -> q_head = kv_head*4 + w.
     /// Each lane holds 4 contiguous f16 of the q/k/v row. Same math as the PTX.

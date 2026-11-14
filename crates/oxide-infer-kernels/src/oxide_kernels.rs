@@ -117,6 +117,50 @@ impl OxideKernels {
         Ok(())
     }
 
+    /// Raw-pointer launch of `batched_fused_causal_conv1d_gating_ptr_fp16`.
+    /// grid (hsize / 256, B, 1), block (256, 1, 1). hidden_size % 256 == 0.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batched_causal_conv_gating(
+        &self,
+        stream: &Stream,
+        y_ptr: u64, y_len: u64,
+        state_ptrs_ptr: u64, state_ptrs_len: u64,
+        bcx_ptr: u64, bcx_len: u64,
+        w_ptr: u64, w_len: u64,
+        hidden_size: u32, k_len: u32, b_size: u32,
+    ) -> Result<()> {
+        let func = self.module().get_function("batched_fused_causal_conv1d_gating_ptr_fp16")?;
+        let mut y_ptr = y_ptr;
+        let mut y_len = y_len;
+        let mut state_ptrs_ptr = state_ptrs_ptr;
+        let mut state_ptrs_len = state_ptrs_len;
+        let mut bcx_ptr = bcx_ptr;
+        let mut bcx_len = bcx_len;
+        let mut w_ptr = w_ptr;
+        let mut w_len = w_len;
+        let mut hidden_size = hidden_size;
+        let mut k_len = k_len;
+        let mut b_size = b_size;
+        let mut args: [*mut c_void; 11] = [
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut y_len as *mut _ as *mut c_void,
+            &mut state_ptrs_ptr as *mut _ as *mut c_void,
+            &mut state_ptrs_len as *mut _ as *mut c_void,
+            &mut bcx_ptr as *mut _ as *mut c_void,
+            &mut bcx_len as *mut _ as *mut c_void,
+            &mut w_ptr as *mut _ as *mut c_void,
+            &mut w_len as *mut _ as *mut c_void,
+            &mut hidden_size as *mut _ as *mut c_void,
+            &mut k_len as *mut _ as *mut c_void,
+            &mut b_size as *mut _ as *mut c_void,
+        ];
+        // grid x = hidden_size/256, y = batch
+        unsafe {
+            launch_kernel_on_stream(&func, (hidden_size / 256, b_size, 1), (256, 1, 1), 0, stream, &mut args)?;
+        }
+        Ok(())
+    }
+
     /// Raw-pointer launch of `batched_qk_rmsnorm_fp16`.
     /// grid (heads, B, 1), block (32, 1, 1).
     #[allow(clippy::too_many_arguments)]

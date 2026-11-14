@@ -1000,8 +1000,24 @@ impl BatchEngine {
                     &mut k_len as *mut _ as *mut c_void,
                     &mut bs as *mut _ as *mut c_void,
                 ];
-                unsafe {
-                    launch_kernel_on_stream(&self.conv, (16, b_u32, 1), (128, 1, 1), 0, stream, &mut args_conv)?;
+                if let Some(ok) = &self.oxide_kernels {
+                    let y_len = b_u32 as u64 * HIDDEN as u64;
+                    let bcx_len = b_u32 as u64 * 3 * HIDDEN as u64;
+                    let w_len = conv.conv_weight.inner().len() as u64;
+                    // d_ptrs is already offset to this layer's pointer table entry
+                    let ptr_table = self.scratch.conv_ptrs.inner().cu_deviceptr() + (l_idx * b * 8) as u64;
+                    ok.batched_causal_conv_gating(
+                        stream,
+                        d_y, y_len,
+                        ptr_table, b_u32 as u64,
+                        d_bcx, bcx_len,
+                        d_cw, w_len,
+                        h_u32, k_len, b_u32,
+                    )?;
+                } else {
+                    unsafe {
+                        launch_kernel_on_stream(&self.conv, (16, b_u32, 1), (128, 1, 1), 0, stream, &mut args_conv)?;
+                    }
                 }
                 phase!();
 
