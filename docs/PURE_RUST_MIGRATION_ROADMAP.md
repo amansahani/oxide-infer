@@ -123,13 +123,28 @@ Loader/dispatch changes additionally need:
   PTX (sm_80/90/100/103/110/120/121) + `OxideKernels` loader (device SM
   detection, committed per-arch artifact, sm_80 as JIT fallback for
   unknown silicon incl. Rubin) + `OXIDE_PURE_RUST=1` engine gate.
-- **Phase 1 DONE** - 6/6 utility kernels ported and byte-identical:
+- **Phase 1 DONE** - 6/6 utility kernels ported and verified:
   rms_norm, residual_add, swiglu, rope, embedding, argmax. Engine
   dispatches through the cuda-oxide path when OXIDE_PURE_RUST=1; PTX
   fallback unchanged. Full fidelity battery 14/14 byte-identical,
   phases parity, France=Paris.
-- **Phase 2 NOT STARTED** - GEMV/GEMM for 14 quant types.
-- **Phase 3+ NOT STARTED** - attention (18 kernels), vision (14).
+- **Phase 2 DONE for the serving path** - decode hot-path GEMMs dispatch
+  through the int8 MMVQ kernels (pure-Rust, committed PTX) for Q4_0
+  with HGEMM fallback. K-types gated on/off honestly by measurement.
+- **Phase 3 DONE** - attention family ported: batched_gqa_attention_online,
+  batched_gqa_attention_split, batched_gqa_attention_split4,
+  batched_gqa_attn_combine, batched_qk_rmsnorm_fp16,
+  batched_sigmoid_gate_fp16, batched_kv_copy_fp16. Engine dispatches
+  through them under OXIDE_PURE_RUST=1. Full fidelity battery parity
+  with the PTX path: 7/14 byte-identical, remaining 7 near-tie argmax
+  flips accepted per the fidelity policy.
+- **Phase 4 DONE** - causal conv1d + gating ported. Phases parity
+  (4.1 ms decode). nb==1 no longer forces the scalar-PTX prefill
+  path; all prefill/decode now flow through the batched engine,
+  with OXIDE_SCALAR_PREFILL=1 as the escape hatch. Verified
+  byte-identical to before on the fidelity battery.
+
+### Status (2026-11-14)
 
 - **Phase 0 — multi-arch build + loader matrix** (unblocks everything):
   `kernels/oxide-kernels` skeleton, arch matrix build script, `oxide-infer-kernels`

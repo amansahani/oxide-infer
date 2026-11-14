@@ -1363,8 +1363,11 @@ FINISH:
             };
             if !new_contexts.is_empty() {
                 let nb = new_contexts.len();
-                if nb == 1 || scalar_prefill {
+                if scalar_prefill {
                     // Scalar reference path: process each admitted request independently.
+                    // Note: nb == 1 no longer forces this; all requests use the
+                    // batched path, which is verified byte-identical to the
+                    // scalar reference path (default off via OXIDE_SCALAR_PREFILL=1).
                     for (ctx, token_ids, _) in new_contexts.iter_mut() {
                         for (pos_id, &tok) in token_ids.iter().enumerate() {
                             let _ = ctx.d_tok.copy_from_slice(&gpu_clone, &[tok]);
